@@ -35,6 +35,7 @@
 #include "uvm_perf_module.h"
 #include "uvm_ats.h"
 #include "uvm_ats_faults.h"
+#include "uvm_cpu_block_policy.h"
 
 #define UVM_PERF_ACCESS_COUNTER_BATCH_COUNT_MIN     1
 #define UVM_PERF_ACCESS_COUNTER_BATCH_COUNT_DEFAULT 256
@@ -148,6 +149,9 @@ static bool is_migration_enabled(void)
     if (uvm_perf_access_counter_migration_enable == 0)
         return false;
     else if (uvm_perf_access_counter_migration_enable > 0)
+        return true;
+
+    if (uvm_cpu_block_policy_enabled())
         return true;
 
     if (UVM_ATS_SUPPORTED())
@@ -1122,7 +1126,7 @@ static NV_STATUS notify_tools_and_process_flags(uvm_va_space_t *va_space,
     return status;
 }
 
-static NV_STATUS service_va_block_locked(uvm_processor_id_t processor,
+static NV_STATUS service_va_block_locked(uvm_gpu_t *gpu,
                                          uvm_va_block_t *va_block,
                                          uvm_va_block_retry_t *va_block_retry,
                                          uvm_service_block_context_t *service_context,
@@ -1137,8 +1141,11 @@ static NV_STATUS service_va_block_locked(uvm_processor_id_t processor,
     NvU32 page_count = 0;
     const uvm_page_mask_t *residency_mask;
     const bool hmm_migratable = true;
+    uvm_processor_id_t processor = gpu ? gpu->id : UVM_ID_CPU;
+    bool promote_full_block;
 
     uvm_assert_mutex_locked(&va_block->lock);
+    promote_full_block = uvm_cpu_block_policy_should_promote(va_block, gpu);
 
     // GPU VA space could be gone since we received the notification. We handle
     // this case by skipping service if processor is not in the mapped mask.
@@ -1169,6 +1176,18 @@ static NV_STATUS service_va_block_locked(uvm_processor_id_t processor,
     // notification for this page is stale. Skip it.
     if (residency_mask)
         uvm_page_mask_andnot(accessed_pages, accessed_pages, residency_mask);
+
+    if (promote_full_block) {
+        const uvm_page_mask_t *cpu_resident_mask =
+            uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, NUMA_NO_NODE);
+
+        if (!cpu_resident_mask)
+            return NV_OK;
+
+        uvm_page_mask_copy(accessed_pages, cpu_resident_mask);
+        if (residency_mask)
+            uvm_page_mask_andnot(accessed_pages, accessed_pages, residency_mask);
+    }
 
     uvm_range_group_range_migratability_iter_first(va_space, va_block->start, va_block->end, &iter);
 
@@ -1215,16 +1234,21 @@ static NV_STATUS service_va_block_locked(uvm_processor_id_t processor,
 
         policy = uvm_va_policy_get(va_block, address);
 
-        new_residency = uvm_va_block_select_residency(va_block,
-                                                      service_context->block_context,
-                                                      page_index,
-                                                      processor,
-                                                      uvm_fault_access_type_mask_bit(UVM_FAULT_ACCESS_TYPE_PREFETCH),
-                                                      policy,
-                                                      &thrashing_hint,
-                                                      UVM_SERVICE_OPERATION_ACCESS_COUNTERS,
-                                                      hmm_migratable,
-                                                      &read_duplicate);
+        if (promote_full_block) {
+            new_residency = gpu->id;
+        }
+        else {
+            new_residency = uvm_va_block_select_residency(va_block,
+                                                          service_context->block_context,
+                                                          page_index,
+                                                          processor,
+                                                          uvm_fault_access_type_mask_bit(UVM_FAULT_ACCESS_TYPE_PREFETCH),
+                                                          policy,
+                                                          &thrashing_hint,
+                                                          UVM_SERVICE_OPERATION_ACCESS_COUNTERS,
+                                                          hmm_migratable,
+                                                          &read_duplicate);
+        }
 
         if (!uvm_processor_mask_test_and_set(&service_context->resident_processors, new_residency))
             uvm_page_mask_zero(&service_context->per_processor_masks[uvm_id_value(new_residency)].new_residency);
@@ -1293,6 +1317,9 @@ static NV_STATUS service_va_block_locked(uvm_processor_id_t processor,
 
     ++service_context->num_retries;
 
+    if (status == NV_OK && promote_full_block && page_count > 0)
+        uvm_cpu_block_policy_record_promotion();
+
     return status;
 }
 
@@ -1306,7 +1333,7 @@ static NV_STATUS service_va_block_locked(uvm_processor_id_t processor,
 
 static NV_STATUS service_notification_va_block_helper(struct mm_struct *mm,
                                                       uvm_va_block_t *va_block,
-                                                      uvm_processor_id_t processor,
+                                                      uvm_gpu_t *gpu,
                                                       uvm_access_counter_service_batch_context_t *batch_context)
 {
     uvm_va_block_retry_t va_block_retry;
@@ -1323,7 +1350,7 @@ static NV_STATUS service_notification_va_block_helper(struct mm_struct *mm,
 
     return UVM_VA_BLOCK_RETRY_LOCKED(va_block,
                                      &va_block_retry,
-                                     service_va_block_locked(processor,
+                                     service_va_block_locked(gpu,
                                                              va_block,
                                                              &va_block_retry,
                                                              service_context,
@@ -1450,7 +1477,7 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
 
     batch_context->block_service_context.access_counters_buffer_index = access_counters->index;
 
-    status = service_notification_va_block_helper(mm, va_block, gpu->id, batch_context);
+    status = service_notification_va_block_helper(mm, va_block, gpu, batch_context);
 
     uvm_mutex_unlock(&va_block->lock);
 

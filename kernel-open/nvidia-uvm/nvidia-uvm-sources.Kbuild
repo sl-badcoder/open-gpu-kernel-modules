@@ -29,6 +29,7 @@ NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_range_allocator.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_va_range.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_va_range_device_p2p.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_va_policy.c
+NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_cpu_block_policy.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_va_block.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_range_group.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_gpu_replayable_faults.c
