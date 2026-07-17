@@ -35,6 +35,7 @@
 #include "uvm_kvmalloc.h"
 #include "uvm_map_external.h"
 #include "uvm_perf_thrashing.h"
+#include "uvm_cpu_block_policy.h"
 #include "nv_uvm_interface.h"
 
 #include <linux/sched.h>
@@ -196,6 +197,7 @@ static uvm_va_range_managed_t *uvm_va_range_alloc_managed(uvm_va_space_t *va_spa
     uvm_va_range_initialize(&managed_range->va_range, UVM_VA_RANGE_TYPE_MANAGED, va_space, start, end);
 
     managed_range->policy = uvm_va_policy_default;
+    uvm_cpu_block_policy_init_range(managed_range);
 
     managed_range->blocks = uvm_kvmalloc_zero(uvm_va_range_num_blocks(managed_range) *
                                               sizeof(managed_range->blocks[0]));
@@ -1235,6 +1237,7 @@ static NV_STATUS va_range_add_gpu_va_space_managed(uvm_va_range_managed_t *manag
     NV_STATUS status = NV_OK;
     const bool should_add_remote_mappings =
         uvm_processor_mask_test(&managed_range->policy.accessed_by, gpu->id) ||
+        uvm_cpu_block_policy_should_add_accessed_by(managed_range, gpu) ||
         gpu->parent->is_integrated_gpu;
 
     // Combine conditions to perform a single VA block traversal
@@ -2459,4 +2462,3 @@ out:
     uvm_va_space_up_write(va_space);
     return status;
 }
-

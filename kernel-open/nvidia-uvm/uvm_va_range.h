@@ -272,6 +272,10 @@ struct uvm_va_range_managed_struct
     // stored in the va_block for HMM allocations.
     uvm_va_policy_t policy;
 
+    // When enabled, CPU-resident pages are mapped remotely on GPUs and a
+    // hardware access-counter notification promotes their complete VA block.
+    bool cpu_access_counter_policy;
+
     // Force the next split on this range to fail. Set by error injection ioctl
     // (testing purposes only).
     bool inject_split_error;
