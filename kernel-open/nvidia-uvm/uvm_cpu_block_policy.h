@@ -30,6 +30,8 @@ bool uvm_cpu_block_policy_enabled(void);
 void uvm_cpu_block_policy_init_range(uvm_va_range_managed_t *managed_range);
 bool uvm_cpu_block_policy_should_add_accessed_by(uvm_va_range_managed_t *managed_range,
                                                 uvm_gpu_t *gpu);
+bool uvm_cpu_block_policy_should_service_4k(uvm_va_range_managed_t *managed_range,
+                                           uvm_gpu_t *gpu);
 bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
 void uvm_cpu_block_policy_record_promotion(void);
 

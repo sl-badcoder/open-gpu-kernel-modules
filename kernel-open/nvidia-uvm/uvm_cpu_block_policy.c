@@ -102,10 +102,22 @@ bool uvm_cpu_block_policy_should_add_accessed_by(uvm_va_range_managed_t *managed
     return true;
 }
 
+bool uvm_cpu_block_policy_should_service_4k(uvm_va_range_managed_t *managed_range,
+                                           uvm_gpu_t *gpu)
+{
+    uvm_va_space_t *va_space = managed_range->va_range.va_space;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    return managed_range->cpu_access_counter_policy &&
+           UVM_ID_IS_CPU(managed_range->policy.preferred_location) &&
+           gpu_supported(va_space, gpu) &&
+           uvm_processor_mask_test(&managed_range->policy.accessed_by, gpu->id);
+}
+
 bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
 {
     uvm_va_range_managed_t *managed_range;
-    uvm_va_space_t *va_space;
 
     if (!gpu || uvm_va_block_is_hmm(va_block))
         return false;
@@ -115,12 +127,7 @@ bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gp
     if (!managed_range || !managed_range->cpu_access_counter_policy)
         return false;
 
-    if (!UVM_ID_IS_CPU(managed_range->policy.preferred_location))
-        return false;
-
-    va_space = managed_range->va_range.va_space;
-    return gpu_supported(va_space, gpu) &&
-           uvm_processor_mask_test(&managed_range->policy.accessed_by, gpu->id);
+    return uvm_cpu_block_policy_should_service_4k(managed_range, gpu);
 }
 
 void uvm_cpu_block_policy_record_promotion(void)

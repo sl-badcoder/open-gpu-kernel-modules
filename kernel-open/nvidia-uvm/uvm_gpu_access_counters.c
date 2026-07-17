@@ -1702,6 +1702,27 @@ static NV_STATUS service_notifications_batch(uvm_gpu_va_space_t *gpu_va_space,
     return status;
 }
 
+static bool should_service_4k_notification(uvm_va_space_t *va_space,
+                                           uvm_gpu_t *gpu,
+                                           NvU64 address)
+{
+    uvm_va_range_t *va_range;
+    uvm_va_range_managed_t *managed_range;
+
+    if (PAGE_SIZE != UVM_PAGE_SIZE_4K)
+        return true;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    va_range = uvm_va_range_find(va_space, address);
+    managed_range = uvm_va_range_to_managed_or_null(va_range);
+
+    // On 4K kernels, use a virtual notification only as a trigger for the
+    // complete-block policy. NVIDIA's general 4K migration path remains off.
+    return managed_range &&
+           uvm_cpu_block_policy_should_service_4k(managed_range, gpu);
+}
+
 static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_counters)
 {
     NvU32 i = 0;
@@ -1713,15 +1734,6 @@ static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_count
     uvm_gpu_va_space_t *gpu_va_space = NULL;
     uvm_parent_gpu_t *parent_gpu = access_counters->parent_gpu;
     uvm_access_counter_service_batch_context_t *batch_context = &access_counters->batch_service_context;
-
-    // TODO: Bug 4299018 : Add support for virtual access counter migrations on
-    //                     4K page sizes.
-    if (PAGE_SIZE == UVM_PAGE_SIZE_4K) {
-        return notify_tools_broadcast_and_process_flags(access_counters,
-                                                        batch_context->notifications,
-                                                        batch_context->num_notifications,
-                                                        0);
-    }
 
     preprocess_notifications(parent_gpu, batch_context);
 
@@ -1754,7 +1766,9 @@ static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_count
                 gpu_va_space = uvm_gpu_va_space_get(va_space, current_entry->gpu);
             }
 
-            if (gpu_va_space && uvm_va_space_has_access_counter_migrations(va_space)) {
+            if (gpu_va_space &&
+                uvm_va_space_has_access_counter_migrations(va_space) &&
+                should_service_4k_notification(va_space, current_entry->gpu, current_entry->address)) {
                 status = service_notifications_batch(gpu_va_space, mm, access_counters, i, &i);
             }
             else {
