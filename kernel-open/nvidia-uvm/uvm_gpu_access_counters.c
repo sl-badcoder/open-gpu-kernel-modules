@@ -1481,8 +1481,10 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
 
     uvm_mutex_unlock(&va_block->lock);
 
-    if (status == NV_OK)
+    if (status == NV_OK) {
+        uvm_cpu_block_policy_prefetch_on_first_signal(va_block, gpu, mm);
         flags |= UVM_ACCESS_COUNTER_ACTION_BATCH_CLEAR;
+    }
 
     flags_status = notify_tools_and_process_flags(va_space,
                                                   gpu,

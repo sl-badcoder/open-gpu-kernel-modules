@@ -274,6 +274,11 @@ struct uvm_va_range_managed_struct
     // hardware access-counter notification promotes their complete VA block.
     bool cpu_access_counter_policy;
 
+    // GPUs for which first-signal whole-allocation prefetch has started. The
+    // bits are updated atomically because GPU service threads may run
+    // concurrently under the VA space read lock.
+    uvm_processor_mask_t gpu_prefetch_started;
+
     // Force the next split on this range to fail. Set by error injection ioctl
     // (testing purposes only).
     bool inject_split_error;

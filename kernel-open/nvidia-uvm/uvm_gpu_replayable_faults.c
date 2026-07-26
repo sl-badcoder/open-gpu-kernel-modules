@@ -38,6 +38,7 @@
 #include "uvm_perf_thrashing.h"
 #include "uvm_gpu_non_replayable_faults.h"
 #include "uvm_ats_faults.h"
+#include "uvm_cpu_block_policy.h"
 #include "uvm_test.h"
 
 // The documentation at the beginning of uvm_gpu_non_replayable_faults.c
@@ -1539,6 +1540,11 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_t *gpu,
                                                       hmm_migratable,
                                                       &read_duplicate);
 
+        if (uvm_cpu_block_policy_should_promote_on_fault(va_block, gpu)) {
+            new_residency = gpu->id;
+            read_duplicate = false;
+        }
+
         if (!uvm_processor_mask_test_and_set(&block_context->resident_processors, new_residency))
             uvm_page_mask_zero(&block_context->per_processor_masks[uvm_id_value(new_residency)].new_residency);
 
@@ -1962,6 +1968,8 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
 
     if (status == NV_OK) {
         status = service_fault_batch_block(gpu, va_block, batch_context, fault_index, hmm_migratable, block_faults);
+        if (status == NV_OK && !uvm_va_block_is_hmm(va_block))
+            uvm_cpu_block_policy_prefetch_on_first_signal(va_block, gpu, mm);
     }
     else if ((status == NV_ERR_INVALID_ADDRESS) && uvm_ats_can_service_faults(gpu_va_space, mm)) {
         NvU64 outer = ~0ULL;
