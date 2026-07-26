@@ -24,12 +24,16 @@
 #include "uvm_global.h"
 #include "uvm_gpu.h"
 #include "uvm_linux.h"
+#include "uvm_perf_thrashing.h"
 #include "uvm_va_block.h"
 #include "uvm_va_range.h"
 #include "uvm_va_space.h"
 
 static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
 static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_prefetched_bytes = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
 
 static int promotion_count_get(char *buffer, const struct kernel_param *kp)
 {
@@ -45,12 +49,42 @@ static const struct kernel_param_ops promotion_count_ops = {
     .get = promotion_count_get,
 };
 
+static int atomic64_count_get(char *buffer, const struct kernel_param *kp)
+{
+    atomic64_t *counter = kp->arg;
+
+    return scnprintf(buffer, PAGE_SIZE, "%lld\n", (long long)atomic64_read(counter));
+}
+
+static const struct kernel_param_ops atomic64_count_ops = {
+    .get = atomic64_count_get,
+};
+
 module_param(uvm_cpu_preferred_blocks_enable, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_blocks_enable,
-                 "Keep managed allocations CPU-preferred and promote complete populated VA blocks on GPU access-counter notifications.");
+                 "Keep managed allocations CPU-preferred and promote them to a GPU on access-counter notifications "
+                 "or their first GPU fault.");
 module_param_cb(uvm_cpu_preferred_block_promotions, &promotion_count_ops, NULL, S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_block_promotions,
                  "Number of successful access-counter VA-block promotion service operations.");
+module_param_cb(uvm_cpu_preferred_range_prefetches,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_range_prefetches,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_range_prefetches,
+                 "Number of managed allocation prefetches started by a first GPU fault.");
+module_param_cb(uvm_cpu_preferred_prefetched_bytes,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_prefetched_bytes,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetched_bytes,
+                 "Number of bytes moved by first-GPU-fault managed allocation prefetches.");
+module_param_cb(uvm_cpu_preferred_prefetch_capacity_stops,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_prefetch_capacity_stops,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_capacity_stops,
+                 "Number of managed allocation prefetches stopped because no unallocated VRAM remained.");
 
 bool uvm_cpu_block_policy_enabled(void)
 {
@@ -63,6 +97,14 @@ static bool gpu_supported(uvm_va_space_t *va_space, uvm_gpu_t *gpu)
         return false;
 
     return uvm_processor_mask_test(&va_space->accessible_from[uvm_id_value(UVM_ID_CPU)], gpu->id);
+}
+
+static bool use_access_counter_trigger(void)
+{
+    // Virtual access-counter migrations are not serviced on 4K-page kernels.
+    // Avoid AccessedBy remote mappings there so the first GPU access produces
+    // the replayable fault used to trigger whole-allocation prefetch.
+    return PAGE_SIZE != UVM_PAGE_SIZE_4K;
 }
 
 void uvm_cpu_block_policy_init_range(uvm_va_range_managed_t *managed_range)
@@ -79,9 +121,11 @@ void uvm_cpu_block_policy_init_range(uvm_va_range_managed_t *managed_range)
     managed_range->policy.preferred_location = UVM_ID_CPU;
     managed_range->policy.preferred_nid = NUMA_NO_NODE;
 
-    for_each_va_space_gpu(gpu, va_space) {
-        if (gpu_supported(va_space, gpu))
-            uvm_processor_mask_set(&managed_range->policy.accessed_by, gpu->id);
+    if (use_access_counter_trigger()) {
+        for_each_va_space_gpu(gpu, va_space) {
+            if (gpu_supported(va_space, gpu))
+                uvm_processor_mask_set(&managed_range->policy.accessed_by, gpu->id);
+        }
     }
 }
 
@@ -97,6 +141,13 @@ bool uvm_cpu_block_policy_should_add_accessed_by(uvm_va_range_managed_t *managed
         !gpu_supported(va_space, gpu)) {
         return false;
     }
+
+    // A GPU can be unregistered and later registered again in the same VA
+    // space. Allow its new first fault to trigger prefetch again.
+    uvm_processor_mask_clear(&managed_range->fault_prefetch_started, gpu->id);
+
+    if (!use_access_counter_trigger())
+        return false;
 
     uvm_processor_mask_set(&managed_range->policy.accessed_by, gpu->id);
     return true;
@@ -121,6 +172,162 @@ bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gp
     va_space = managed_range->va_range.va_space;
     return gpu_supported(va_space, gpu) &&
            uvm_processor_mask_test(&managed_range->policy.accessed_by, gpu->id);
+}
+
+bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+{
+    uvm_va_range_managed_t *managed_range;
+
+    if (!gpu || uvm_va_block_is_hmm(va_block))
+        return false;
+
+    managed_range = va_block->managed_range;
+
+    return managed_range &&
+           managed_range->cpu_access_counter_policy &&
+           UVM_ID_IS_CPU(managed_range->policy.preferred_location) &&
+           gpu_supported(managed_range->va_range.va_space, gpu);
+}
+
+static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
+                                uvm_gpu_t *gpu,
+                                struct mm_struct *mm,
+                                uvm_va_block_context_t *block_context,
+                                NvU64 *prefetched_bytes,
+                                bool *capacity_stop)
+{
+    NV_STATUS status;
+    uvm_va_block_retry_t retry;
+    uvm_page_mask_t prefetch_mask;
+    const uvm_page_mask_t *cpu_resident;
+    const uvm_page_mask_t *gpu_resident;
+    const uvm_page_mask_t *thrashing_pages;
+    NvU32 page_count;
+
+    *capacity_stop = false;
+    uvm_mutex_lock(&va_block->lock);
+
+    cpu_resident = uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, NUMA_NO_NODE);
+    if (!cpu_resident) {
+        status = NV_OK;
+        goto out_unlock;
+    }
+
+    uvm_page_mask_copy(&prefetch_mask, cpu_resident);
+
+    gpu_resident = uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE);
+    if (gpu_resident)
+        uvm_page_mask_andnot(&prefetch_mask, &prefetch_mask, gpu_resident);
+
+    // UVM's thrashing policy forbids speculative prefetch of pages it is
+    // actively protecting from migration.
+    thrashing_pages = uvm_perf_thrashing_get_thrashing_pages(va_block);
+    if (thrashing_pages)
+        uvm_page_mask_andnot(&prefetch_mask, &prefetch_mask, thrashing_pages);
+
+    page_count = uvm_page_mask_weight(&prefetch_mask);
+    if (page_count == 0) {
+        status = NV_OK;
+        goto out_unlock;
+    }
+
+    uvm_va_block_context_init(block_context, mm);
+    uvm_page_mask_zero(&block_context->make_resident.pages_changed_residency);
+    uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
+
+    uvm_va_block_retry_init(&retry);
+    retry.allow_eviction = false;
+
+    status = uvm_va_block_make_resident(va_block,
+                                        &retry,
+                                        block_context,
+                                        gpu->id,
+                                        uvm_va_block_region_from_block(va_block),
+                                        &prefetch_mask,
+                                        NULL,
+                                        UVM_MAKE_RESIDENT_CAUSE_PREFETCH);
+
+    if (status == NV_OK) {
+        *prefetched_bytes +=
+            (NvU64)uvm_page_mask_weight(&block_context->make_resident.pages_changed_residency) * PAGE_SIZE;
+    }
+    else {
+        *capacity_stop = retry.no_eviction_allocation_failed;
+    }
+
+    uvm_mutex_unlock(&va_block->lock);
+    uvm_va_block_retry_deinit(&retry, va_block);
+    return status;
+
+out_unlock:
+    uvm_mutex_unlock(&va_block->lock);
+    return status;
+}
+
+void uvm_cpu_block_policy_prefetch_on_first_fault(uvm_va_block_t *faulted_block,
+                                                  uvm_gpu_t *gpu,
+                                                  struct mm_struct *mm)
+{
+    uvm_va_range_managed_t *managed_range = faulted_block->managed_range;
+    uvm_va_space_t *va_space;
+    uvm_va_block_context_t *block_context;
+    size_t block_count;
+    size_t start_index;
+    size_t offset;
+    NvU64 prefetched_bytes = 0;
+
+    if (!managed_range || !uvm_cpu_block_policy_should_promote_on_fault(faulted_block, gpu))
+        return;
+
+    va_space = managed_range->va_range.va_space;
+    uvm_assert_rwsem_locked_read(&va_space->lock);
+
+    if (uvm_processor_mask_test(&managed_range->fault_prefetch_started, gpu->id))
+        return;
+
+    block_context = uvm_va_block_context_alloc(mm);
+    if (!block_context)
+        return;
+
+    if (uvm_processor_mask_test_and_set_atomic(&managed_range->fault_prefetch_started, gpu->id))
+        goto out;
+
+    atomic64_inc(&uvm_cpu_preferred_range_prefetches);
+
+    block_count = uvm_va_range_num_blocks(managed_range);
+    start_index = uvm_va_range_block_index(managed_range, faulted_block->start);
+
+    // Start at the faulted block and wrap once so limited free VRAM is spent
+    // first on pages spatially following the initial GPU access.
+    for (offset = 0; offset < block_count; ++offset) {
+        size_t block_index = (start_index + offset) % block_count;
+        uvm_va_block_t *va_block = uvm_va_range_block(managed_range, block_index);
+        NV_STATUS status;
+        bool capacity_stop;
+
+        // Managed pages are populated lazily. Do not instantiate untouched VA
+        // blocks merely to prefetch zero-filled memory.
+        if (!va_block)
+            continue;
+
+        status = prefetch_block(va_block, gpu, mm, block_context, &prefetched_bytes, &capacity_stop);
+        if (capacity_stop) {
+            atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
+            break;
+        }
+
+        if (status != NV_OK) {
+            UVM_DBG_PRINT("Managed allocation prefetch stopped with %s on GPU %s\n",
+                          nvstatusToString(status),
+                          gpu->parent->name);
+            break;
+        }
+    }
+
+    atomic64_add(prefetched_bytes, &uvm_cpu_preferred_prefetched_bytes);
+
+out:
+    uvm_va_block_context_free(block_context);
 }
 
 void uvm_cpu_block_policy_record_promotion(void)

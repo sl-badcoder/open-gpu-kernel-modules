@@ -272,9 +272,14 @@ struct uvm_va_range_managed_struct
     // stored in the va_block for HMM allocations.
     uvm_va_policy_t policy;
 
-    // When enabled, CPU-resident pages are mapped remotely on GPUs and a
-    // hardware access-counter notification promotes their complete VA block.
+    // When enabled, CPU-resident managed pages are promoted to GPUs by access
+    // counters or first-GPU-fault whole-allocation prefetch.
     bool cpu_access_counter_policy;
+
+    // GPUs for which the first-fault whole-allocation prefetch has been
+    // started. Bits are updated atomically because fault handlers for
+    // different GPUs may run concurrently under the VA space read lock.
+    uvm_processor_mask_t fault_prefetch_started;
 
     // Force the next split on this range to fail. Set by error injection ioctl
     // (testing purposes only).

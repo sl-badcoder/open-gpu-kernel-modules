@@ -23,6 +23,7 @@
 #ifndef __UVM_CPU_BLOCK_POLICY_H__
 #define __UVM_CPU_BLOCK_POLICY_H__
 
+#include "uvm_common.h"
 #include "uvm_forward_decl.h"
 
 bool uvm_cpu_block_policy_enabled(void);
@@ -30,6 +31,10 @@ void uvm_cpu_block_policy_init_range(uvm_va_range_managed_t *managed_range);
 bool uvm_cpu_block_policy_should_add_accessed_by(uvm_va_range_managed_t *managed_range,
                                                 uvm_gpu_t *gpu);
 bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
+bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
+void uvm_cpu_block_policy_prefetch_on_first_fault(uvm_va_block_t *faulted_block,
+                                                  uvm_gpu_t *gpu,
+                                                  struct mm_struct *mm);
 void uvm_cpu_block_policy_record_promotion(void);
 
 #endif

@@ -591,6 +591,16 @@ struct uvm_va_block_retry_struct
     // A tracker used for all allocations from PMM.
     uvm_tracker_t tracker;
 
+    // Whether a failed GPU allocation may evict existing GPU memory and retry.
+    // Opportunistic prefetching disables eviction so that it only consumes
+    // currently available VRAM.
+    bool allow_eviction;
+
+    // Set when an allocation failed specifically because eviction was
+    // disabled. This distinguishes a capacity stop from unrelated metadata
+    // allocation failures which also return NV_ERR_NO_MEMORY.
+    bool no_eviction_allocation_failed;
+
     // List of allocated chunks (uvm_gpu_chunk_t). Currently all chunks are of
     // the same size. However it can contain chunks from multiple GPUs. All
     // remaining free chunks are freed when the operation is finished with
