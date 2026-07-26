@@ -321,6 +321,11 @@ struct uvm_va_block_struct
     // zeroed.
     uvm_processor_mask_t ever_fully_resident;
 
+    // GPUs for which this 2MB VA block has already triggered an
+    // access-counter-guided prefetch chunk. Bits are updated atomically since
+    // GPU service threads may run concurrently under the VA space read lock.
+    uvm_processor_mask_t gpu_prefetch_started;
+
     // Per-processor mapping bit vector, used for fast lookup of which
     // processors are active in this block.
     //

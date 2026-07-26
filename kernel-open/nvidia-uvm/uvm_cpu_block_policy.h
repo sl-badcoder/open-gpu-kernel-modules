@@ -34,9 +34,9 @@ bool uvm_cpu_block_policy_should_service_4k(uvm_va_range_managed_t *managed_rang
                                            uvm_gpu_t *gpu);
 bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
 bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
-void uvm_cpu_block_policy_prefetch_on_first_signal(uvm_va_block_t *trigger_block,
-                                                   uvm_gpu_t *gpu,
-                                                   struct mm_struct *mm);
+void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
+                                             uvm_gpu_t *gpu,
+                                             struct mm_struct *mm);
 void uvm_cpu_block_policy_record_promotion(void);
 
 #endif

@@ -29,7 +29,11 @@
 #include "uvm_va_range.h"
 #include "uvm_va_space.h"
 
+#define UVM_CPU_PREFERRED_PREFETCH_CHUNK_MB_DEFAULT 64
+
 static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
+static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly =
+    UVM_CPU_PREFERRED_PREFETCH_CHUNK_MB_DEFAULT;
 static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetched_bytes = ATOMIC64_INIT(0);
@@ -63,7 +67,11 @@ static const struct kernel_param_ops atomic64_count_ops = {
 module_param(uvm_cpu_preferred_blocks_enable, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_blocks_enable,
                  "Keep managed allocations CPU-preferred, promote populated VA blocks on GPU access-counter "
-                 "notifications, and prefetch the allocation on its first GPU signal.");
+                 "notifications, and prefetch a configurable chunk around each new 2MB GPU signal.");
+module_param(uvm_cpu_preferred_prefetch_chunk_mb, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_chunk_mb,
+                 "Access-counter-guided prefetch chunk size in MiB. Non-zero values are rounded up to 2MB; "
+                 "zero disables speculative chunk prefetch.");
 module_param_cb(uvm_cpu_preferred_block_promotions, &promotion_count_ops, NULL, S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_block_promotions,
                  "Number of successful access-counter VA-block promotion service operations.");
@@ -72,13 +80,13 @@ module_param_cb(uvm_cpu_preferred_range_prefetches,
                 &uvm_cpu_preferred_range_prefetches,
                 S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_range_prefetches,
-                 "Number of managed allocation prefetches started by a first GPU signal.");
+                 "Number of access-counter-guided managed allocation chunk prefetches started.");
 module_param_cb(uvm_cpu_preferred_prefetched_bytes,
                 &atomic64_count_ops,
                 &uvm_cpu_preferred_prefetched_bytes,
                 S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_prefetched_bytes,
-                 "Number of bytes moved by first-GPU-signal managed allocation prefetches.");
+                 "Number of bytes moved by access-counter-guided managed allocation chunk prefetches.");
 module_param_cb(uvm_cpu_preferred_prefetch_capacity_stops,
                 &atomic64_count_ops,
                 &uvm_cpu_preferred_prefetch_capacity_stops,
@@ -123,6 +131,7 @@ bool uvm_cpu_block_policy_should_add_accessed_by(uvm_va_range_managed_t *managed
                                                 uvm_gpu_t *gpu)
 {
     uvm_va_space_t *va_space = managed_range->va_range.va_space;
+    uvm_va_block_t *va_block;
 
     uvm_assert_rwsem_locked_write(&va_space->lock);
 
@@ -133,8 +142,10 @@ bool uvm_cpu_block_policy_should_add_accessed_by(uvm_va_range_managed_t *managed
     }
 
     // A GPU may be unregistered and registered again in the same VA space.
-    // Permit the newly registered instance to trigger prefetch again.
-    uvm_processor_mask_clear_atomic(&managed_range->gpu_prefetch_started, gpu->id);
+    // Permit the newly registered instance to trigger each block again.
+    for_each_va_block_in_va_range(managed_range, va_block)
+        uvm_processor_mask_clear_atomic(&va_block->gpu_prefetch_started, gpu->id);
+
     uvm_processor_mask_set(&managed_range->policy.accessed_by, gpu->id);
     return true;
 }
@@ -241,6 +252,20 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
     if (status == NV_OK) {
         *prefetched_bytes +=
             (NvU64)uvm_page_mask_weight(&block_context->make_resident.pages_changed_residency) * PAGE_SIZE;
+
+        // make_resident updates physical residency but does not install a
+        // destination GPU PTE. Map the prefetched pages locally now so their
+        // first use does not fall back to an AccessedBy system-memory mapping.
+        do {
+            status = uvm_va_block_map(va_block,
+                                      block_context,
+                                      gpu->id,
+                                      uvm_va_block_region_from_block(va_block),
+                                      &prefetch_mask,
+                                      UVM_PROT_READ_WRITE_ATOMIC,
+                                      UvmEventMapRemoteCauseInvalid,
+                                      &va_block->tracker);
+        } while (status == NV_ERR_MORE_PROCESSING_REQUIRED);
     }
     else {
         *capacity_stop = retry.no_eviction_allocation_failed;
@@ -255,43 +280,62 @@ out_unlock:
     return status;
 }
 
-void uvm_cpu_block_policy_prefetch_on_first_signal(uvm_va_block_t *trigger_block,
-                                                   uvm_gpu_t *gpu,
-                                                   struct mm_struct *mm)
+void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
+                                             uvm_gpu_t *gpu,
+                                             struct mm_struct *mm)
 {
     uvm_va_range_managed_t *managed_range = trigger_block->managed_range;
     uvm_va_space_t *va_space;
     uvm_va_block_context_t *block_context;
     size_t block_count;
+    size_t chunk_block_count;
+    size_t end_index;
     size_t start_index;
-    size_t offset;
+    size_t trigger_index;
+    size_t block_index;
+    NvU64 chunk_bytes;
     NvU64 prefetched_bytes = 0;
+    unsigned prefetch_chunk_mb = READ_ONCE(uvm_cpu_preferred_prefetch_chunk_mb);
 
-    if (!managed_range || !uvm_cpu_block_policy_should_promote_on_fault(trigger_block, gpu))
+    if (!managed_range ||
+        prefetch_chunk_mb == 0 ||
+        !uvm_cpu_block_policy_should_promote_on_fault(trigger_block, gpu)) {
         return;
+    }
 
     va_space = managed_range->va_range.va_space;
     uvm_assert_rwsem_locked_read(&va_space->lock);
 
-    if (uvm_processor_mask_test(&managed_range->gpu_prefetch_started, gpu->id))
+    if (uvm_processor_mask_test(&trigger_block->gpu_prefetch_started, gpu->id))
         return;
 
     block_context = uvm_va_block_context_alloc(mm);
     if (!block_context)
         return;
 
-    if (uvm_processor_mask_test_and_set_atomic(&managed_range->gpu_prefetch_started, gpu->id))
+    if (uvm_processor_mask_test_and_set_atomic(&trigger_block->gpu_prefetch_started, gpu->id))
         goto out;
 
     atomic64_inc(&uvm_cpu_preferred_range_prefetches);
 
     block_count = uvm_va_range_num_blocks(managed_range);
-    start_index = uvm_va_range_block_index(managed_range, trigger_block->start);
+    trigger_index = uvm_va_range_block_index(managed_range, trigger_block->start);
+    chunk_bytes = (NvU64)prefetch_chunk_mb * UVM_SIZE_1MB;
+    chunk_block_count = (chunk_bytes + UVM_VA_BLOCK_SIZE - 1) / UVM_VA_BLOCK_SIZE;
+    chunk_block_count = max_t(size_t, chunk_block_count, 1);
+    chunk_block_count = min(chunk_block_count, block_count);
 
-    // Start at the block which produced the signal, then wrap once. This
-    // prioritizes nearby data if only part of the allocation fits in VRAM.
-    for (offset = 0; offset < block_count; ++offset) {
-        size_t block_index = (start_index + offset) % block_count;
+    // Center the configurable chunk on the 2MB block which produced the
+    // access-counter notification. Shift at allocation boundaries so a full
+    // chunk is still considered whenever the range is large enough.
+    start_index = trigger_index > chunk_block_count / 2 ?
+                      trigger_index - chunk_block_count / 2 :
+                      0;
+    if (start_index + chunk_block_count > block_count)
+        start_index = block_count - chunk_block_count;
+    end_index = start_index + chunk_block_count;
+
+    for (block_index = start_index; block_index < end_index; ++block_index) {
         uvm_va_block_t *va_block = uvm_va_range_block(managed_range, block_index);
         NV_STATUS status;
         bool capacity_stop;
