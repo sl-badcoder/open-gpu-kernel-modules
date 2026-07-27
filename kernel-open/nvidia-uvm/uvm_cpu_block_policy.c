@@ -32,6 +32,7 @@
 #define UVM_CPU_PREFERRED_PREFETCH_CHUNK_MB_DEFAULT 64
 
 static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
+static unsigned uvm_cpu_preferred_block_promotion_enable __read_mostly = 1;
 static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly =
     UVM_CPU_PREFERRED_PREFETCH_CHUNK_MB_DEFAULT;
 static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
@@ -66,8 +67,11 @@ static const struct kernel_param_ops atomic64_count_ops = {
 
 module_param(uvm_cpu_preferred_blocks_enable, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_blocks_enable,
-                 "Keep managed allocations CPU-preferred, promote populated VA blocks on GPU access-counter "
-                 "notifications, and prefetch a configurable chunk around each new 2MB GPU signal.");
+                 "Keep managed allocations CPU-preferred and enable access-counter-guided migration policy.");
+module_param(uvm_cpu_preferred_block_promotion_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_cpu_preferred_block_promotion_enable,
+                 "Promote complete populated 2MB VA blocks on GPU access-counter notifications. "
+                 "Zero leaves speculative prefetch enabled without block promotion.");
 module_param(uvm_cpu_preferred_prefetch_chunk_mb, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_chunk_mb,
                  "Access-counter-guided prefetch chunk size in MiB. Non-zero values are rounded up to 2MB; "
@@ -167,8 +171,11 @@ bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gp
 {
     uvm_va_range_managed_t *managed_range;
 
-    if (!gpu || uvm_va_block_is_hmm(va_block))
+    if (!READ_ONCE(uvm_cpu_preferred_block_promotion_enable) ||
+        !gpu ||
+        uvm_va_block_is_hmm(va_block)) {
         return false;
+    }
 
     uvm_assert_mutex_locked(&va_block->lock);
     managed_range = va_block->managed_range;
@@ -178,7 +185,7 @@ bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gp
     return uvm_cpu_block_policy_should_service_4k(managed_range, gpu);
 }
 
-bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+static bool should_handle_gpu_signal(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
 {
     uvm_va_range_managed_t *managed_range;
 
@@ -191,6 +198,12 @@ bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_
            managed_range->cpu_access_counter_policy &&
            UVM_ID_IS_CPU(managed_range->policy.preferred_location) &&
            gpu_supported(managed_range->va_range.va_space, gpu);
+}
+
+bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+{
+    return READ_ONCE(uvm_cpu_preferred_block_promotion_enable) &&
+           should_handle_gpu_signal(va_block, gpu);
 }
 
 static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
@@ -299,7 +312,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
 
     if (!managed_range ||
         prefetch_chunk_mb == 0 ||
-        !uvm_cpu_block_policy_should_promote_on_fault(trigger_block, gpu)) {
+        !should_handle_gpu_signal(trigger_block, gpu)) {
         return;
     }
 
