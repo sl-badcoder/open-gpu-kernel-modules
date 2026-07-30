@@ -67,7 +67,7 @@ typedef struct
 } va_space_access_counters_info_t;
 
 // Enable/disable access-counter-guided migrations
-static int uvm_perf_access_counter_migration_enable = -1;
+static int uvm_perf_access_counter_migration_enable = 1;
 
 // Number of entries that are fetched from the GPU access counter notification
 // buffer and serviced in batch
@@ -80,7 +80,7 @@ static unsigned uvm_perf_access_counter_threshold = UVM_PERF_ACCESS_COUNTER_THRE
 module_param(uvm_perf_access_counter_migration_enable, int, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_access_counter_migration_enable,
                  "Whether access counters will trigger migrations."
-                 "Valid values: <= -1 (default policy), 0 (off), >= 1 (on)");
+                 "Valid values: <= -1 (platform policy), 0 (off), >= 1 (on, default)");
 module_param(uvm_perf_access_counter_batch_count, uint, S_IRUGO);
 module_param(uvm_perf_access_counter_threshold, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_access_counter_threshold,
@@ -1478,6 +1478,15 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     batch_context->block_service_context.access_counters_buffer_index = access_counters->index;
 
     status = service_notification_va_block_helper(mm, va_block, gpu, batch_context);
+
+    if (status == NV_OK) {
+        for (i = index; i < *out_index; i++) {
+            uvm_access_counter_buffer_entry_t *entry = notifications[i];
+            uvm_gpu_chunk_t *chunk = uvm_va_block_lookup_gpu_chunk(va_block, gpu, entry->address);
+
+            uvm_pmm_gpu_mark_chunk_accessed(&gpu->pmm, chunk, entry->counter_value);
+        }
+    }
 
     uvm_mutex_unlock(&va_block->lock);
 

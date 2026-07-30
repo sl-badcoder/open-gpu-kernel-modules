@@ -368,6 +368,13 @@ typedef struct uvm_gpu_root_chunk_struct
 {
     uvm_gpu_chunk_t chunk;
 
+    // Decaying access-counter heat used to order user-memory eviction.
+    //
+    // Protected by the owning PMM's list_lock. The score is updated from
+    // access-counter servicing and aged by the eager eviction worker.
+    NvU64 access_heat;
+    NvU64 last_access_epoch;
+
     // Pending operations for all GPU chunks under the root chunk.
     //
     // Protected by the corresponding root chunk bit lock.
@@ -439,6 +446,17 @@ typedef struct uvm_pmm_gpu_struct
     // Inject an error after evicting a number of chunks. 0 means no error left
     // to be injected.
     NvU32 inject_pma_evict_error_after_num_chunks;
+
+    struct
+    {
+        // Periodically ages access heat and proactively evicts cold user
+        // memory. The worker uses the existing VA-block eviction path, so VA
+        // mappings and migration bookkeeping remain unchanged.
+        struct delayed_work work;
+        NvU64 epoch;
+        bool recovering_watermark;
+        bool stopping;
+    } eager_eviction;
 
     // The mask of the initialized chunk sizes
     DECLARE_BITMAP(chunk_split_cache_initialized, UVM_PMM_CHUNK_SPLIT_CACHE_SIZES);
@@ -618,6 +636,15 @@ void uvm_pmm_gpu_mark_root_chunk_unused(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chu
 
 // Mark an allocated chunk as discarded
 void uvm_pmm_gpu_mark_root_chunk_discarded(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
+
+// Add an access-counter sample to the root chunk backing chunk and request an
+// eager policy pass. chunk may be NULL when a notification did not result in
+// GPU residency.
+void uvm_pmm_gpu_mark_chunk_accessed(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, NvU32 counter_value);
+
+// Return true when proactive user-memory growth should stop at the configured
+// high watermark. A true result also kicks the background eviction worker.
+bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm);
 
 static bool uvm_gpu_chunk_same_root(uvm_gpu_chunk_t *chunk1, uvm_gpu_chunk_t *chunk2)
 {

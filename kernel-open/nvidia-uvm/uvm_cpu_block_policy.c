@@ -353,6 +353,14 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         NV_STATUS status;
         bool capacity_stop;
 
+        // Speculative prefetch must not consume the headroom reserved by the
+        // eager eviction policy. Demand migration can still make forward
+        // progress while the background worker reclaims cold regions.
+        if (uvm_pmm_gpu_eager_eviction_watermark_reached(&gpu->pmm)) {
+            atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
+            break;
+        }
+
         // Managed pages are populated lazily. Avoid instantiating untouched VA
         // blocks just to create speculative zero-filled backing.
         if (!va_block)
