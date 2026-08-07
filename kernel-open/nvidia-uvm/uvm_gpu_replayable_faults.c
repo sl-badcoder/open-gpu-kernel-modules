@@ -1968,8 +1968,6 @@ static NV_STATUS service_fault_batch_dispatch(uvm_va_space_t *va_space,
 
     if (status == NV_OK) {
         status = service_fault_batch_block(gpu, va_block, batch_context, fault_index, hmm_migratable, block_faults);
-        if (status == NV_OK && !uvm_va_block_is_hmm(va_block))
-            uvm_cpu_block_policy_prefetch_on_signal(va_block, gpu, mm);
     }
     else if ((status == NV_ERR_INVALID_ADDRESS) && uvm_ats_can_service_faults(gpu_va_space, mm)) {
         NvU64 outer = ~0ULL;
