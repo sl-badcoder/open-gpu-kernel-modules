@@ -37,6 +37,7 @@ static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly =
     UVM_CPU_PREFERRED_PREFETCH_CHUNK_MB_DEFAULT;
 static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_prefetch_retries = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetched_bytes = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
 
@@ -85,6 +86,12 @@ module_param_cb(uvm_cpu_preferred_range_prefetches,
                 S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_range_prefetches,
                  "Number of access-counter-guided managed allocation chunk prefetches started.");
+module_param_cb(uvm_cpu_preferred_prefetch_retries,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_prefetch_retries,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_retries,
+                 "Number of capacity-stopped managed allocation prefetches retried.");
 module_param_cb(uvm_cpu_preferred_prefetched_bytes,
                 &atomic64_count_ops,
                 &uvm_cpu_preferred_prefetched_bytes,
@@ -147,8 +154,10 @@ bool uvm_cpu_block_policy_should_add_accessed_by(uvm_va_range_managed_t *managed
 
     // A GPU may be unregistered and registered again in the same VA space.
     // Permit the newly registered instance to trigger each block again.
-    for_each_va_block_in_va_range(managed_range, va_block)
+    for_each_va_block_in_va_range(managed_range, va_block) {
         uvm_processor_mask_clear_atomic(&va_block->gpu_prefetch_started, gpu->id);
+        uvm_processor_mask_clear_atomic(&va_block->gpu_prefetch_retry, gpu->id);
+    }
 
     uvm_processor_mask_set(&managed_range->policy.accessed_by, gpu->id);
     return true;
@@ -309,6 +318,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     NvU64 chunk_bytes;
     NvU64 prefetched_bytes = 0;
     unsigned prefetch_chunk_mb = READ_ONCE(uvm_cpu_preferred_prefetch_chunk_mb);
+    bool retry = false;
+    bool capacity_stopped = false;
 
     if (!managed_range ||
         prefetch_chunk_mb == 0 ||
@@ -319,8 +330,20 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     va_space = managed_range->va_range.va_space;
     uvm_assert_rwsem_locked_read(&va_space->lock);
 
-    if (uvm_processor_mask_test(&trigger_block->gpu_prefetch_started, gpu->id))
-        return;
+    if (uvm_processor_mask_test(&trigger_block->gpu_prefetch_started, gpu->id)) {
+        if (!uvm_processor_mask_test(&trigger_block->gpu_prefetch_retry, gpu->id) ||
+            uvm_pmm_gpu_eager_eviction_watermark_reached(&gpu->pmm)) {
+            return;
+        }
+
+        // Claim this retry before clearing started. This prevents concurrent
+        // GPU service threads from both turning the retry into a new attempt.
+        if (!uvm_processor_mask_test_and_clear_atomic(&trigger_block->gpu_prefetch_retry, gpu->id))
+            return;
+
+        uvm_processor_mask_clear_atomic(&trigger_block->gpu_prefetch_started, gpu->id);
+        retry = true;
+    }
 
     block_context = uvm_va_block_context_alloc(mm);
     if (!block_context)
@@ -330,6 +353,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         goto out;
 
     atomic64_inc(&uvm_cpu_preferred_range_prefetches);
+    if (retry)
+        atomic64_inc(&uvm_cpu_preferred_prefetch_retries);
 
     block_count = uvm_va_range_num_blocks(managed_range);
     trigger_index = uvm_va_range_block_index(managed_range, trigger_block->start);
@@ -358,6 +383,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         // progress while the background worker reclaims cold regions.
         if (uvm_pmm_gpu_eager_eviction_watermark_reached(&gpu->pmm)) {
             atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
+            capacity_stopped = true;
             break;
         }
 
@@ -369,6 +395,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         status = prefetch_block(va_block, gpu, mm, block_context, &prefetched_bytes, &capacity_stop);
         if (capacity_stop) {
             atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
+            capacity_stopped = true;
             break;
         }
 
@@ -381,6 +408,13 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     }
 
     atomic64_add(prefetched_bytes, &uvm_cpu_preferred_prefetched_bytes);
+
+    // Keep completed attempts one-shot, but re-arm capacity-stopped attempts.
+    // The started bit remains set so signals are cheap while usage is still
+    // above the high watermark. Once there is headroom, one service thread
+    // claims gpu_prefetch_retry and starts the next attempt.
+    if (capacity_stopped)
+        uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
 
 out:
     uvm_va_block_context_free(block_context);

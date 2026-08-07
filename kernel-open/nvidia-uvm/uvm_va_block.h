@@ -326,6 +326,13 @@ struct uvm_va_block_struct
     // GPU service threads may run concurrently under the VA space read lock.
     uvm_processor_mask_t gpu_prefetch_started;
 
+    // GPUs for which the access-counter-guided prefetch chunk stopped because
+    // there was not enough GPU memory. A subsequent signal may claim the retry
+    // after eager eviction has lowered GPU memory usage below its high
+    // watermark. Bits are updated atomically for the same reason as
+    // gpu_prefetch_started.
+    uvm_processor_mask_t gpu_prefetch_retry;
+
     // Per-processor mapping bit vector, used for fast lookup of which
     // processors are active in this block.
     //
