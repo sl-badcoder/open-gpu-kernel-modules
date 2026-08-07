@@ -191,10 +191,10 @@ MODULE_PARM_DESC(uvm_global_oversubscription, "Enable (1) or disable (0) global 
 static bool uvm_perf_eager_eviction_enable = true;
 static unsigned uvm_perf_eager_eviction_high_watermark = 90;
 static unsigned uvm_perf_eager_eviction_low_watermark = 85;
-static unsigned uvm_perf_eager_eviction_interval_ms = 100;
+static unsigned uvm_perf_eager_eviction_interval_ms = 25;
 static unsigned uvm_perf_eager_eviction_heat_ratio = 2;
 static unsigned uvm_perf_eager_eviction_stale_intervals = 5;
-static unsigned uvm_perf_eager_eviction_batch_count = 8;
+static unsigned uvm_perf_eager_eviction_batch_count = 16;
 
 module_param(uvm_perf_eager_eviction_enable, bool, S_IRUGO);
 module_param(uvm_perf_eager_eviction_high_watermark, uint, S_IRUGO);
@@ -211,13 +211,13 @@ MODULE_PARM_DESC(uvm_perf_eager_eviction_high_watermark,
 MODULE_PARM_DESC(uvm_perf_eager_eviction_low_watermark,
                  "VRAM usage target and hot/cold replacement floor (default: 85).");
 MODULE_PARM_DESC(uvm_perf_eager_eviction_interval_ms,
-                 "Access heat aging and eviction interval in milliseconds (default: 100).");
+                 "Access heat aging and eviction interval in milliseconds (default: 25).");
 MODULE_PARM_DESC(uvm_perf_eager_eviction_heat_ratio,
                  "Minimum hot-to-cold access heat ratio for proactive replacement (default: 2).");
 MODULE_PARM_DESC(uvm_perf_eager_eviction_stale_intervals,
                  "Intervals without a sampled access before a zero-heat chunk is stale (default: 5).");
 MODULE_PARM_DESC(uvm_perf_eager_eviction_batch_count,
-                 "Maximum 2MB root chunks evicted by one background pass (default: 8).");
+                 "Maximum 2MB root chunks evicted by one background pass (default: 16).");
 
 #define UVM_PERF_PMA_BATCH_NONPINNED_ORDER_DEFAULT 6
 
@@ -1832,11 +1832,9 @@ static void eager_eviction_work(struct work_struct *work)
 
         usage = eager_eviction_usage_percent(pmm);
 
-        // Ratio-based replacement below the high watermark moves one cold
-        // batch at a time. Watermark recovery continues toward the low
-        // watermark and may use the full batch.
-        if (!force)
-            break;
+        // Both ratio-based replacement and forced watermark recovery may use
+        // the full configured batch. eager_eviction_one() rechecks the
+        // hot/cold condition before every non-forced eviction.
     }
 
     eager_eviction_schedule(pmm, msecs_to_jiffies(max(uvm_perf_eager_eviction_interval_ms, 1U)));
