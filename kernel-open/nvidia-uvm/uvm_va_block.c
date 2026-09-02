@@ -39,6 +39,7 @@
 #include "uvm_perf_prefetch.h"
 #include "uvm_mem.h"
 #include "uvm_gpu_access_counters.h"
+#include "uvm_cpu_block_policy.h"
 #include "uvm_va_space_mm.h"
 #include "uvm_test_ioctl.h"
 #include "uvm_va_policy.h"
@@ -12924,6 +12925,7 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     uvm_va_space_t *va_space = uvm_va_block_get_va_space_maybe_dead(va_block);
     struct mm_struct *mm;
     bool accessed_by_set = false;
+    bool pages_evicted;
 
     uvm_assert_mutex_locked(&va_block->lock);
 
@@ -12999,6 +13001,7 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                      &va_block->discarded_pages,
                      uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE));
     uvm_page_mask_and(pages_to_evict, pages_to_evict, &block_context->scratch_page_mask);
+    pages_evicted = !uvm_page_mask_empty(pages_to_evict);
     uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
 
     if (uvm_va_block_is_hmm(va_block)) {
@@ -13026,6 +13029,9 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     }
     if (status != NV_OK)
         goto out;
+
+    if (pages_evicted)
+        uvm_cpu_block_policy_rearm_on_eviction(va_block, gpu);
 
     // VA space lock may not be held and hence we cannot reestablish any
     // mappings here and need to defer it to a work queue.

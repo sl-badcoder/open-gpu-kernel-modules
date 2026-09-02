@@ -423,6 +423,19 @@ out:
     uvm_va_block_context_free(block_context);
 }
 
+void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+{
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    // A completed prefetch is one-shot only while its trigger block remains
+    // GPU-resident. Once any part of that block is evicted to the CPU, a new
+    // remote-access notification is genuine new demand and may start another
+    // chunk prefetch. Also discard capacity-retry state: the eviction itself
+    // supplies headroom and the next notification should be a fresh attempt.
+    uvm_processor_mask_clear_atomic(&va_block->gpu_prefetch_retry, gpu->id);
+    uvm_processor_mask_clear_atomic(&va_block->gpu_prefetch_started, gpu->id);
+}
+
 void uvm_cpu_block_policy_record_promotion(void)
 {
     atomic64_inc(&uvm_cpu_preferred_block_promotions);
