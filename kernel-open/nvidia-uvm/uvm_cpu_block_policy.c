@@ -29,12 +29,9 @@
 #include "uvm_va_range.h"
 #include "uvm_va_space.h"
 
-#define UVM_CPU_PREFERRED_PREFETCH_CHUNK_MB_DEFAULT 64
-
 static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
 static unsigned uvm_cpu_preferred_block_promotion_enable __read_mostly = 1;
-static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly =
-    UVM_CPU_PREFERRED_PREFETCH_CHUNK_MB_DEFAULT;
+static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly = 64;
 static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_retries = ATOMIC64_INIT(0);
@@ -66,50 +63,35 @@ static const struct kernel_param_ops atomic64_count_ops = {
     .get = atomic64_count_get,
 };
 
+/**
+ * Introduced module params + description
+ * Define new module params here
+ */
 module_param(uvm_cpu_preferred_blocks_enable, uint, S_IRUGO);
-MODULE_PARM_DESC(uvm_cpu_preferred_blocks_enable,
-                 "Keep managed allocations CPU-preferred and enable access-counter-guided migration policy.");
+MODULE_PARM_DESC(uvm_cpu_preferred_blocks_enable, "Keep managed allocations CPU-preferred and enable access-counter-guided migration policy.");
 module_param(uvm_cpu_preferred_block_promotion_enable, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(uvm_cpu_preferred_block_promotion_enable,
-                 "Promote complete populated 2MB VA blocks on GPU access-counter notifications. "
-                 "Zero leaves speculative prefetch enabled without block promotion.");
+MODULE_PARM_DESC(uvm_cpu_preferred_block_promotion_enable, "Promote complete populated 2MB VA blocks on GPU access-counter notifications. " "Zero leaves speculative prefetch enabled without block promotion.");
 module_param(uvm_cpu_preferred_prefetch_chunk_mb, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_chunk_mb,
-                 "Access-counter-guided prefetch chunk size in MiB. Non-zero values are rounded up to 2MB; "
-                 "zero disables speculative chunk prefetch.");
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_chunk_mb, "Access-counter-guided prefetch chunk size in MiB. Non-zero values are rounded up to 2MB; " "zero disables speculative chunk prefetch.");
 module_param_cb(uvm_cpu_preferred_block_promotions, &promotion_count_ops, NULL, S_IRUGO);
-MODULE_PARM_DESC(uvm_cpu_preferred_block_promotions,
-                 "Number of successful access-counter VA-block promotion service operations.");
-module_param_cb(uvm_cpu_preferred_range_prefetches,
-                &atomic64_count_ops,
-                &uvm_cpu_preferred_range_prefetches,
-                S_IRUGO);
-MODULE_PARM_DESC(uvm_cpu_preferred_range_prefetches,
-                 "Number of access-counter-guided managed allocation chunk prefetches started.");
-module_param_cb(uvm_cpu_preferred_prefetch_retries,
-                &atomic64_count_ops,
-                &uvm_cpu_preferred_prefetch_retries,
-                S_IRUGO);
-MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_retries,
-                 "Number of capacity-stopped managed allocation prefetches retried.");
-module_param_cb(uvm_cpu_preferred_prefetched_bytes,
-                &atomic64_count_ops,
-                &uvm_cpu_preferred_prefetched_bytes,
-                S_IRUGO);
-MODULE_PARM_DESC(uvm_cpu_preferred_prefetched_bytes,
-                 "Number of bytes moved by access-counter-guided managed allocation chunk prefetches.");
-module_param_cb(uvm_cpu_preferred_prefetch_capacity_stops,
-                &atomic64_count_ops,
-                &uvm_cpu_preferred_prefetch_capacity_stops,
-                S_IRUGO);
-MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_capacity_stops,
-                 "Number of managed allocation prefetches stopped when free VRAM was exhausted.");
+MODULE_PARM_DESC(uvm_cpu_preferred_block_promotions, "Number of successful access-counter VA-block promotion service operations.");
+module_param_cb(uvm_cpu_preferred_range_prefetches, &atomic64_count_ops, &uvm_cpu_preferred_range_prefetches,S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_range_prefetches,"Number of access-counter-guided managed allocation chunk prefetches started.");
+module_param_cb(uvm_cpu_preferred_prefetch_retries, &atomic64_count_ops, &uvm_cpu_preferred_prefetch_retries, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_retries, "Number of capacity-stopped managed allocation prefetches retried.");
+module_param_cb(uvm_cpu_preferred_prefetched_bytes, &atomic64_count_ops, &uvm_cpu_preferred_prefetched_bytes, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetched_bytes, "Number of bytes moved by access-counter-guided managed allocation chunk prefetches.");
+module_param_cb(uvm_cpu_preferred_prefetch_capacity_stops, &atomic64_count_ops, &uvm_cpu_preferred_prefetch_capacity_stops, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_capacity_stops, "Number of managed allocation prefetches stopped when free VRAM was exhausted.");
 
+
+// check if block policy is enabled
 bool uvm_cpu_block_policy_enabled(void)
 {
     return uvm_cpu_preferred_blocks_enable != 0;
 }
 
+// check if gpu is supported
 static bool gpu_supported(uvm_va_space_t *va_space, uvm_gpu_t *gpu)
 {
     if (!gpu || !gpu->parent->access_counters_supported || gpu->parent->is_integrated_gpu)
@@ -117,6 +99,7 @@ static bool gpu_supported(uvm_va_space_t *va_space, uvm_gpu_t *gpu)
 
     return uvm_processor_mask_test(&va_space->accessible_from[uvm_id_value(UVM_ID_CPU)], gpu->id);
 }
+
 
 void uvm_cpu_block_policy_init_range(uvm_va_range_managed_t *managed_range)
 {
@@ -315,6 +298,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     size_t start_index;
     size_t trigger_index;
     size_t block_index;
+    size_t candidate_index;
     NvU64 chunk_bytes;
     NvU64 prefetched_bytes = 0;
     unsigned prefetch_chunk_mb = READ_ONCE(uvm_cpu_preferred_prefetch_chunk_mb);
@@ -373,10 +357,29 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         start_index = block_count - chunk_block_count;
     end_index = start_index + chunk_block_count;
 
-    for (block_index = start_index; block_index < end_index; ++block_index) {
-        uvm_va_block_t *va_block = uvm_va_range_block(managed_range, block_index);
+    // Migrate the block which produced the notification before considering
+    // its speculative neighbors. Otherwise, walking from start_index could
+    // consume the available prefetch headroom and stop before reaching the
+    // block which actually triggered this operation.
+    for (block_index = 0; block_index < chunk_block_count; ++block_index) {
+        uvm_va_block_t *va_block;
         NV_STATUS status;
         bool capacity_stop;
+
+        if (block_index == 0) {
+            candidate_index = trigger_index;
+        }
+        else {
+            candidate_index = start_index + block_index - 1;
+            if (candidate_index >= trigger_index)
+                ++candidate_index;
+        }
+
+        UVM_ASSERT(candidate_index >= start_index && candidate_index < end_index);
+
+        va_block = candidate_index == trigger_index ?
+                       trigger_block :
+                       uvm_va_range_block(managed_range, candidate_index);
 
         // Speculative prefetch must not consume the headroom reserved by the
         // eager eviction policy. Demand migration can still make forward
