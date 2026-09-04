@@ -221,6 +221,18 @@ typedef struct
 
     // Set of pages using EGM mappings.
     uvm_page_mask_t egm_pages;
+
+    // Migration history used by the GPU PMM eviction policy. Unlike the
+    // physical root-chunk score, this state follows the logical VA block when
+    // its backing storage moves between CPU memory and this GPU.
+    struct
+    {
+        NvU64 last_gpu_to_cpu_ns;
+        NvU64 last_score_update_ns;
+        NvU64 recent_pcie_bytes;
+        NvU32 score;
+        NvU32 quick_return_count;
+    } eviction_history;
 } uvm_va_block_gpu_state_t;
 
 typedef struct

@@ -4153,6 +4153,13 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
                                                     &block_context->make_resident);
             }
 
+            uvm_pmm_gpu_record_migration(block,
+                                         dst_id,
+                                         src_id,
+                                         uvm_va_block_region_start(block, contig_region),
+                                         uvm_va_block_region_size(contig_region),
+                                         transfer_mode);
+
             contig_start_index = page_index;
             contig_cause = page_cause;
         }
@@ -4201,6 +4208,13 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
                                                 contig_cause,
                                                 &block_context->make_resident);
         }
+
+        uvm_pmm_gpu_record_migration(block,
+                                     dst_id,
+                                     src_id,
+                                     uvm_va_block_region_start(block, contig_region),
+                                     uvm_va_block_region_size(contig_region),
+                                     transfer_mode);
 
         if (block_copy_should_use_push(block, &copy_state) && copying_gpu)
             status = block_copy_end_push(block, &copy_state, copy_tracker, status, &push);

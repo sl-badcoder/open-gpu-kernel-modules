@@ -195,6 +195,12 @@ static unsigned uvm_perf_eager_eviction_interval_ms = 25;
 static unsigned uvm_perf_eager_eviction_heat_ratio = 2;
 static unsigned uvm_perf_eager_eviction_stale_intervals = 5;
 static unsigned uvm_perf_eager_eviction_batch_count = 16;
+static bool uvm_perf_migration_aware_eviction_enable = true;
+static unsigned uvm_perf_migration_eviction_base_grace_ms = 100;
+static unsigned uvm_perf_migration_eviction_return_window_ms = 500;
+static unsigned uvm_perf_migration_eviction_score_grace_ms = 250;
+static unsigned uvm_perf_migration_eviction_max_grace_ms = 2000;
+static unsigned uvm_perf_migration_eviction_decay_ms = 1000;
 
 module_param(uvm_perf_eager_eviction_enable, bool, S_IRUGO);
 module_param(uvm_perf_eager_eviction_high_watermark, uint, S_IRUGO);
@@ -203,6 +209,12 @@ module_param(uvm_perf_eager_eviction_interval_ms, uint, S_IRUGO);
 module_param(uvm_perf_eager_eviction_heat_ratio, uint, S_IRUGO);
 module_param(uvm_perf_eager_eviction_stale_intervals, uint, S_IRUGO);
 module_param(uvm_perf_eager_eviction_batch_count, uint, S_IRUGO);
+module_param(uvm_perf_migration_aware_eviction_enable, bool, S_IRUGO);
+module_param(uvm_perf_migration_eviction_base_grace_ms, uint, S_IRUGO);
+module_param(uvm_perf_migration_eviction_return_window_ms, uint, S_IRUGO);
+module_param(uvm_perf_migration_eviction_score_grace_ms, uint, S_IRUGO);
+module_param(uvm_perf_migration_eviction_max_grace_ms, uint, S_IRUGO);
+module_param(uvm_perf_migration_eviction_decay_ms, uint, S_IRUGO);
 
 MODULE_PARM_DESC(uvm_perf_eager_eviction_enable,
                  "Enable access-counter-guided background eviction (default: 1).");
@@ -218,6 +230,18 @@ MODULE_PARM_DESC(uvm_perf_eager_eviction_stale_intervals,
                  "Intervals without a sampled access before a zero-heat chunk is stale (default: 5).");
 MODULE_PARM_DESC(uvm_perf_eager_eviction_batch_count,
                  "Maximum 2MB root chunks evicted by one background pass (default: 16).");
+MODULE_PARM_DESC(uvm_perf_migration_aware_eviction_enable,
+                 "Protect recently migrated and repeatedly returned GPU data from eviction (default: 1).");
+MODULE_PARM_DESC(uvm_perf_migration_eviction_base_grace_ms,
+                 "Minimum residency grace period after a CPU-to-GPU migration (default: 100 ms).");
+MODULE_PARM_DESC(uvm_perf_migration_eviction_return_window_ms,
+                 "Maximum CPU residency time counted as a quick GPU return (default: 500 ms).");
+MODULE_PARM_DESC(uvm_perf_migration_eviction_score_grace_ms,
+                 "Additional residency grace per migration score point (default: 250 ms).");
+MODULE_PARM_DESC(uvm_perf_migration_eviction_max_grace_ms,
+                 "Maximum total migration-aware residency grace (default: 2000 ms).");
+MODULE_PARM_DESC(uvm_perf_migration_eviction_decay_ms,
+                 "Time per halving of logical migration history (default: 1000 ms).");
 
 #define UVM_PERF_PMA_BATCH_NONPINNED_ORDER_DEFAULT 6
 
@@ -1524,6 +1548,7 @@ static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
     uvm_pmm_alloc_list_t alloc_list;
     uvm_gpu_chunk_t *coldest = NULL;
     uvm_gpu_chunk_t *entry;
+    NvU64 now = NV_GETTIME();
 
     uvm_assert_spinlock_locked(&pmm->list_lock);
 
@@ -1539,6 +1564,9 @@ static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
     list_for_each_entry(entry, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
         uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, entry);
         uvm_gpu_root_chunk_t *coldest_root;
+        bool root_protected = uvm_perf_migration_aware_eviction_enable &&
+                              now < root->protected_until_ns;
+        bool coldest_protected;
 
         if (!coldest) {
             coldest = entry;
@@ -1546,8 +1574,36 @@ static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
         }
 
         coldest_root = root_chunk_from_chunk(pmm, coldest);
-        if (root->access_heat < coldest_root->access_heat ||
-            (root->access_heat == coldest_root->access_heat &&
+        coldest_protected = uvm_perf_migration_aware_eviction_enable &&
+                            now < coldest_root->protected_until_ns;
+
+        // Always prefer an unprotected root. If all roots are protected, pick
+        // the one whose protection expires first so allocation can still make
+        // forward progress under critical memory pressure.
+        if (coldest_protected != root_protected) {
+            if (!root_protected)
+                coldest = entry;
+            continue;
+        }
+
+        if (root_protected && root->protected_until_ns != coldest_root->protected_until_ns) {
+            if (root->protected_until_ns < coldest_root->protected_until_ns)
+                coldest = entry;
+            continue;
+        }
+
+        // Migration score and residency age are stable without local-VRAM
+        // access information. Access-counter heat remains a final tie-breaker
+        // for the remote demand which originally brought data to this GPU.
+        if (root->migration_score < coldest_root->migration_score ||
+            (root->migration_score == coldest_root->migration_score &&
+             root->resident_since_ns < coldest_root->resident_since_ns) ||
+            (root->migration_score == coldest_root->migration_score &&
+             root->resident_since_ns == coldest_root->resident_since_ns &&
+             root->access_heat < coldest_root->access_heat) ||
+            (root->migration_score == coldest_root->migration_score &&
+             root->resident_since_ns == coldest_root->resident_since_ns &&
+             root->access_heat == coldest_root->access_heat &&
              root->last_access_epoch < coldest_root->last_access_epoch)) {
             coldest = entry;
         }
@@ -1814,6 +1870,22 @@ static void eager_eviction_work(struct work_struct *work)
 
         if (root->chunk.state != UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED)
             root->access_heat >>= 1;
+
+        if (root->chunk.state != UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED &&
+            uvm_perf_migration_aware_eviction_enable &&
+            root->migration_score) {
+            NvU64 decay_ns = (NvU64)max(uvm_perf_migration_eviction_decay_ms, 1U) * NSEC_PER_MSEC;
+            NvU64 now = NV_GETTIME();
+            NvU64 shifts = (now - root->migration_score_update_ns) / decay_ns;
+
+            if (shifts >= 32)
+                root->migration_score = 0;
+            else if (shifts)
+                root->migration_score >>= shifts;
+
+            if (shifts)
+                root->migration_score_update_ns += shifts * decay_ns;
+        }
     }
     uvm_spin_unlock(&pmm->list_lock);
 
@@ -1871,6 +1943,140 @@ void uvm_pmm_gpu_mark_chunk_accessed(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk,
     uvm_spin_unlock(&pmm->list_lock);
 
     eager_eviction_schedule(pmm, 0);
+}
+
+static void migration_history_decay(uvm_va_block_gpu_state_t *gpu_state, NvU64 now)
+{
+    NvU64 decay_ns = (NvU64)max(uvm_perf_migration_eviction_decay_ms, 1U) * NSEC_PER_MSEC;
+    NvU64 elapsed;
+    NvU64 shifts;
+
+    if (!gpu_state->eviction_history.last_score_update_ns) {
+        gpu_state->eviction_history.last_score_update_ns = now;
+        return;
+    }
+
+    elapsed = now - gpu_state->eviction_history.last_score_update_ns;
+    shifts = elapsed / decay_ns;
+    if (!shifts)
+        return;
+
+    if (shifts >= 32)
+        gpu_state->eviction_history.score = 0;
+    else
+        gpu_state->eviction_history.score >>= shifts;
+
+    if (shifts >= 64)
+        gpu_state->eviction_history.recent_pcie_bytes = 0;
+    else
+        gpu_state->eviction_history.recent_pcie_bytes >>= shifts;
+
+    gpu_state->eviction_history.last_score_update_ns += shifts * decay_ns;
+}
+
+void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
+                                  uvm_processor_id_t dst_id,
+                                  uvm_processor_id_t src_id,
+                                  NvU64 address,
+                                  NvU64 bytes,
+                                  uvm_va_block_transfer_mode_t transfer_mode)
+{
+    uvm_gpu_t *gpu;
+    uvm_va_block_gpu_state_t *gpu_state;
+    NvU64 now;
+    NvU64 end;
+    bool arriving;
+
+    if (!uvm_perf_migration_aware_eviction_enable ||
+        transfer_mode != UVM_VA_BLOCK_TRANSFER_MODE_MOVE ||
+        !bytes) {
+        return;
+    }
+
+    if (UVM_ID_IS_CPU(src_id) && UVM_ID_IS_GPU(dst_id)) {
+        gpu = uvm_gpu_get(dst_id);
+        arriving = true;
+    }
+    else if (UVM_ID_IS_GPU(src_id) && UVM_ID_IS_CPU(dst_id)) {
+        gpu = uvm_gpu_get(src_id);
+        arriving = false;
+    }
+    else {
+        return;
+    }
+
+    uvm_assert_mutex_locked(&va_block->lock);
+    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    if (!gpu_state)
+        return;
+
+    now = NV_GETTIME();
+    migration_history_decay(gpu_state, now);
+
+    if (U64_MAX - gpu_state->eviction_history.recent_pcie_bytes < bytes)
+        gpu_state->eviction_history.recent_pcie_bytes = U64_MAX;
+    else
+        gpu_state->eviction_history.recent_pcie_bytes += bytes;
+
+    if (!arriving) {
+        gpu_state->eviction_history.last_gpu_to_cpu_ns = now;
+        return;
+    }
+
+    if (gpu_state->eviction_history.last_gpu_to_cpu_ns &&
+        now - gpu_state->eviction_history.last_gpu_to_cpu_ns <=
+            (NvU64)uvm_perf_migration_eviction_return_window_ms * NSEC_PER_MSEC) {
+        NvU64 increment = DIV_ROUND_UP(bytes, UVM_CHUNK_SIZE_2M);
+
+        if (!increment)
+            increment = 1;
+
+        if (increment > NV_U32_MAX - gpu_state->eviction_history.score)
+            gpu_state->eviction_history.score = NV_U32_MAX;
+        else
+            gpu_state->eviction_history.score += (NvU32)increment;
+
+        if (gpu_state->eviction_history.quick_return_count != NV_U32_MAX)
+            ++gpu_state->eviction_history.quick_return_count;
+
+        // Consume the eviction marker so fragments from one return migration
+        // count as one cycle. A later GPU-to-CPU move arms it again.
+        gpu_state->eviction_history.last_gpu_to_cpu_ns = 0;
+    }
+
+    end = min(address + bytes, va_block->end + 1);
+    uvm_spin_lock(&gpu->pmm.list_lock);
+    while (address < end) {
+        uvm_gpu_chunk_t *chunk = uvm_va_block_lookup_gpu_chunk(va_block, gpu, address);
+
+        if (chunk) {
+            uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(&gpu->pmm, chunk);
+            NvU64 base_grace_ns = (NvU64)uvm_perf_migration_eviction_base_grace_ms * NSEC_PER_MSEC;
+            NvU64 max_grace_ns = (NvU64)max(uvm_perf_migration_eviction_max_grace_ms,
+                                            uvm_perf_migration_eviction_base_grace_ms) * NSEC_PER_MSEC;
+            NvU64 score_grace_ns;
+            NvU64 grace_ns;
+
+            if (uvm_perf_migration_eviction_score_grace_ms &&
+                gpu_state->eviction_history.score >
+                    U64_MAX / ((NvU64)uvm_perf_migration_eviction_score_grace_ms * NSEC_PER_MSEC)) {
+                score_grace_ns = max_grace_ns;
+            }
+            else {
+                score_grace_ns = (NvU64)gpu_state->eviction_history.score *
+                                 uvm_perf_migration_eviction_score_grace_ms * NSEC_PER_MSEC;
+            }
+
+            grace_ns = min(base_grace_ns + min(score_grace_ns, max_grace_ns), max_grace_ns);
+            root->migration_score = max(root->migration_score, gpu_state->eviction_history.score);
+            root->migration_score_update_ns = now;
+            root->resident_since_ns = max(root->resident_since_ns, now);
+            root->protected_until_ns = max(root->protected_until_ns, now + grace_ns);
+        }
+
+        address = min(UVM_ALIGN_UP(address + 1, PAGE_SIZE), end);
+    }
+    uvm_spin_unlock(&gpu->pmm.list_lock);
 }
 
 static uvm_gpu_chunk_t *find_free_chunk_locked(uvm_pmm_gpu_t *pmm,
@@ -1940,6 +2146,20 @@ static uvm_gpu_chunk_t *claim_free_chunk(uvm_pmm_gpu_t *pmm, uvm_pmm_gpu_memory_
     UVM_ASSERT(chunk->type == type);
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_FREE);
     UVM_ASSERT(!chunk_is_in_eviction(pmm, chunk));
+
+    // A completely free root no longer represents the logical data which
+    // supplied its previous scores. Split roots can still contain allocated
+    // siblings, so their aggregate metadata is allowed to decay naturally.
+    if (chunk_is_root_chunk(chunk)) {
+        uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, chunk);
+
+        root->access_heat = 0;
+        root->last_access_epoch = pmm->eager_eviction.epoch;
+        root->migration_score = 0;
+        root->migration_score_update_ns = 0;
+        root->resident_since_ns = 0;
+        root->protected_until_ns = 0;
+    }
 
     if (chunk->parent) {
         UVM_ASSERT(chunk->parent->suballoc);
@@ -2180,6 +2400,10 @@ static void init_root_chunk(uvm_pmm_gpu_t *pmm,
     chunk->is_zero = is_zero;
     root_chunk->access_heat = 0;
     root_chunk->last_access_epoch = pmm->eager_eviction.epoch;
+    root_chunk->migration_score = 0;
+    root_chunk->migration_score_update_ns = 0;
+    root_chunk->resident_since_ns = 0;
+    root_chunk->protected_until_ns = 0;
 
     if (initial_state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED)
         ++pmm->root_chunks.pinned_count;

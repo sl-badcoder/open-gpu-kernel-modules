@@ -375,6 +375,14 @@ typedef struct uvm_gpu_root_chunk_struct
     NvU64 access_heat;
     NvU64 last_access_epoch;
 
+    // Snapshot of the logical VA-block migration history for data currently
+    // backed by this physical root. These fields are reset whenever the root
+    // is initialized for reuse.
+    NvU32 migration_score;
+    NvU64 migration_score_update_ns;
+    NvU64 resident_since_ns;
+    NvU64 protected_until_ns;
+
     // Pending operations for all GPU chunks under the root chunk.
     //
     // Protected by the corresponding root chunk bit lock.
@@ -641,6 +649,16 @@ void uvm_pmm_gpu_mark_root_chunk_discarded(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
 // eager policy pass. chunk may be NULL when a notification did not result in
 // GPU residency.
 void uvm_pmm_gpu_mark_chunk_accessed(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, NvU32 counter_value);
+
+// Record a CPU <-> GPU move for migration-aware eviction. The VA block lock
+// must be held. History is retained in the logical {VA block, GPU} state while
+// the current score is copied to any physical roots backing an arrival.
+void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
+                                  uvm_processor_id_t dst_id,
+                                  uvm_processor_id_t src_id,
+                                  NvU64 address,
+                                  NvU64 bytes,
+                                  uvm_va_block_transfer_mode_t transfer_mode);
 
 // Return true when proactive user-memory growth should stop at the configured
 // high watermark. A true result also kicks the background eviction worker.
