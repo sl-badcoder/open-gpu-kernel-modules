@@ -37,7 +37,6 @@ bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_
 bool uvm_cpu_block_policy_should_pin(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
 NvU64 uvm_cpu_block_policy_pin_threshold(void);
 NvU64 uvm_cpu_block_policy_pin_budget_bytes(void);
-unsigned uvm_cpu_block_policy_vram_cap_percent(void);
 void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                              uvm_gpu_t *gpu,
                                              struct mm_struct *mm);

@@ -1777,14 +1777,6 @@ bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm)
     return true;
 }
 
-bool uvm_pmm_gpu_cpu_preferred_capacity_reached(uvm_pmm_gpu_t *pmm)
-{
-    if (eager_eviction_usage_percent(pmm) >= uvm_cpu_block_policy_vram_cap_percent())
-        return true;
-
-    return uvm_pmm_gpu_eager_eviction_watermark_reached(pmm);
-}
-
 // Return whether the coldest used root chunk is sufficiently colder than the
 // hottest used root chunk to justify replacement below the high watermark.
 // list_lock must be held.

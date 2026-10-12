@@ -35,7 +35,6 @@ static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly = 64;
 // Zero disables permanent policy pins. Pinning is limited to whole PMM roots.
 static unsigned uvm_cpu_preferred_pin_threshold __read_mostly;
 static unsigned uvm_cpu_preferred_pin_budget_mb __read_mostly;
-static unsigned uvm_cpu_preferred_vram_cap_percent __read_mostly = 85;
 static atomic64_t uvm_cpu_preferred_access_counter_batches = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_access_counter_notifications = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_access_counter_value = ATOMIC64_INIT(0);
@@ -77,8 +76,6 @@ module_param(uvm_cpu_preferred_pin_threshold, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_cpu_preferred_pin_threshold, "Cumulative hardware access-counter value required to pin a 2MB GPU root; zero disables pinning.");
 module_param(uvm_cpu_preferred_pin_budget_mb, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_cpu_preferred_pin_budget_mb, "Maximum MiB of policy-pinned GPU roots per GPU; zero disables pinning.");
-module_param(uvm_cpu_preferred_vram_cap_percent, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(uvm_cpu_preferred_vram_cap_percent, "Stop speculative CPU-preferred prefetch and full-block promotion at this total VRAM usage percentage (1-100); demand migration can exceed it.");
 module_param_cb(uvm_cpu_preferred_access_counter_batches,
                 &atomic64_count_ops,
                 &uvm_cpu_preferred_access_counter_batches,
@@ -243,8 +240,7 @@ bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gp
     if (!managed_range || !managed_range->cpu_access_counter_policy)
         return false;
 
-    return !uvm_pmm_gpu_cpu_preferred_capacity_reached(&gpu->pmm) &&
-           uvm_cpu_block_policy_should_service_4k(managed_range, gpu);
+    return uvm_cpu_block_policy_should_service_4k(managed_range, gpu);
 }
 
 static bool should_handle_gpu_signal(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
@@ -279,16 +275,10 @@ NvU64 uvm_cpu_block_policy_pin_budget_bytes(void)
     return (NvU64)READ_ONCE(uvm_cpu_preferred_pin_budget_mb) * UVM_SIZE_1MB;
 }
 
-unsigned uvm_cpu_block_policy_vram_cap_percent(void)
-{
-    return clamp(READ_ONCE(uvm_cpu_preferred_vram_cap_percent), 1U, 100U);
-}
-
 bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
 {
     return READ_ONCE(uvm_cpu_preferred_block_promotion_enable) &&
-           should_handle_gpu_signal(va_block, gpu) &&
-           !uvm_pmm_gpu_cpu_preferred_capacity_reached(&gpu->pmm);
+           should_handle_gpu_signal(va_block, gpu);
 }
 
 static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
@@ -409,7 +399,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
 
     if (uvm_processor_mask_test(&trigger_block->gpu_prefetch_started, gpu->id)) {
         if (!uvm_processor_mask_test(&trigger_block->gpu_prefetch_retry, gpu->id) ||
-            uvm_pmm_gpu_cpu_preferred_capacity_reached(&gpu->pmm)) {
+            uvm_pmm_gpu_eager_eviction_watermark_reached(&gpu->pmm)) {
             return;
         }
 
@@ -477,7 +467,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         // Speculative prefetch must not consume the headroom reserved by the
         // eager eviction policy. Demand migration can still make forward
         // progress while the background worker reclaims cold regions.
-        if (uvm_pmm_gpu_cpu_preferred_capacity_reached(&gpu->pmm)) {
+        if (uvm_pmm_gpu_eager_eviction_watermark_reached(&gpu->pmm)) {
             atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
             capacity_stopped = true;
             break;

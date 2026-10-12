@@ -658,7 +658,6 @@ void uvm_pmm_gpu_mark_chunk_accessed(uvm_pmm_gpu_t *pmm,
                                      uvm_gpu_chunk_t *chunk,
                                      NvU32 counter_value,
                                      bool allow_policy_pin);
-bool uvm_pmm_gpu_cpu_preferred_capacity_reached(uvm_pmm_gpu_t *pmm);
 
 // Record a CPU <-> GPU move for migration-aware eviction. The VA block lock
 // must be held. History is retained in the logical {VA block, GPU} state while
