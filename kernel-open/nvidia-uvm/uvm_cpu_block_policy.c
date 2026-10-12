@@ -32,25 +32,25 @@
 static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
 static unsigned uvm_cpu_preferred_block_promotion_enable __read_mostly = 1;
 static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly = 64;
+// Zero disables permanent policy pins. Pinning is limited to whole PMM roots.
+static unsigned uvm_cpu_preferred_pin_threshold __read_mostly;
+static unsigned uvm_cpu_preferred_pin_budget_mb __read_mostly;
+static unsigned uvm_cpu_preferred_vram_cap_percent __read_mostly = 85;
+static atomic64_t uvm_cpu_preferred_access_counter_batches = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_access_counter_notifications = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_access_counter_value = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_promoted_bytes = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_retries = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetched_bytes = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
-
-static int promotion_count_get(char *buffer, const struct kernel_param *kp)
-{
-    (void)kp;
-
-    return scnprintf(buffer,
-                     PAGE_SIZE,
-                     "%lld\n",
-                     (long long)atomic64_read(&uvm_cpu_preferred_block_promotions));
-}
-
-static const struct kernel_param_ops promotion_count_ops = {
-    .get = promotion_count_get,
-};
+static atomic64_t uvm_cpu_preferred_demotion_transfers = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_demoted_bytes = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_eager_eviction_attempts = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_eager_eviction_successes = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_eager_eviction_failures = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_eager_reclaimed_bytes = ATOMIC64_INIT(0);
 
 static int atomic64_count_get(char *buffer, const struct kernel_param *kp)
 {
@@ -73,8 +73,41 @@ module_param(uvm_cpu_preferred_block_promotion_enable, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_cpu_preferred_block_promotion_enable, "Promote complete populated 2MB VA blocks on GPU access-counter notifications. " "Zero leaves speculative prefetch enabled without block promotion.");
 module_param(uvm_cpu_preferred_prefetch_chunk_mb, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_chunk_mb, "Access-counter-guided prefetch chunk size in MiB. Non-zero values are rounded up to 2MB; " "zero disables speculative chunk prefetch.");
-module_param_cb(uvm_cpu_preferred_block_promotions, &promotion_count_ops, NULL, S_IRUGO);
+module_param(uvm_cpu_preferred_pin_threshold, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_cpu_preferred_pin_threshold, "Cumulative hardware access-counter value required to pin a 2MB GPU root; zero disables pinning.");
+module_param(uvm_cpu_preferred_pin_budget_mb, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_cpu_preferred_pin_budget_mb, "Maximum MiB of policy-pinned GPU roots per GPU; zero disables pinning.");
+module_param(uvm_cpu_preferred_vram_cap_percent, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_cpu_preferred_vram_cap_percent, "Stop speculative CPU-preferred prefetch and full-block promotion at this total VRAM usage percentage (1-100); demand migration can exceed it.");
+module_param_cb(uvm_cpu_preferred_access_counter_batches,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_access_counter_batches,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_access_counter_batches,
+                 "Number of non-empty hardware access-counter batches fetched by UVM.");
+module_param_cb(uvm_cpu_preferred_access_counter_notifications,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_access_counter_notifications,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_access_counter_notifications,
+                 "Number of hardware access-counter notification records fetched by UVM.");
+module_param_cb(uvm_cpu_preferred_access_counter_value,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_access_counter_value,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_access_counter_value,
+                 "Sum of the hardware counter values reported by fetched access-counter notifications.");
+module_param_cb(uvm_cpu_preferred_block_promotions,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_block_promotions,
+                S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_block_promotions, "Number of successful access-counter VA-block promotion service operations.");
+module_param_cb(uvm_cpu_preferred_promoted_bytes,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_promoted_bytes,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_promoted_bytes,
+                 "Number of bytes moved by successful access-counter VA-block promotion operations.");
 module_param_cb(uvm_cpu_preferred_range_prefetches, &atomic64_count_ops, &uvm_cpu_preferred_range_prefetches,S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_range_prefetches,"Number of access-counter-guided managed allocation chunk prefetches started.");
 module_param_cb(uvm_cpu_preferred_prefetch_retries, &atomic64_count_ops, &uvm_cpu_preferred_prefetch_retries, S_IRUGO);
@@ -83,6 +116,42 @@ module_param_cb(uvm_cpu_preferred_prefetched_bytes, &atomic64_count_ops, &uvm_cp
 MODULE_PARM_DESC(uvm_cpu_preferred_prefetched_bytes, "Number of bytes moved by access-counter-guided managed allocation chunk prefetches.");
 module_param_cb(uvm_cpu_preferred_prefetch_capacity_stops, &atomic64_count_ops, &uvm_cpu_preferred_prefetch_capacity_stops, S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_capacity_stops, "Number of managed allocation prefetches stopped when free VRAM was exhausted.");
+module_param_cb(uvm_cpu_preferred_demotion_transfers,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_demotion_transfers,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_demotion_transfers,
+                 "Number of GPU-to-CPU transfer segments caused by eviction.");
+module_param_cb(uvm_cpu_preferred_demoted_bytes,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_demoted_bytes,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_demoted_bytes,
+                 "Number of bytes moved from GPU to CPU by eviction.");
+module_param_cb(uvm_cpu_preferred_eager_eviction_attempts,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_eager_eviction_attempts,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_eager_eviction_attempts,
+                 "Number of eager root-chunk eviction attempts.");
+module_param_cb(uvm_cpu_preferred_eager_eviction_successes,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_eager_eviction_successes,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_eager_eviction_successes,
+                 "Number of successful eager root-chunk evictions.");
+module_param_cb(uvm_cpu_preferred_eager_eviction_failures,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_eager_eviction_failures,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_eager_eviction_failures,
+                 "Number of failed eager root-chunk evictions.");
+module_param_cb(uvm_cpu_preferred_eager_reclaimed_bytes,
+                &atomic64_count_ops,
+                &uvm_cpu_preferred_eager_reclaimed_bytes,
+                S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_eager_reclaimed_bytes,
+                 "Number of GPU bytes returned to PMA by successful eager evictions.");
 
 
 // check if block policy is enabled
@@ -174,7 +243,8 @@ bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gp
     if (!managed_range || !managed_range->cpu_access_counter_policy)
         return false;
 
-    return uvm_cpu_block_policy_should_service_4k(managed_range, gpu);
+    return !uvm_pmm_gpu_cpu_preferred_capacity_reached(&gpu->pmm) &&
+           uvm_cpu_block_policy_should_service_4k(managed_range, gpu);
 }
 
 static bool should_handle_gpu_signal(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
@@ -192,10 +262,33 @@ static bool should_handle_gpu_signal(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
            gpu_supported(managed_range->va_range.va_space, gpu);
 }
 
+bool uvm_cpu_block_policy_should_pin(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+{
+    return READ_ONCE(uvm_cpu_preferred_pin_threshold) &&
+           READ_ONCE(uvm_cpu_preferred_pin_budget_mb) &&
+           should_handle_gpu_signal(va_block, gpu);
+}
+
+NvU64 uvm_cpu_block_policy_pin_threshold(void)
+{
+    return READ_ONCE(uvm_cpu_preferred_pin_threshold);
+}
+
+NvU64 uvm_cpu_block_policy_pin_budget_bytes(void)
+{
+    return (NvU64)READ_ONCE(uvm_cpu_preferred_pin_budget_mb) * UVM_SIZE_1MB;
+}
+
+unsigned uvm_cpu_block_policy_vram_cap_percent(void)
+{
+    return clamp(READ_ONCE(uvm_cpu_preferred_vram_cap_percent), 1U, 100U);
+}
+
 bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
 {
     return READ_ONCE(uvm_cpu_preferred_block_promotion_enable) &&
-           should_handle_gpu_signal(va_block, gpu);
+           should_handle_gpu_signal(va_block, gpu) &&
+           !uvm_pmm_gpu_cpu_preferred_capacity_reached(&gpu->pmm);
 }
 
 static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
@@ -316,7 +409,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
 
     if (uvm_processor_mask_test(&trigger_block->gpu_prefetch_started, gpu->id)) {
         if (!uvm_processor_mask_test(&trigger_block->gpu_prefetch_retry, gpu->id) ||
-            uvm_pmm_gpu_eager_eviction_watermark_reached(&gpu->pmm)) {
+            uvm_pmm_gpu_cpu_preferred_capacity_reached(&gpu->pmm)) {
             return;
         }
 
@@ -384,7 +477,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         // Speculative prefetch must not consume the headroom reserved by the
         // eager eviction policy. Demand migration can still make forward
         // progress while the background worker reclaims cold regions.
-        if (uvm_pmm_gpu_eager_eviction_watermark_reached(&gpu->pmm)) {
+        if (uvm_pmm_gpu_cpu_preferred_capacity_reached(&gpu->pmm)) {
             atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
             capacity_stopped = true;
             break;
@@ -436,7 +529,34 @@ void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t 
     uvm_processor_mask_clear_atomic(&va_block->gpu_prefetch_started, gpu->id);
 }
 
-void uvm_cpu_block_policy_record_promotion(void)
+void uvm_cpu_block_policy_record_promotion(NvU64 bytes)
 {
     atomic64_inc(&uvm_cpu_preferred_block_promotions);
+    atomic64_add(bytes, &uvm_cpu_preferred_promoted_bytes);
+}
+
+void uvm_cpu_block_policy_record_access_counter_batch(NvU32 notification_count, NvU64 counter_value_sum)
+{
+    atomic64_inc(&uvm_cpu_preferred_access_counter_batches);
+    atomic64_add(notification_count, &uvm_cpu_preferred_access_counter_notifications);
+    atomic64_add(counter_value_sum, &uvm_cpu_preferred_access_counter_value);
+}
+
+void uvm_cpu_block_policy_record_demotion_transfer(NvU64 bytes)
+{
+    atomic64_inc(&uvm_cpu_preferred_demotion_transfers);
+    atomic64_add(bytes, &uvm_cpu_preferred_demoted_bytes);
+}
+
+void uvm_cpu_block_policy_record_eager_eviction(bool succeeded, NvU64 reclaimed_bytes)
+{
+    atomic64_inc(&uvm_cpu_preferred_eager_eviction_attempts);
+
+    if (succeeded) {
+        atomic64_inc(&uvm_cpu_preferred_eager_eviction_successes);
+        atomic64_add(reclaimed_bytes, &uvm_cpu_preferred_eager_reclaimed_bytes);
+    }
+    else {
+        atomic64_inc(&uvm_cpu_preferred_eager_eviction_failures);
+    }
 }

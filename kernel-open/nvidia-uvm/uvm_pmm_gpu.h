@@ -374,6 +374,10 @@ typedef struct uvm_gpu_root_chunk_struct
     // access-counter servicing and aged by the eager eviction worker.
     NvU64 access_heat;
     NvU64 last_access_epoch;
+    // Cumulative policy access count and eviction exclusion for this allocation.
+    // Cleared when the root becomes fully free or is returned to PMA.
+    NvU64 policy_access_count;
+    bool policy_pinned;
 
     // Snapshot of the logical VA-block migration history for data currently
     // backed by this physical root. These fields are reset whenever the root
@@ -437,6 +441,8 @@ typedef struct uvm_pmm_gpu_struct
         // Updates are protected by 'list_lock', but it can be queried outside
         // of the critical section.
         long pinned_count;
+        // Number of policy-pinned 2MB roots. Protected by list_lock.
+        size_t policy_pinned_count;
     } root_chunks;
 
     // Lock protecting PMA allocation, freeing and eviction
@@ -648,7 +654,11 @@ void uvm_pmm_gpu_mark_root_chunk_discarded(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
 // Add an access-counter sample to the root chunk backing chunk and request an
 // eager policy pass. chunk may be NULL when a notification did not result in
 // GPU residency.
-void uvm_pmm_gpu_mark_chunk_accessed(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, NvU32 counter_value);
+void uvm_pmm_gpu_mark_chunk_accessed(uvm_pmm_gpu_t *pmm,
+                                     uvm_gpu_chunk_t *chunk,
+                                     NvU32 counter_value,
+                                     bool allow_policy_pin);
+bool uvm_pmm_gpu_cpu_preferred_capacity_reached(uvm_pmm_gpu_t *pmm);
 
 // Record a CPU <-> GPU move for migration-aware eviction. The VA block lock
 // must be held. History is retained in the logical {VA block, GPU} state while

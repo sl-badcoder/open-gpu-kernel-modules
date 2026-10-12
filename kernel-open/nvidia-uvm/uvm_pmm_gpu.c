@@ -174,6 +174,7 @@
 #include "uvm_va_space.h"
 #include "uvm_va_block.h"
 #include "uvm_va_range.h"
+#include "uvm_cpu_block_policy.h"
 #include "uvm_test.h"
 #include "uvm_linux.h"
 
@@ -1464,6 +1465,9 @@ static bool chunk_is_evictable(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     if (root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED)
         return false;
 
+    if (root_chunk->policy_pinned)
+        return false;
+
     if (chunk_is_root_chunk_pinned(pmm, chunk))
         return false;
 
@@ -1553,12 +1557,16 @@ static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
     uvm_assert_spinlock_locked(&pmm->list_lock);
 
     for (alloc_list = 0; alloc_list < UVM_PMM_ALLOC_LIST_COUNT; alloc_list++) {
-        uvm_gpu_chunk_t *chunk = list_first_chunk(&pmm->root_chunks.alloc_list[alloc_list]);
+        uvm_gpu_chunk_t *chunk;
 
         // Preserve the existing unused/discarded priority. For used memory,
         // order eviction by decayed access heat and then by oldest access.
-        if (chunk && alloc_list != UVM_PMM_ALLOC_LIST_USED)
-            return chunk;
+        if (alloc_list != UVM_PMM_ALLOC_LIST_USED) {
+            list_for_each_entry(chunk, &pmm->root_chunks.alloc_list[alloc_list], list) {
+                if (!root_chunk_from_chunk(pmm, chunk)->policy_pinned)
+                    return chunk;
+            }
+        }
     }
 
     list_for_each_entry(entry, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
@@ -1567,6 +1575,9 @@ static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
         bool root_protected = uvm_perf_migration_aware_eviction_enable &&
                               now < root->protected_until_ns;
         bool coldest_protected;
+
+        if (root->policy_pinned)
+            continue;
 
         if (!coldest) {
             coldest = entry;
@@ -1766,6 +1777,14 @@ bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm)
     return true;
 }
 
+bool uvm_pmm_gpu_cpu_preferred_capacity_reached(uvm_pmm_gpu_t *pmm)
+{
+    if (eager_eviction_usage_percent(pmm) >= uvm_cpu_block_policy_vram_cap_percent())
+        return true;
+
+    return uvm_pmm_gpu_eager_eviction_watermark_reached(pmm);
+}
+
 // Return whether the coldest used root chunk is sufficiently colder than the
 // hottest used root chunk to justify replacement below the high watermark.
 // list_lock must be held.
@@ -1838,12 +1857,15 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force)
     status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
     uvm_mutex_unlock(&pmm->lock);
 
-    if (status != NV_OK)
+    if (status != NV_OK) {
+        uvm_cpu_block_policy_record_eager_eviction(false, 0);
         return false;
+    }
 
     // Eager eviction returns the entire root allocation to PMA instead of
     // retaining it on a PMM free list. This makes the watermark visible to
     // all VRAM clients, not only UVM.
+    uvm_cpu_block_policy_record_eager_eviction(true, uvm_gpu_chunk_get_size(&root_chunk->chunk));
     free_root_chunk(pmm, root_chunk, FREE_ROOT_CHUNK_MODE_DEFAULT);
     return true;
 }
@@ -1923,26 +1945,46 @@ static void eager_eviction_schedule(uvm_pmm_gpu_t *pmm, unsigned long delay)
     schedule_delayed_work(&pmm->eager_eviction.work, delay);
 }
 
-void uvm_pmm_gpu_mark_chunk_accessed(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, NvU32 counter_value)
+void uvm_pmm_gpu_mark_chunk_accessed(uvm_pmm_gpu_t *pmm,
+                                     uvm_gpu_chunk_t *chunk,
+                                     NvU32 counter_value,
+                                     bool allow_policy_pin)
 {
     uvm_gpu_root_chunk_t *root;
 
-    if (!eager_eviction_supported(pmm) || !chunk || !counter_value)
+    if (!chunk || !counter_value)
         return;
 
     root = root_chunk_from_chunk(pmm, chunk);
 
     uvm_spin_lock(&pmm->list_lock);
     if (root->chunk.state != UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED) {
-        if (U64_MAX - root->access_heat < counter_value)
-            root->access_heat = U64_MAX;
-        else
-            root->access_heat += counter_value;
-        root->last_access_epoch = pmm->eager_eviction.epoch;
+        if (eager_eviction_supported(pmm)) {
+            if (U64_MAX - root->access_heat < counter_value)
+                root->access_heat = U64_MAX;
+            else
+                root->access_heat += counter_value;
+            root->last_access_epoch = pmm->eager_eviction.epoch;
+        }
+
+        if (allow_policy_pin && !root->policy_pinned &&
+            !chunk_is_in_eviction(pmm, &root->chunk)) {
+            NvU64 budget = uvm_cpu_block_policy_pin_budget_bytes();
+            NvU64 threshold = uvm_cpu_block_policy_pin_threshold();
+
+            root->policy_access_count = min(U64_MAX - counter_value, root->policy_access_count) + counter_value;
+            if (threshold &&
+                root->policy_access_count >= threshold &&
+                budget / UVM_CHUNK_SIZE_MAX > pmm->root_chunks.policy_pinned_count) {
+                root->policy_pinned = true;
+                ++pmm->root_chunks.policy_pinned_count;
+            }
+        }
     }
     uvm_spin_unlock(&pmm->list_lock);
 
-    eager_eviction_schedule(pmm, 0);
+    if (eager_eviction_supported(pmm))
+        eager_eviction_schedule(pmm, 0);
 }
 
 static void migration_history_decay(uvm_va_block_gpu_state_t *gpu_state, NvU64 now)
@@ -2153,6 +2195,7 @@ static uvm_gpu_chunk_t *claim_free_chunk(uvm_pmm_gpu_t *pmm, uvm_pmm_gpu_memory_
     if (chunk_is_root_chunk(chunk)) {
         uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, chunk);
 
+        UVM_ASSERT(!root->policy_pinned);
         root->access_heat = 0;
         root->last_access_epoch = pmm->eager_eviction.epoch;
         root->migration_score = 0;
@@ -2398,6 +2441,8 @@ static void init_root_chunk(uvm_pmm_gpu_t *pmm,
     chunk->type = type;
     chunk->state = initial_state;
     chunk->is_zero = is_zero;
+    UVM_ASSERT(!root_chunk->policy_pinned);
+    root_chunk->policy_access_count = 0;
     root_chunk->access_heat = 0;
     root_chunk->last_access_epoch = pmm->eager_eviction.epoch;
     root_chunk->migration_score = 0;
@@ -2560,6 +2605,11 @@ void free_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk, free_
                    uvm_gpu_name(gpu));
     UVM_ASSERT(list_empty(&chunk->list));
 
+    if (root_chunk->policy_pinned) {
+        root_chunk->policy_pinned = false;
+        --pmm->root_chunks.policy_pinned_count;
+    }
+    root_chunk->policy_access_count = 0;
     chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED);
 
     uvm_spin_unlock(&pmm->list_lock);
@@ -2793,6 +2843,14 @@ static void chunk_free_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
         chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_FREE);
     else
         chunk->state = UVM_PMM_GPU_CHUNK_STATE_FREE;
+
+    if (chunk_is_root_chunk(chunk)) {
+        if (root_chunk->policy_pinned) {
+            root_chunk->policy_pinned = false;
+            --pmm->root_chunks.policy_pinned_count;
+        }
+        root_chunk->policy_access_count = 0;
+    }
 
     chunk_update_lists_locked(pmm, chunk);
 }
@@ -3201,6 +3259,11 @@ static NV_STATUS uvm_pmm_gpu_pma_evict_range(void *void_pmm,
 
             if (chunk->state != UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED) {
                 UVM_ASSERT(uvm_gpu_chunk_is_user(chunk));
+
+                if (root_chunk->policy_pinned) {
+                    uvm_spin_unlock(&pmm->list_lock);
+                    return NV_ERR_NO_MEMORY;
+                }
 
                 if (chunk_is_evictable(pmm, chunk)) {
                     chunk_start_eviction(pmm, chunk);

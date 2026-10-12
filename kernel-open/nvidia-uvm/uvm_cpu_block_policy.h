@@ -34,10 +34,17 @@ bool uvm_cpu_block_policy_should_service_4k(uvm_va_range_managed_t *managed_rang
                                            uvm_gpu_t *gpu);
 bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
 bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
+bool uvm_cpu_block_policy_should_pin(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
+NvU64 uvm_cpu_block_policy_pin_threshold(void);
+NvU64 uvm_cpu_block_policy_pin_budget_bytes(void);
+unsigned uvm_cpu_block_policy_vram_cap_percent(void);
 void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                              uvm_gpu_t *gpu,
                                              struct mm_struct *mm);
 void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
-void uvm_cpu_block_policy_record_promotion(void);
+void uvm_cpu_block_policy_record_promotion(NvU64 bytes);
+void uvm_cpu_block_policy_record_access_counter_batch(NvU32 notification_count, NvU64 counter_value_sum);
+void uvm_cpu_block_policy_record_demotion_transfer(NvU64 bytes);
+void uvm_cpu_block_policy_record_eager_eviction(bool succeeded, NvU64 reclaimed_bytes);
 
 #endif

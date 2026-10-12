@@ -490,6 +490,9 @@ struct uvm_access_counter_service_batch_context_struct
 
     NvU32 num_cached_notifications;
 
+    // Sum of counter_value for the entries fetched in the current batch.
+    NvU64 counter_value_sum;
+
     uvm_access_counter_buffer_entry_t **notifications;
 
     NvU32 num_notifications;

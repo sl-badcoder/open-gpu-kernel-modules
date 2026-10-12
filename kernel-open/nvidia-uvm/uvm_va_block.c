@@ -3905,6 +3905,22 @@ static NV_STATUS zero_destination_mem_if_needed(uvm_va_block_t *block,
     return status;
 }
 
+static void record_cpu_preferred_migration(uvm_processor_id_t dst_id,
+                                           uvm_processor_id_t src_id,
+                                           NvU64 bytes,
+                                           uvm_va_block_transfer_mode_t transfer_mode,
+                                           uvm_make_resident_cause_t cause)
+{
+    if (transfer_mode != UVM_VA_BLOCK_TRANSFER_MODE_MOVE)
+        return;
+
+    if (cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION &&
+        UVM_ID_IS_GPU(src_id) &&
+        UVM_ID_IS_CPU(dst_id)) {
+        uvm_cpu_block_policy_record_demotion_transfer(bytes);
+    }
+}
+
 // Copies pages resident on the src_id processor to the dst_id processor
 //
 // The function adds the pages that were successfully copied to the output
@@ -4159,6 +4175,11 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
                                          uvm_va_block_region_start(block, contig_region),
                                          uvm_va_block_region_size(contig_region),
                                          transfer_mode);
+            record_cpu_preferred_migration(dst_id,
+                                           src_id,
+                                           uvm_va_block_region_size(contig_region),
+                                           transfer_mode,
+                                           contig_cause);
 
             contig_start_index = page_index;
             contig_cause = page_cause;
@@ -4215,6 +4236,11 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
                                      uvm_va_block_region_start(block, contig_region),
                                      uvm_va_block_region_size(contig_region),
                                      transfer_mode);
+        record_cpu_preferred_migration(dst_id,
+                                       src_id,
+                                       uvm_va_block_region_size(contig_region),
+                                       transfer_mode,
+                                       contig_cause);
 
         if (block_copy_should_use_push(block, &copy_state) && copying_gpu)
             status = block_copy_end_push(block, &copy_state, copy_tracker, status, &push);

@@ -939,6 +939,7 @@ static NvU32 fetch_access_counter_buffer_entries(uvm_access_counter_buffer_t *ac
         return 0;
 
     batch_context->num_notifications = 0;
+    batch_context->counter_value_sum = 0;
     batch_context->is_single_instance_ptr = true;
     notification_index = 0;
 
@@ -969,6 +970,7 @@ static NvU32 fetch_access_counter_buffer_entries(uvm_access_counter_buffer_t *ac
         parent_gpu->access_counter_buffer_hal->parse_entry(access_counters, get, current_entry);
 
         batch_context->notifications[batch_context->num_notifications++] = current_entry;
+        batch_context->counter_value_sum += current_entry->counter_value;
 
         if (batch_context->is_single_instance_ptr) {
             if (batch_context->num_notifications == 1)
@@ -1317,8 +1319,13 @@ static NV_STATUS service_va_block_locked(uvm_gpu_t *gpu,
 
     ++service_context->num_retries;
 
-    if (status == NV_OK && promote_full_block && page_count > 0)
-        uvm_cpu_block_policy_record_promotion();
+    if (status == NV_OK && promote_full_block && page_count > 0) {
+        NvU64 promoted_bytes =
+            (NvU64)uvm_page_mask_weight(&service_context->block_context->make_resident.pages_changed_residency) *
+            PAGE_SIZE;
+
+        uvm_cpu_block_policy_record_promotion(promoted_bytes);
+    }
 
     return status;
 }
@@ -1484,7 +1491,10 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
             uvm_access_counter_buffer_entry_t *entry = notifications[i];
             uvm_gpu_chunk_t *chunk = uvm_va_block_lookup_gpu_chunk(va_block, gpu, entry->address);
 
-            uvm_pmm_gpu_mark_chunk_accessed(&gpu->pmm, chunk, entry->counter_value);
+            uvm_pmm_gpu_mark_chunk_accessed(&gpu->pmm,
+                                             chunk,
+                                             entry->counter_value,
+                                             uvm_cpu_block_policy_should_pin(va_block, gpu));
         }
     }
 
@@ -1829,6 +1839,10 @@ void uvm_service_access_counters(uvm_access_counter_buffer_t *access_counters)
                                                                                       NOTIFICATION_FETCH_MODE_BATCH_READY);
         if (batch_context->num_cached_notifications == 0)
             break;
+
+        // Keep the atomic accounting to one update per batch.
+        uvm_cpu_block_policy_record_access_counter_batch(batch_context->num_cached_notifications,
+                                                         batch_context->counter_value_sum);
 
         ++batch_context->batch_id;
 
