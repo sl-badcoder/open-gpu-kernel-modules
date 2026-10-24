@@ -339,11 +339,6 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         uvm_processor_mask_clear_atomic(&trigger_block->gpu_prefetch_started, gpu->id);
         retry = true;
     }
-    else if (uvm_pmm_gpu_eager_eviction_watermark_reached(&gpu->pmm)) {
-        // Reject new blocked signals before allocating the context and its
-        // NUMA masks. begin() still performs atomic admission after the claim.
-        return;
-    }
 
     block_context = uvm_va_block_context_alloc(mm);
     if (!block_context)
@@ -443,6 +438,14 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
 
     atomic64_add(prefetched_bytes, &uvm_cpu_preferred_prefetched_bytes);
 
+    // Keep completed attempts one-shot, but re-arm capacity-stopped attempts.
+    // The started bit remains set so signals are cheap while usage is still
+    // in watermark recovery or an eviction batch. Once recovery reaches the
+    // low watermark and eviction finishes, one service thread
+    // claims gpu_prefetch_retry and starts the next attempt.
+    if (capacity_stopped)
+        uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
+
 out:
     // No VA-block lock is held here. Drain all submitted work before allowing
     // eager eviction, even when submission stopped for capacity or an error.
@@ -454,11 +457,6 @@ out:
                           gpu->parent->name);
         }
     }
-
-    // Publish a retry only after the previous attempt has drained. Otherwise
-    // another service thread could retry the same chunk during the final wait.
-    if (capacity_stopped)
-        uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
 
     if (prefetch_admitted)
         uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm);
