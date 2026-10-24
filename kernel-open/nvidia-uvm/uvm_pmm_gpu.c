@@ -1543,6 +1543,32 @@ static uvm_pmm_alloc_list_t get_alloc_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
     return UVM_PMM_ALLOC_LIST_COUNT;
 }
 
+// Return true when a is preferred over b. This is deliberately independent of
+// list position so the eager batch snapshot and the original one-at-a-time
+// selector cannot disagree about migration protection or coldness.
+static bool allocated_chunk_precedes(uvm_pmm_gpu_t *pmm,
+                                     uvm_gpu_chunk_t *a,
+                                     uvm_gpu_chunk_t *b,
+                                     NvU64 now)
+{
+    uvm_gpu_root_chunk_t *a_root = root_chunk_from_chunk(pmm, a);
+    uvm_gpu_root_chunk_t *b_root = root_chunk_from_chunk(pmm, b);
+    bool a_protected = uvm_perf_migration_aware_eviction_enable && now < a_root->protected_until_ns;
+    bool b_protected = uvm_perf_migration_aware_eviction_enable && now < b_root->protected_until_ns;
+
+    if (a_protected != b_protected)
+        return !a_protected;
+    if (a_protected && a_root->protected_until_ns != b_root->protected_until_ns)
+        return a_root->protected_until_ns < b_root->protected_until_ns;
+    if (a_root->migration_score != b_root->migration_score)
+        return a_root->migration_score < b_root->migration_score;
+    if (a_root->resident_since_ns != b_root->resident_since_ns)
+        return a_root->resident_since_ns < b_root->resident_since_ns;
+    if (a_root->access_heat != b_root->access_heat)
+        return a_root->access_heat < b_root->access_heat;
+    return a_root->last_access_epoch < b_root->last_access_epoch;
+}
+
 static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
 {
     uvm_pmm_alloc_list_t alloc_list;
@@ -1555,61 +1581,113 @@ static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
     for (alloc_list = 0; alloc_list < UVM_PMM_ALLOC_LIST_COUNT; alloc_list++) {
         uvm_gpu_chunk_t *chunk = list_first_chunk(&pmm->root_chunks.alloc_list[alloc_list]);
 
-        // Preserve the existing unused/discarded priority. For used memory,
-        // order eviction by decayed access heat and then by oldest access.
         if (chunk && alloc_list != UVM_PMM_ALLOC_LIST_USED)
             return chunk;
     }
 
     list_for_each_entry(entry, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
-        uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, entry);
-        uvm_gpu_root_chunk_t *coldest_root;
-        bool root_protected = uvm_perf_migration_aware_eviction_enable &&
-                              now < root->protected_until_ns;
-        bool coldest_protected;
-
-        if (!coldest) {
+        if (!coldest || allocated_chunk_precedes(pmm, entry, coldest, now))
             coldest = entry;
-            continue;
-        }
-
-        coldest_root = root_chunk_from_chunk(pmm, coldest);
-        coldest_protected = uvm_perf_migration_aware_eviction_enable &&
-                            now < coldest_root->protected_until_ns;
-
-        // Always prefer an unprotected root. If all roots are protected, pick
-        // the one whose protection expires first so allocation can still make
-        // forward progress under critical memory pressure.
-        if (coldest_protected != root_protected) {
-            if (!root_protected)
-                coldest = entry;
-            continue;
-        }
-
-        if (root_protected && root->protected_until_ns != coldest_root->protected_until_ns) {
-            if (root->protected_until_ns < coldest_root->protected_until_ns)
-                coldest = entry;
-            continue;
-        }
-
-        // Migration score and residency age are stable without local-VRAM
-        // access information. Access-counter heat remains a final tie-breaker
-        // for the remote demand which originally brought data to this GPU.
-        if (root->migration_score < coldest_root->migration_score ||
-            (root->migration_score == coldest_root->migration_score &&
-             root->resident_since_ns < coldest_root->resident_since_ns) ||
-            (root->migration_score == coldest_root->migration_score &&
-             root->resident_since_ns == coldest_root->resident_since_ns &&
-             root->access_heat < coldest_root->access_heat) ||
-            (root->migration_score == coldest_root->migration_score &&
-             root->resident_since_ns == coldest_root->resident_since_ns &&
-             root->access_heat == coldest_root->access_heat &&
-             root->last_access_epoch < coldest_root->last_access_epoch)) {
-            coldest = entry;
-        }
     }
 
     return coldest;
+}
+
+#define UVM_EAGER_EVICTION_SNAPSHOT_SIZE 16
+
+typedef struct
+{
+    uvm_gpu_chunk_t *chunks[UVM_EAGER_EVICTION_SNAPSHOT_SIZE];
+    unsigned capacity;
+    unsigned count;
+    unsigned next;
+    bool has_cold_candidate;
+} eager_eviction_snapshot_t;
+
+// list_lock must be held. Defined below the snapshot helpers. This is a used
+// root heat decision only; priority-list availability is selected separately.
+static bool eager_eviction_has_cold_used_candidate(uvm_pmm_gpu_t *pmm);
+
+static void eager_snapshot_swap(uvm_gpu_chunk_t **a, uvm_gpu_chunk_t **b)
+{
+    uvm_gpu_chunk_t *tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+// Keep the worst candidate at the heap root. A bounded heap makes the list
+// traversal O(N log 16), while the sorted cache makes each claim O(1).
+static void eager_snapshot_refill(uvm_pmm_gpu_t *pmm, eager_eviction_snapshot_t *snapshot)
+{
+    uvm_gpu_chunk_t *entry;
+    NvU64 now = NV_GETTIME();
+    unsigned i;
+
+    snapshot->count = 0;
+    snapshot->next = 0;
+    snapshot->has_cold_candidate = false;
+
+    list_for_each_entry(entry, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
+        unsigned child;
+
+        if (snapshot->count < snapshot->capacity) {
+            snapshot->chunks[snapshot->count++] = entry;
+            child = snapshot->count - 1;
+            while (child && allocated_chunk_precedes(pmm,
+                                                      snapshot->chunks[(child - 1) / 2],
+                                                      snapshot->chunks[child],
+                                                      now)) {
+                eager_snapshot_swap(&snapshot->chunks[child], &snapshot->chunks[(child - 1) / 2]);
+                child = (child - 1) / 2;
+            }
+        }
+        else if (allocated_chunk_precedes(pmm, entry, snapshot->chunks[0], now)) {
+            snapshot->chunks[0] = entry;
+            child = 0;
+        }
+        else {
+            continue;
+        }
+        while (child < snapshot->count) {
+            unsigned worst = child;
+            unsigned left = child * 2 + 1;
+            unsigned right = left + 1;
+
+            if (left < snapshot->count && allocated_chunk_precedes(pmm, snapshot->chunks[worst], snapshot->chunks[left], now))
+                worst = left;
+            if (right < snapshot->count && allocated_chunk_precedes(pmm, snapshot->chunks[worst], snapshot->chunks[right], now))
+                worst = right;
+            if (worst == child)
+                break;
+            eager_snapshot_swap(&snapshot->chunks[child], &snapshot->chunks[worst]);
+            child = worst;
+        }
+    }
+
+    // Sort the bounded heap coldest first. The ranking is intentionally a
+    // sampled decision for this window; eligibility and list membership are
+    // revalidated immediately before every claim.
+    for (i = 1; i < snapshot->count; ++i) {
+        unsigned j = i;
+        while (j && allocated_chunk_precedes(pmm, snapshot->chunks[j], snapshot->chunks[j - 1], now)) {
+            eager_snapshot_swap(&snapshot->chunks[j], &snapshot->chunks[j - 1]);
+            --j;
+        }
+    }
+
+    snapshot->has_cold_candidate = eager_eviction_has_cold_used_candidate(pmm);
+}
+
+static uvm_gpu_chunk_t *eager_snapshot_next(uvm_pmm_gpu_t *pmm, eager_eviction_snapshot_t *snapshot)
+{
+    uvm_gpu_chunk_t *chunk;
+
+    while (snapshot->next < snapshot->count) {
+        chunk = snapshot->chunks[snapshot->next++];
+        if (uvm_gpu_chunk_is_user(chunk) && chunk_is_evictable(pmm, chunk))
+            return chunk;
+    }
+    return NULL;
 }
 
 static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
@@ -1827,7 +1905,7 @@ void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm)
 // Return whether the coldest used root chunk is sufficiently colder than the
 // hottest used root chunk to justify replacement below the high watermark.
 // list_lock must be held.
-static bool eager_eviction_has_cold_candidate(uvm_pmm_gpu_t *pmm)
+static bool eager_eviction_has_cold_used_candidate(uvm_pmm_gpu_t *pmm)
 {
     uvm_gpu_chunk_t *entry;
     NvU64 cold_heat = U64_MAX;
@@ -1836,12 +1914,6 @@ static bool eager_eviction_has_cold_candidate(uvm_pmm_gpu_t *pmm)
     NvU64 age;
 
     uvm_assert_spinlock_locked(&pmm->list_lock);
-
-    // Empty and discarded roots are always preferable to resident used data.
-    if (!list_empty(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_UNUSED]) ||
-        !list_empty(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_DISCARDED])) {
-        return true;
-    }
 
     list_for_each_entry(entry, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
         uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, entry);
@@ -1867,32 +1939,44 @@ static bool eager_eviction_has_cold_candidate(uvm_pmm_gpu_t *pmm)
     return hot_heat / cold_heat >= max(uvm_perf_eager_eviction_heat_ratio, 1U);
 }
 
-static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force, uvm_gpu_root_chunk_t **out_root)
+static bool eager_eviction_one(uvm_pmm_gpu_t *pmm,
+                               bool force,
+                               eager_eviction_snapshot_t *snapshot,
+                               uvm_gpu_root_chunk_t **out_root)
 {
     NV_STATUS status;
     uvm_gpu_root_chunk_t *root_chunk;
+    uvm_gpu_chunk_t *chunk;
 
     uvm_mutex_lock(&pmm->lock);
 
-    if (!force) {
-        bool has_candidate;
+    uvm_spin_lock(&pmm->list_lock);
+    if (snapshot->next >= snapshot->count)
+        eager_snapshot_refill(pmm, snapshot);
 
-        uvm_spin_lock(&pmm->list_lock);
-        has_candidate = eager_eviction_has_cold_candidate(pmm);
+    chunk = list_first_chunk(find_free_list(pmm, UVM_PMM_GPU_MEMORY_TYPE_USER,
+                                            UVM_CHUNK_SIZE_MAX, UVM_PMM_LIST_NO_ZERO));
+    if (!chunk)
+        chunk = list_first_chunk(find_free_list(pmm, UVM_PMM_GPU_MEMORY_TYPE_USER,
+                                                UVM_CHUNK_SIZE_MAX, UVM_PMM_LIST_ZERO));
+    if (!chunk)
+        chunk = list_first_chunk(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_UNUSED]);
+    if (!chunk)
+        chunk = list_first_chunk(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_DISCARDED]);
+    if (!chunk && !force && !snapshot->has_cold_candidate) {
         uvm_spin_unlock(&pmm->list_lock);
-
-        if (!has_candidate) {
-            uvm_mutex_unlock(&pmm->lock);
-            return false;
-        }
+        goto out_unlock;
     }
-
-    root_chunk = pick_root_chunk_to_evict(pmm);
-    if (!root_chunk) {
-        uvm_mutex_unlock(&pmm->lock);
-        return false;
+    if (!chunk) {
+        chunk = eager_snapshot_next(pmm, snapshot);
     }
+    if (chunk)
+        chunk_start_eviction(pmm, chunk);
+    uvm_spin_unlock(&pmm->list_lock);
+    if (!chunk)
+        goto out_unlock;
 
+    root_chunk = root_chunk_from_chunk(pmm, chunk);
     status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
     uvm_mutex_unlock(&pmm->lock);
 
@@ -1902,6 +1986,10 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force, uvm_gpu_root_chun
     // Keep the root pinned until the caller drains the submitted batch.
     *out_root = root_chunk;
     return true;
+
+out_unlock:
+    uvm_mutex_unlock(&pmm->lock);
+    return false;
 }
 
 static unsigned eager_eviction_batch(uvm_pmm_gpu_t *pmm, bool force, unsigned limit, unsigned low)
@@ -1913,12 +2001,17 @@ static unsigned eager_eviction_batch(uvm_pmm_gpu_t *pmm, bool force, unsigned li
     unsigned count;
     unsigned i;
     bool exhausted = false;
+    eager_eviction_snapshot_t snapshot = {
+        .capacity = min(limit, (unsigned)UVM_EAGER_EVICTION_SNAPSHOT_SIZE),
+        .count = 0,
+        .next = 0,
+    };
 
     while (submitted < limit && eager_eviction_usage_percent(pmm) > low && !exhausted) {
         count = 0;
         while (count < ARRAY_SIZE(pending) && submitted < limit &&
                eager_eviction_usage_percent_pending(pmm, count) > low) {
-            if (!eager_eviction_one(pmm, force, &pending[count])) {
+            if (!eager_eviction_one(pmm, force, &snapshot, &pending[count])) {
                 exhausted = true;
                 break;
             }
