@@ -47,6 +47,52 @@
 #define UVM_ACCESS_COUNTER_ACTION_BATCH_CLEAR       0x1
 #define UVM_ACCESS_COUNTER_ACTION_TARGETED_CLEAR    0x2
 
+// Keep demand servicing ahead of speculative neighbors without allowing a
+// large notification batch to retain an unbounded set of VA blocks. The VA
+// space read lock held by service_notifications protects these block pointers.
+#define UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY 8
+
+typedef struct
+{
+    uvm_va_block_t *blocks[UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY];
+    uvm_gpu_t *gpu;
+    struct mm_struct *mm;
+    NvU32 count;
+} demand_first_prefetch_queue_t;
+
+static void demand_first_prefetch_queue_flush(demand_first_prefetch_queue_t *queue)
+{
+    NvU32 i;
+
+    for (i = 0; i < queue->count; i++)
+        uvm_cpu_block_policy_prefetch_on_signal(queue->blocks[i], queue->gpu, queue->mm);
+
+    queue->count = 0;
+}
+
+static void demand_first_prefetch_queue_discard(demand_first_prefetch_queue_t *queue)
+{
+    queue->count = 0;
+}
+
+static void demand_first_prefetch_queue_push(demand_first_prefetch_queue_t *queue,
+                                             uvm_va_block_t *block,
+                                             uvm_gpu_t *gpu,
+                                             struct mm_struct *mm)
+{
+    if (queue->count == UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY)
+        demand_first_prefetch_queue_flush(queue);
+
+    if (queue->count == 0) {
+        queue->gpu = gpu;
+        queue->mm = mm;
+    }
+
+    UVM_ASSERT(queue->gpu == gpu);
+    UVM_ASSERT(queue->mm == mm);
+    queue->blocks[queue->count++] = block;
+}
+
 // Each page in a tracked physical range may belong to a different VA Block. We
 // preallocate an array of reverse map translations. However, access counter
 // granularity can be set to up to 16G, which would require an array too large
@@ -1431,7 +1477,8 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
                                                 uvm_access_counter_buffer_t *access_counters,
                                                 uvm_va_block_t *va_block,
                                                 NvU32 index,
-                                                NvU32 *out_index)
+                                                NvU32 *out_index,
+                                                demand_first_prefetch_queue_t *prefetch_queue)
 {
     NvU32 i;
     NvU32 flags = 0;
@@ -1491,7 +1538,6 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     uvm_mutex_unlock(&va_block->lock);
 
     if (status == NV_OK) {
-        uvm_cpu_block_policy_prefetch_on_signal(va_block, gpu, mm);
         flags |= UVM_ACCESS_COUNTER_ACTION_BATCH_CLEAR;
     }
 
@@ -1506,6 +1552,9 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
 
     if ((status == NV_OK) && (flags_status != NV_OK))
         status = flags_status;
+
+    if (status == NV_OK)
+        demand_first_prefetch_queue_push(prefetch_queue, va_block, gpu, mm);
 
     return status;
 }
@@ -1600,7 +1649,8 @@ static NV_STATUS service_notifications_batch(uvm_gpu_va_space_t *gpu_va_space,
                                              struct mm_struct *mm,
                                              uvm_access_counter_buffer_t *access_counters,
                                              NvU32 index,
-                                             NvU32 *out_index)
+                                             NvU32 *out_index,
+                                             demand_first_prefetch_queue_t *prefetch_queue)
 {
     NV_STATUS status;
     uvm_va_range_t *va_range;
@@ -1645,7 +1695,8 @@ static NV_STATUS service_notifications_batch(uvm_gpu_va_space_t *gpu_va_space,
                                                     access_counters,
                                                     va_block,
                                                     index,
-                                                    out_index);
+                                                    out_index,
+                                                    prefetch_queue);
         }
         else {
             status = notify_tools_and_process_flags(va_space,
@@ -1743,6 +1794,7 @@ static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_count
     uvm_va_space_t *prev_va_space = NULL;
     uvm_gpu_t *prev_gpu = NULL;
     uvm_gpu_va_space_t *gpu_va_space = NULL;
+    demand_first_prefetch_queue_t prefetch_queue = {};
     uvm_parent_gpu_t *parent_gpu = access_counters->parent_gpu;
     uvm_access_counter_service_batch_context_t *batch_context = &access_counters->batch_service_context;
 
@@ -1755,6 +1807,7 @@ static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_count
         if (va_space != prev_va_space) {
             // New va_space detected, drop locks of the old va_space.
             if (prev_va_space) {
+                demand_first_prefetch_queue_flush(&prefetch_queue);
                 uvm_va_space_up_read(prev_va_space);
                 uvm_va_space_mm_release_unlock(prev_va_space, mm);
 
@@ -1773,6 +1826,7 @@ static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_count
 
         if (va_space) {
             if (prev_gpu != current_entry->gpu) {
+                demand_first_prefetch_queue_flush(&prefetch_queue);
                 prev_gpu = current_entry->gpu;
                 gpu_va_space = uvm_gpu_va_space_get(va_space, current_entry->gpu);
             }
@@ -1780,7 +1834,12 @@ static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_count
             if (gpu_va_space &&
                 uvm_va_space_has_access_counter_migrations(va_space) &&
                 should_service_4k_notification(va_space, current_entry->gpu, current_entry->address)) {
-                status = service_notifications_batch(gpu_va_space, mm, access_counters, i, &i);
+                status = service_notifications_batch(gpu_va_space,
+                                                     mm,
+                                                     access_counters,
+                                                     i,
+                                                     &i,
+                                                     &prefetch_queue);
             }
             else {
                 status = notify_tools_and_process_flags(va_space,
@@ -1807,6 +1866,10 @@ static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_count
     }
 
     if (va_space) {
+        if (status == NV_OK)
+            demand_first_prefetch_queue_flush(&prefetch_queue);
+        else
+            demand_first_prefetch_queue_discard(&prefetch_queue);
         uvm_va_space_up_read(va_space);
         uvm_va_space_mm_release_unlock(va_space, mm);
     }
