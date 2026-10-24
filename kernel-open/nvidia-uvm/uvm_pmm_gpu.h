@@ -669,7 +669,7 @@ void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
 // A true result also kicks the background eviction worker.
 bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm);
 
-// Admit a speculative block migration only outside the eager eviction phase.
+// Admit a speculative chunk migration only outside the eager eviction phase.
 // Every successful begin must be paired with end after GPU work completes.
 bool uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm);
 void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm);

@@ -202,6 +202,7 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
                                 uvm_gpu_t *gpu,
                                 struct mm_struct *mm,
                                 uvm_va_block_context_t *block_context,
+                                uvm_tracker_t *prefetch_tracker,
                                 NvU64 *prefetched_bytes,
                                 bool *capacity_stop)
 {
@@ -213,11 +214,6 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
     const uvm_page_mask_t *thrashing_pages;
 
     *capacity_stop = false;
-    if (!uvm_pmm_gpu_eager_eviction_prefetch_begin(&gpu->pmm)) {
-        *capacity_stop = true;
-        return NV_OK;
-    }
-
     uvm_mutex_lock(&va_block->lock);
 
     cpu_resident = uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, NUMA_NO_NODE);
@@ -281,22 +277,20 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
         *capacity_stop = retry.no_eviction_allocation_failed;
     }
 
-    // Keep the admission until asynchronous copies and mappings complete.
-    // Otherwise the eviction worker could overlap the submitted prefetch.
+    // Collect dependencies while the block tracker is locked, including any
+    // work submitted before an error. The chunk waits once after submission.
     {
-        NV_STATUS wait_status = uvm_tracker_wait(&va_block->tracker);
+        NV_STATUS tracker_status = uvm_tracker_add_tracker_safe(prefetch_tracker, &va_block->tracker);
         if (status == NV_OK)
-            status = wait_status;
+            status = tracker_status;
     }
 
     uvm_mutex_unlock(&va_block->lock);
     uvm_va_block_retry_deinit(&retry, va_block);
-    uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm);
     return status;
 
 out_unlock:
     uvm_mutex_unlock(&va_block->lock);
-    uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm);
     return status;
 }
 
@@ -319,6 +313,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     unsigned prefetch_chunk_mb = READ_ONCE(uvm_cpu_preferred_prefetch_chunk_mb);
     bool retry = false;
     bool capacity_stopped = false;
+    bool prefetch_admitted = false;
+    uvm_tracker_t prefetch_tracker = UVM_TRACKER_INIT();
 
     if (!managed_range ||
         prefetch_chunk_mb == 0 ||
@@ -350,6 +346,15 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
 
     if (uvm_processor_mask_test_and_set_atomic(&trigger_block->gpu_prefetch_started, gpu->id))
         goto out;
+
+    // Hold one admission for the whole chunk, including its final GPU wait.
+    // Per-block watermark checks still stop submission when recovery begins.
+    if (!uvm_pmm_gpu_eager_eviction_prefetch_begin(&gpu->pmm)) {
+        atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
+        uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
+        goto out;
+    }
+    prefetch_admitted = true;
 
     atomic64_inc(&uvm_cpu_preferred_range_prefetches);
     if (retry)
@@ -410,7 +415,13 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         if (!va_block)
             continue;
 
-        status = prefetch_block(va_block, gpu, mm, block_context, &prefetched_bytes, &capacity_stop);
+        status = prefetch_block(va_block,
+                                gpu,
+                                mm,
+                                block_context,
+                                &prefetch_tracker,
+                                &prefetched_bytes,
+                                &capacity_stop);
         if (capacity_stop) {
             atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
             capacity_stopped = true;
@@ -436,6 +447,20 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
 
 out:
+    // No VA-block lock is held here. Drain all submitted work before allowing
+    // eager eviction, even when submission stopped for capacity or an error.
+    {
+        NV_STATUS status = uvm_tracker_wait_deinit(&prefetch_tracker);
+        if (status != NV_OK) {
+            UVM_DBG_PRINT("Managed allocation prefetch completion failed with %s on GPU %s\n",
+                          nvstatusToString(status),
+                          gpu->parent->name);
+        }
+    }
+
+    if (prefetch_admitted)
+        uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm);
+
     uvm_va_block_context_free(block_context);
 }
 
