@@ -1780,15 +1780,19 @@ static bool eager_eviction_prefetch_blocked_locked(uvm_pmm_gpu_t *pmm)
 bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm)
 {
     bool blocked;
+    bool kick;
 
     if (!eager_eviction_supported(pmm))
         return false;
 
     uvm_spin_lock(&pmm->list_lock);
     blocked = eager_eviction_prefetch_blocked_locked(pmm);
+    // The running worker reschedules itself. If prefetch is draining, its
+    // last end() wakes recovery, so neither case needs another queued pass.
+    kick = blocked && !pmm->eager_eviction.active && !pmm->eager_eviction.prefetch_count;
     uvm_spin_unlock(&pmm->list_lock);
 
-    if (blocked)
+    if (kick)
         eager_eviction_schedule(pmm, 0);
 
     return blocked;
@@ -1797,14 +1801,18 @@ bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm)
 bool uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm)
 {
     bool blocked;
+    bool kick;
 
     uvm_spin_lock(&pmm->list_lock);
     blocked = eager_eviction_supported(pmm) && eager_eviction_prefetch_blocked_locked(pmm);
     if (!blocked)
         ++pmm->eager_eviction.prefetch_count;
+    // The running worker reschedules itself. If prefetch is draining, its
+    // last end() wakes recovery, so neither case needs another queued pass.
+    kick = blocked && !pmm->eager_eviction.active && !pmm->eager_eviction.prefetch_count;
     uvm_spin_unlock(&pmm->list_lock);
 
-    if (blocked)
+    if (kick)
         eager_eviction_schedule(pmm, 0);
 
     return !blocked;
