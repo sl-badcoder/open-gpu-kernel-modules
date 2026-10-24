@@ -1734,7 +1734,9 @@ static NV_STATUS pick_and_evict_root_chunk_retry(uvm_pmm_gpu_t *pmm,
     return status;
 }
 
-static unsigned eager_eviction_usage_percent(uvm_pmm_gpu_t *pmm)
+// Include roots whose eviction is submitted but which have not reached PMA
+// yet, so pipelining does not deliberately reclaim beyond the low watermark.
+static unsigned eager_eviction_usage_percent_pending(uvm_pmm_gpu_t *pmm, unsigned pending_roots)
 {
     NvU64 total_pages_64k;
     NvU64 free_pages_64k;
@@ -1747,8 +1749,15 @@ static unsigned eager_eviction_usage_percent(uvm_pmm_gpu_t *pmm)
     if (!total_pages_64k)
         return 0;
 
-    free_pages_64k = min(READ_ONCE(pmm->pma_stats->numFreePages64k), total_pages_64k);
+    free_pages_64k = min(READ_ONCE(pmm->pma_stats->numFreePages64k) +
+                            (NvU64)pending_roots * (UVM_CHUNK_SIZE_MAX / UVM_PAGE_SIZE_64K),
+                        total_pages_64k);
     return (unsigned)(((total_pages_64k - free_pages_64k) * 100) / total_pages_64k);
+}
+
+static unsigned eager_eviction_usage_percent(uvm_pmm_gpu_t *pmm)
+{
+    return eager_eviction_usage_percent_pending(pmm, 0);
 }
 
 // list_lock serializes recovery state and admission to either migration phase.
@@ -1803,10 +1812,16 @@ bool uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm)
 
 void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm)
 {
+    bool resume_recovery;
+
     uvm_spin_lock(&pmm->list_lock);
     UVM_ASSERT(pmm->eager_eviction.prefetch_count > 0);
     --pmm->eager_eviction.prefetch_count;
+    resume_recovery = !pmm->eager_eviction.prefetch_count && pmm->eager_eviction.recovering_watermark;
     uvm_spin_unlock(&pmm->list_lock);
+
+    if (resume_recovery && !READ_ONCE(pmm->eager_eviction.stopping))
+        mod_delayed_work(system_wq, &pmm->eager_eviction.work, 0);
 }
 
 // Return whether the coldest used root chunk is sufficiently colder than the
@@ -1852,7 +1867,7 @@ static bool eager_eviction_has_cold_candidate(uvm_pmm_gpu_t *pmm)
     return hot_heat / cold_heat >= max(uvm_perf_eager_eviction_heat_ratio, 1U);
 }
 
-static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force)
+static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force, uvm_gpu_root_chunk_t **out_root)
 {
     NV_STATUS status;
     uvm_gpu_root_chunk_t *root_chunk;
@@ -1884,11 +1899,41 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force)
     if (status != NV_OK)
         return false;
 
-    // Eager eviction returns the entire root allocation to PMA instead of
-    // retaining it on a PMM free list. This makes the watermark visible to
-    // all VRAM clients, not only UVM.
-    free_root_chunk(pmm, root_chunk, FREE_ROOT_CHUNK_MODE_DEFAULT);
+    // Keep the root pinned until the caller drains the submitted batch.
+    *out_root = root_chunk;
     return true;
+}
+
+static unsigned eager_eviction_batch(uvm_pmm_gpu_t *pmm, bool force, unsigned limit, unsigned low)
+{
+    // Bound stack use and outstanding pinned VRAM independently of the module
+    // parameter. Copies for these roots can run before the first PMA free waits.
+    uvm_gpu_root_chunk_t *pending[16];
+    unsigned submitted = 0;
+    unsigned count;
+    unsigned i;
+    bool exhausted = false;
+
+    while (submitted < limit && eager_eviction_usage_percent(pmm) > low && !exhausted) {
+        count = 0;
+        while (count < ARRAY_SIZE(pending) && submitted < limit &&
+               eager_eviction_usage_percent_pending(pmm, count) > low) {
+            if (!eager_eviction_one(pmm, force, &pending[count])) {
+                exhausted = true;
+                break;
+            }
+
+            ++count;
+            ++submitted;
+        }
+
+        // Drain successful submissions even if selecting a later root failed.
+        // free_root_chunk waits for each root's tracker before releasing VRAM.
+        for (i = 0; i < count; ++i)
+            free_root_chunk(pmm, pending[i], FREE_ROOT_CHUNK_MODE_DEFAULT);
+    }
+
+    return submitted;
 }
 
 static void eager_eviction_work(struct work_struct *work)
@@ -1899,6 +1944,9 @@ static void eager_eviction_work(struct work_struct *work)
     unsigned high = clamp(uvm_perf_eager_eviction_high_watermark, 1U, 100U);
     unsigned low = clamp(uvm_perf_eager_eviction_low_watermark, 1U, high);
     unsigned batch_count = max(uvm_perf_eager_eviction_batch_count, 1U);
+    unsigned evicted = 0;
+    unsigned long delay = msecs_to_jiffies(max(uvm_perf_eager_eviction_interval_ms, 1U));
+    NvU64 now;
     bool recovering;
 
     if (!eager_eviction_supported(pmm) || READ_ONCE(pmm->eager_eviction.stopping))
@@ -1907,27 +1955,31 @@ static void eager_eviction_work(struct work_struct *work)
     // Exponential decay makes the ordering responsive to phase changes and
     // naturally turns regions with no new notifications into cold candidates.
     uvm_spin_lock(&pmm->list_lock);
-    ++pmm->eager_eviction.epoch;
-    for (i = 0; i < pmm->root_chunks.count; i++) {
-        uvm_gpu_root_chunk_t *root = &pmm->root_chunks.array[i];
+    now = NV_GETTIME();
+    if (now >= pmm->eager_eviction.next_aging_ns) {
+        pmm->eager_eviction.next_aging_ns = now +
+            (NvU64)max(uvm_perf_eager_eviction_interval_ms, 1U) * NSEC_PER_MSEC;
+        ++pmm->eager_eviction.epoch;
+        for (i = 0; i < pmm->root_chunks.count; i++) {
+            uvm_gpu_root_chunk_t *root = &pmm->root_chunks.array[i];
 
-        if (root->chunk.state != UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED)
-            root->access_heat >>= 1;
+            if (root->chunk.state != UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED)
+                root->access_heat >>= 1;
 
-        if (root->chunk.state != UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED &&
-            uvm_perf_migration_aware_eviction_enable &&
-            root->migration_score) {
-            NvU64 decay_ns = (NvU64)max(uvm_perf_migration_eviction_decay_ms, 1U) * NSEC_PER_MSEC;
-            NvU64 now = NV_GETTIME();
-            NvU64 shifts = (now - root->migration_score_update_ns) / decay_ns;
+            if (root->chunk.state != UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED &&
+                uvm_perf_migration_aware_eviction_enable &&
+                root->migration_score) {
+                NvU64 decay_ns = (NvU64)max(uvm_perf_migration_eviction_decay_ms, 1U) * NSEC_PER_MSEC;
+                NvU64 shifts = (now - root->migration_score_update_ns) / decay_ns;
 
-            if (shifts >= 32)
-                root->migration_score = 0;
-            else if (shifts)
-                root->migration_score >>= shifts;
+                if (shifts >= 32)
+                    root->migration_score = 0;
+                else if (shifts)
+                    root->migration_score >>= shifts;
 
-            if (shifts)
-                root->migration_score_update_ns += shifts * decay_ns;
+                if (shifts)
+                    root->migration_score_update_ns += shifts * decay_ns;
+            }
         }
     }
     uvm_spin_unlock(&pmm->list_lock);
@@ -1948,27 +2000,22 @@ static void eager_eviction_work(struct work_struct *work)
     pmm->eager_eviction.active = true;
     uvm_spin_unlock(&pmm->list_lock);
 
-    for (i = 0; i < batch_count && usage > low; i++) {
-        bool force = recovering;
-
-        if (!eager_eviction_one(pmm, force))
-            break;
-
-        usage = eager_eviction_usage_percent(pmm);
-
-        // Both ratio-based replacement and forced watermark recovery may use
-        // the full configured batch. eager_eviction_one() rechecks the
-        // hot/cold condition before every non-forced eviction.
-    }
+    evicted = eager_eviction_batch(pmm, recovering, batch_count, low);
 
     uvm_spin_lock(&pmm->list_lock);
-    if (eager_eviction_usage_percent(pmm) <= low)
+    usage = eager_eviction_usage_percent(pmm);
+    if (usage <= low)
         pmm->eager_eviction.recovering_watermark = false;
+
+    // Continue productive recovery without a timer gap. Yield through the
+    // workqueue between bounded batches; back off if no full batch was possible.
+    if (pmm->eager_eviction.recovering_watermark && evicted == batch_count)
+        delay = 0;
     pmm->eager_eviction.active = false;
     uvm_spin_unlock(&pmm->list_lock);
 
 reschedule:
-    eager_eviction_schedule(pmm, msecs_to_jiffies(max(uvm_perf_eager_eviction_interval_ms, 1U)));
+    eager_eviction_schedule(pmm, delay);
 }
 
 static void eager_eviction_schedule(uvm_pmm_gpu_t *pmm, unsigned long delay)
@@ -4149,6 +4196,7 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     pmm->root_chunks.pinned_count = 0;
     pmm->root_chunks.in_eviction_count = 0;
     pmm->eager_eviction.epoch = 0;
+    pmm->eager_eviction.next_aging_ns = 0;
     pmm->eager_eviction.active = false;
     pmm->eager_eviction.prefetch_count = 0;
     pmm->eager_eviction.recovering_watermark = false;

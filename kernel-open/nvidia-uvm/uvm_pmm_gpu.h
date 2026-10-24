@@ -462,6 +462,8 @@ typedef struct uvm_pmm_gpu_struct
         // mappings and migration bookkeeping remain unchanged.
         struct delayed_work work;
         NvU64 epoch;
+        // Protected by list_lock. Recovery kicks do not accelerate heat decay.
+        NvU64 next_aging_ns;
         // Protected by list_lock. Prefetch admissions and worker eviction
         // batches are mutually exclusive; recovery persists down to low.
         unsigned prefetch_count;
