@@ -370,6 +370,10 @@ static NV_STATUS alloc_root_chunk(uvm_pmm_gpu_t *pmm,
                                   uvm_pmm_alloc_flags_t flags,
                                   uvm_gpu_chunk_t **chunk);
 static void free_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk, free_root_chunk_mode_t free_mode);
+static void free_root_chunks(uvm_pmm_gpu_t *pmm,
+                             uvm_gpu_root_chunk_t **root_chunks,
+                             unsigned count,
+                             free_root_chunk_mode_t free_mode);
 static NV_STATUS split_gpu_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 static void free_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
 static void free_chunk_with_merges(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
@@ -1911,7 +1915,6 @@ static unsigned eager_eviction_batch(uvm_pmm_gpu_t *pmm, bool force, unsigned li
     uvm_gpu_root_chunk_t *pending[16];
     unsigned submitted = 0;
     unsigned count;
-    unsigned i;
     bool exhausted = false;
 
     while (submitted < limit && eager_eviction_usage_percent(pmm) > low && !exhausted) {
@@ -1928,9 +1931,8 @@ static unsigned eager_eviction_batch(uvm_pmm_gpu_t *pmm, bool force, unsigned li
         }
 
         // Drain successful submissions even if selecting a later root failed.
-        // free_root_chunk waits for each root's tracker before releasing VRAM.
-        for (i = 0; i < count; ++i)
-            free_root_chunk(pmm, pending[i], FREE_ROOT_CHUNK_MODE_DEFAULT);
+        // free_root_chunks waits for each root before releasing VRAM.
+        free_root_chunks(pmm, pending, count, FREE_ROOT_CHUNK_MODE_DEFAULT);
     }
 
     return submitted;
@@ -2637,40 +2639,57 @@ exit_unlock:
     return status;
 }
 
-void free_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk, free_root_chunk_mode_t free_mode)
+static void free_root_chunks(uvm_pmm_gpu_t *pmm,
+                             uvm_gpu_root_chunk_t **root_chunks,
+                             unsigned count,
+                             free_root_chunk_mode_t free_mode)
 {
-    NV_STATUS status;
+    unsigned i;
     uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
-    uvm_gpu_chunk_t *chunk = &root_chunk->chunk;
     NvU32 flags = 0;
+    NvU64 addresses[16];
+
+    if (count == 0)
+        return;
+
+    UVM_ASSERT(count <= ARRAY_SIZE(addresses));
 
     // Acquire the PMA lock for read so that uvm_pmm_gpu_pma_evict_range() can
-    // flush out any pending frees.
+    // flush out any pending frees. Keep it across every wait, state update, and
+    // the batched PMA free so callbacks cannot race these operations.
     uvm_down_read(&pmm->pma_lock);
 
-    root_chunk_lock(pmm, root_chunk);
+    for (i = 0; i < count; ++i) {
+        NV_STATUS status;
+        uvm_gpu_root_chunk_t *root_chunk = root_chunks[i];
+        uvm_gpu_chunk_t *chunk = &root_chunk->chunk;
 
-    status = uvm_tracker_wait_deinit(&root_chunk->tracker);
-    if (status != NV_OK) {
-        // TODO: Bug 1766184: Handle RC/ECC. For now just go ahead and free the
-        // chunk anyway.
-        UVM_ASSERT(uvm_global_get_status() != NV_OK);
+        root_chunk_lock(pmm, root_chunk);
+
+        status = uvm_tracker_wait_deinit(&root_chunk->tracker);
+        if (status != NV_OK) {
+            // TODO: Bug 1766184: Handle RC/ECC. For now just go ahead and free the
+            // chunk anyway.
+            UVM_ASSERT(uvm_global_get_status() != NV_OK);
+        }
+
+        uvm_spin_lock(&pmm->list_lock);
+
+        UVM_ASSERT_MSG(chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED,
+                       "Address 0x%llx state %s GPU %s\n",
+                       chunk->address,
+                       uvm_pmm_gpu_chunk_state_string(chunk->state),
+                       uvm_gpu_name(gpu));
+        UVM_ASSERT(list_empty(&chunk->list));
+
+        // Publish PMA_OWNED before releasing the root lock or PMA lock.
+        chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED);
+        addresses[i] = chunk->address;
+
+        uvm_spin_unlock(&pmm->list_lock);
+
+        root_chunk_unlock(pmm, root_chunk);
     }
-
-    uvm_spin_lock(&pmm->list_lock);
-
-    UVM_ASSERT_MSG(chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED,
-                   "Address 0x%llx state %s GPU %s\n",
-                   chunk->address,
-                   uvm_pmm_gpu_chunk_state_string(chunk->state),
-                   uvm_gpu_name(gpu));
-    UVM_ASSERT(list_empty(&chunk->list));
-
-    chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_PMA_OWNED);
-
-    uvm_spin_unlock(&pmm->list_lock);
-
-    root_chunk_unlock(pmm, root_chunk);
 
     if (free_mode == FREE_ROOT_CHUNK_MODE_SKIP_PMA_FREE) {
         uvm_up_read(&pmm->pma_lock);
@@ -2680,12 +2699,23 @@ void free_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk, free_
     if (free_mode == FREE_ROOT_CHUNK_MODE_PMA_EVICTION)
         flags |= UVM_PMA_CALLED_FROM_PMA_EVICTION;
 
-    if (chunk->is_zero)
-        flags |= UVM_PMA_FREE_IS_ZERO;
+    for (i = 0; i < count; ++i) {
+        if (root_chunks[i]->chunk.is_zero) {
+            // Eager eviction roots are never zero. Preserve the generic
+            // single-root path's zero-page flag for all other callers.
+            UVM_ASSERT(count == 1);
+            flags |= UVM_PMA_FREE_IS_ZERO;
+        }
+    }
 
-    nvUvmInterfacePmaFreePages(pmm->pma, &chunk->address, 1, UVM_CHUNK_SIZE_MAX, flags);
+    nvUvmInterfacePmaFreePages(pmm->pma, addresses, count, UVM_CHUNK_SIZE_MAX, flags);
 
     uvm_up_read(&pmm->pma_lock);
+}
+
+static void free_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root_chunk, free_root_chunk_mode_t free_mode)
+{
+    free_root_chunks(pmm, &root_chunk, 1, free_mode);
 }
 
 // Splits the input chunk into subchunks of the next size down. The chunk state
