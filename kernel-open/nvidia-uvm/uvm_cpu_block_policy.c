@@ -107,6 +107,7 @@ void uvm_cpu_block_policy_init_range(uvm_va_range_managed_t *managed_range)
     uvm_gpu_t *gpu;
 
     uvm_assert_rwsem_locked_write(&va_space->lock);
+    uvm_spin_lock_init(&managed_range->cpu_prefetch_lock, UVM_LOCK_ORDER_LEAF);
 
     if (!uvm_cpu_block_policy_enabled() || g_uvm_global.conf_computing_enabled)
         return;
@@ -294,6 +295,82 @@ out_unlock:
     return status;
 }
 
+typedef struct
+{
+    size_t first;
+    size_t outer;
+} prefetch_coverage_t;
+
+// Snapshot older in-flight windows before advertising this one. This gives
+// concurrent calls an acyclic ownership order: a call only skips older work.
+// When all slots are occupied, continue without publishing another window.
+static int prefetch_window_begin(uvm_va_range_managed_t *managed_range,
+                                  uvm_gpu_t *gpu,
+                                  uvm_va_block_t *trigger_block,
+                                  size_t first,
+                                  size_t outer,
+                                  prefetch_coverage_t *coverage,
+                                  unsigned *coverage_count)
+{
+    unsigned i;
+    int slot = -1;
+
+    *coverage_count = 0;
+    uvm_spin_lock(&managed_range->cpu_prefetch_lock);
+    for (i = 0; i < ARRAY_SIZE(managed_range->cpu_prefetch_windows); ++i) {
+        if (!managed_range->cpu_prefetch_windows[i].gpu) {
+            if (slot < 0)
+                slot = i;
+            continue;
+        }
+
+        if (managed_range->cpu_prefetch_windows[i].gpu == gpu &&
+            managed_range->cpu_prefetch_windows[i].first < outer &&
+            managed_range->cpu_prefetch_windows[i].outer > first) {
+            coverage[*coverage_count].first = managed_range->cpu_prefetch_windows[i].first;
+            coverage[*coverage_count].outer = managed_range->cpu_prefetch_windows[i].outer;
+            ++*coverage_count;
+        }
+    }
+
+    // Publish the retry before older owners can remove their windows. A
+    // notification racing their completion must not see started without retry.
+    if (*coverage_count)
+        uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
+
+    if (slot >= 0) {
+        managed_range->cpu_prefetch_windows[slot].first = first;
+        managed_range->cpu_prefetch_windows[slot].outer = outer;
+        managed_range->cpu_prefetch_windows[slot].gpu = gpu;
+    }
+    uvm_spin_unlock(&managed_range->cpu_prefetch_lock);
+    return slot;
+}
+
+static bool prefetch_window_covers(const prefetch_coverage_t *coverage,
+                                   unsigned count,
+                                   size_t index)
+{
+    unsigned i;
+
+    for (i = 0; i < count; ++i) {
+        if (index >= coverage[i].first && index < coverage[i].outer)
+            return true;
+    }
+
+    return false;
+}
+
+static void prefetch_window_end(uvm_va_range_managed_t *managed_range, int slot)
+{
+    if (slot < 0)
+        return;
+
+    uvm_spin_lock(&managed_range->cpu_prefetch_lock);
+    managed_range->cpu_prefetch_windows[slot].gpu = NULL;
+    uvm_spin_unlock(&managed_range->cpu_prefetch_lock);
+}
+
 void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                              uvm_gpu_t *gpu,
                                              struct mm_struct *mm)
@@ -314,6 +391,10 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     bool retry = false;
     bool capacity_stopped = false;
     bool prefetch_admitted = false;
+    bool overlap_skipped = false;
+    prefetch_coverage_t coverage[ARRAY_SIZE(managed_range->cpu_prefetch_windows)];
+    unsigned coverage_count = 0;
+    int window_slot = -1;
     uvm_tracker_t prefetch_tracker = UVM_TRACKER_INIT();
 
     if (!managed_range ||
@@ -376,6 +457,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     if (start_index + chunk_block_count > block_count)
         start_index = block_count - chunk_block_count;
     end_index = start_index + chunk_block_count;
+    window_slot = prefetch_window_begin(managed_range, gpu, trigger_block, start_index, end_index, coverage, &coverage_count);
 
     // Migrate the block which produced the notification before considering
     // its speculative neighbors. Otherwise, walking from start_index could
@@ -396,6 +478,13 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         }
 
         UVM_ASSERT(candidate_index >= start_index && candidate_index < end_index);
+
+        // Older callers own these indices. Keep this trigger retryable: an
+        // older call may stop for capacity before submitting its entire window.
+        if (prefetch_window_covers(coverage, coverage_count, candidate_index)) {
+            overlap_skipped = true;
+            continue;
+        }
 
         va_block = candidate_index == trigger_index ?
                        trigger_block :
@@ -443,7 +532,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     // in watermark recovery or an eviction batch. Once recovery reaches the
     // low watermark and eviction finishes, one service thread
     // claims gpu_prefetch_retry and starts the next attempt.
-    if (capacity_stopped)
+    if (capacity_stopped || overlap_skipped)
         uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
 
 out:
@@ -457,6 +546,10 @@ out:
                           gpu->parent->name);
         }
     }
+
+    // Coverage ends after submitted copies and mappings finish. Eviction
+    // never leaves a persistent coverage cache which could suppress new demand.
+    prefetch_window_end(managed_range, window_slot);
 
     if (prefetch_admitted)
         uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm);

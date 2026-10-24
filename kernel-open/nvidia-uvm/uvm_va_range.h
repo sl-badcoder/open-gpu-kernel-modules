@@ -274,6 +274,18 @@ struct uvm_va_range_managed_struct
     // hardware access-counter notification promotes their complete VA block.
     bool cpu_access_counter_policy;
 
+    // Bounded speculative windows, protected by cpu_prefetch_lock. A NULL
+    // GPU marks a free slot. Entries exist only while a prefetch call holds
+    // the VA-space read lock, including its final GPU completion wait.
+    uvm_spinlock_t cpu_prefetch_lock;
+    struct
+    {
+        uvm_gpu_t *gpu;
+        size_t first;
+        size_t outer;
+    } cpu_prefetch_windows[8];
+
+
     // Force the next split on this range to fail. Set by error injection ioctl
     // (testing purposes only).
     bool inject_split_error;
