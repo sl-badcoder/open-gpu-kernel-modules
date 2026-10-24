@@ -1751,19 +1751,62 @@ static unsigned eager_eviction_usage_percent(uvm_pmm_gpu_t *pmm)
     return (unsigned)(((total_pages_64k - free_pages_64k) * 100) / total_pages_64k);
 }
 
+// list_lock serializes recovery state and admission to either migration phase.
+static bool eager_eviction_prefetch_blocked_locked(uvm_pmm_gpu_t *pmm)
+{
+    unsigned high = clamp(uvm_perf_eager_eviction_high_watermark, 1U, 100U);
+    unsigned usage = eager_eviction_usage_percent(pmm);
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    if (usage >= high)
+        pmm->eager_eviction.recovering_watermark = true;
+
+    // Only the worker clears recovery, after its evictions have completed.
+    // This also handles equal high and low watermarks without reopening early.
+    return pmm->eager_eviction.recovering_watermark ||
+           pmm->eager_eviction.active;
+}
+
 bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm)
 {
-    unsigned high;
+    bool blocked;
 
     if (!eager_eviction_supported(pmm))
         return false;
 
-    high = clamp(uvm_perf_eager_eviction_high_watermark, 1U, 100U);
-    if (eager_eviction_usage_percent(pmm) < high)
-        return false;
+    uvm_spin_lock(&pmm->list_lock);
+    blocked = eager_eviction_prefetch_blocked_locked(pmm);
+    uvm_spin_unlock(&pmm->list_lock);
 
-    eager_eviction_schedule(pmm, 0);
-    return true;
+    if (blocked)
+        eager_eviction_schedule(pmm, 0);
+
+    return blocked;
+}
+
+bool uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm)
+{
+    bool blocked;
+
+    uvm_spin_lock(&pmm->list_lock);
+    blocked = eager_eviction_supported(pmm) && eager_eviction_prefetch_blocked_locked(pmm);
+    if (!blocked)
+        ++pmm->eager_eviction.prefetch_count;
+    uvm_spin_unlock(&pmm->list_lock);
+
+    if (blocked)
+        eager_eviction_schedule(pmm, 0);
+
+    return !blocked;
+}
+
+void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm)
+{
+    uvm_spin_lock(&pmm->list_lock);
+    UVM_ASSERT(pmm->eager_eviction.prefetch_count > 0);
+    --pmm->eager_eviction.prefetch_count;
+    uvm_spin_unlock(&pmm->list_lock);
 }
 
 // Return whether the coldest used root chunk is sufficiently colder than the
@@ -1889,6 +1932,7 @@ static void eager_eviction_work(struct work_struct *work)
     }
     uvm_spin_unlock(&pmm->list_lock);
 
+    uvm_spin_lock(&pmm->list_lock);
     usage = eager_eviction_usage_percent(pmm);
     if (usage >= high)
         pmm->eager_eviction.recovering_watermark = true;
@@ -1896,6 +1940,14 @@ static void eager_eviction_work(struct work_struct *work)
         pmm->eager_eviction.recovering_watermark = false;
 
     recovering = pmm->eager_eviction.recovering_watermark;
+    if (pmm->eager_eviction.prefetch_count) {
+        uvm_spin_unlock(&pmm->list_lock);
+        goto reschedule;
+    }
+
+    pmm->eager_eviction.active = true;
+    uvm_spin_unlock(&pmm->list_lock);
+
     for (i = 0; i < batch_count && usage > low; i++) {
         bool force = recovering;
 
@@ -1909,6 +1961,13 @@ static void eager_eviction_work(struct work_struct *work)
         // hot/cold condition before every non-forced eviction.
     }
 
+    uvm_spin_lock(&pmm->list_lock);
+    if (eager_eviction_usage_percent(pmm) <= low)
+        pmm->eager_eviction.recovering_watermark = false;
+    pmm->eager_eviction.active = false;
+    uvm_spin_unlock(&pmm->list_lock);
+
+reschedule:
     eager_eviction_schedule(pmm, msecs_to_jiffies(max(uvm_perf_eager_eviction_interval_ms, 1U)));
 }
 
@@ -4090,6 +4149,8 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     pmm->root_chunks.pinned_count = 0;
     pmm->root_chunks.in_eviction_count = 0;
     pmm->eager_eviction.epoch = 0;
+    pmm->eager_eviction.active = false;
+    pmm->eager_eviction.prefetch_count = 0;
     pmm->eager_eviction.recovering_watermark = false;
     pmm->eager_eviction.stopping = false;
     INIT_DELAYED_WORK(&pmm->eager_eviction.work, eager_eviction_work);

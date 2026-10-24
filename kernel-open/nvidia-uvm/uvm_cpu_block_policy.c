@@ -213,6 +213,11 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
     const uvm_page_mask_t *thrashing_pages;
 
     *capacity_stop = false;
+    if (!uvm_pmm_gpu_eager_eviction_prefetch_begin(&gpu->pmm)) {
+        *capacity_stop = true;
+        return NV_OK;
+    }
+
     uvm_mutex_lock(&va_block->lock);
 
     cpu_resident = uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, NUMA_NO_NODE);
@@ -276,12 +281,22 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
         *capacity_stop = retry.no_eviction_allocation_failed;
     }
 
+    // Keep the admission until asynchronous copies and mappings complete.
+    // Otherwise the eviction worker could overlap the submitted prefetch.
+    {
+        NV_STATUS wait_status = uvm_tracker_wait(&va_block->tracker);
+        if (status == NV_OK)
+            status = wait_status;
+    }
+
     uvm_mutex_unlock(&va_block->lock);
     uvm_va_block_retry_deinit(&retry, va_block);
+    uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm);
     return status;
 
 out_unlock:
     uvm_mutex_unlock(&va_block->lock);
+    uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm);
     return status;
 }
 
@@ -414,7 +429,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
 
     // Keep completed attempts one-shot, but re-arm capacity-stopped attempts.
     // The started bit remains set so signals are cheap while usage is still
-    // above the high watermark. Once there is headroom, one service thread
+    // in watermark recovery or an eviction batch. Once recovery reaches the
+    // low watermark and eviction finishes, one service thread
     // claims gpu_prefetch_retry and starts the next attempt.
     if (capacity_stopped)
         uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);

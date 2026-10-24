@@ -462,6 +462,10 @@ typedef struct uvm_pmm_gpu_struct
         // mappings and migration bookkeeping remain unchanged.
         struct delayed_work work;
         NvU64 epoch;
+        // Protected by list_lock. Prefetch admissions and worker eviction
+        // batches are mutually exclusive; recovery persists down to low.
+        unsigned prefetch_count;
+        bool active;
         bool recovering_watermark;
         bool stopping;
     } eager_eviction;
@@ -661,8 +665,14 @@ void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
                                   uvm_va_block_transfer_mode_t transfer_mode);
 
 // Return true when proactive user-memory growth should stop at the configured
-// high watermark. A true result also kicks the background eviction worker.
+// high watermark, until recovery reaches low, or during an eviction batch.
+// A true result also kicks the background eviction worker.
 bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm);
+
+// Admit a speculative block migration only outside the eager eviction phase.
+// Every successful begin must be paired with end after GPU work completes.
+bool uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm);
+void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm);
 
 static bool uvm_gpu_chunk_same_root(uvm_gpu_chunk_t *chunk1, uvm_gpu_chunk_t *chunk2)
 {
