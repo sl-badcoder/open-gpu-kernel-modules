@@ -19,6 +19,14 @@ add overhead when all notifications are processed serially. Candidate ranking
 is sampled within a bounded window, so concurrent heat changes can affect
 which roots are chosen compared with the baseline.
 
+## Combined version
+
+`595.71.05/experiment/demand-first-coalesced-prefetch` combines the two measured
+winners, demand-first notifications and in-flight prefetch coalescing. It merges
+those two branches and preserves their numeric defaults. The other two
+optimizations remain separate. See [combined behavior and tests](demand-first-coalesced-prefetch.md).
+Compare it with each individual branch using the same loaded parameters.
+
 ## Build and compare
 
 Fetch the branches and check out one at a time. For example:
