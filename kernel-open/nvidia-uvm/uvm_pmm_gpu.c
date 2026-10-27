@@ -193,6 +193,7 @@ static unsigned uvm_perf_eager_eviction_high_watermark = 90;
 static unsigned uvm_perf_eager_eviction_low_watermark = 85;
 static unsigned uvm_perf_eager_eviction_interval_ms = 25;
 static unsigned uvm_perf_eager_eviction_heat_ratio = 2;
+static unsigned uvm_perf_eager_eviction_cold_threshold = 0;
 static unsigned uvm_perf_eager_eviction_stale_intervals = 5;
 static unsigned uvm_perf_eager_eviction_batch_count = 16;
 static bool uvm_perf_migration_aware_eviction_enable = true;
@@ -207,6 +208,7 @@ module_param(uvm_perf_eager_eviction_high_watermark, uint, S_IRUGO);
 module_param(uvm_perf_eager_eviction_low_watermark, uint, S_IRUGO);
 module_param(uvm_perf_eager_eviction_interval_ms, uint, S_IRUGO);
 module_param(uvm_perf_eager_eviction_heat_ratio, uint, S_IRUGO);
+module_param(uvm_perf_eager_eviction_cold_threshold, uint, S_IRUGO);
 module_param(uvm_perf_eager_eviction_stale_intervals, uint, S_IRUGO);
 module_param(uvm_perf_eager_eviction_batch_count, uint, S_IRUGO);
 module_param(uvm_perf_migration_aware_eviction_enable, bool, S_IRUGO);
@@ -219,13 +221,15 @@ module_param(uvm_perf_migration_eviction_decay_ms, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_eager_eviction_enable,
                  "Enable access-counter-guided background eviction (default: 1).");
 MODULE_PARM_DESC(uvm_perf_eager_eviction_high_watermark,
-                 "VRAM usage percentage which forces background eviction (default: 90).");
+                 "VRAM usage percentage which starts cold-only background recovery (default: 90).");
 MODULE_PARM_DESC(uvm_perf_eager_eviction_low_watermark,
                  "VRAM usage target and hot/cold replacement floor (default: 85).");
 MODULE_PARM_DESC(uvm_perf_eager_eviction_interval_ms,
                  "Access heat aging and eviction interval in milliseconds (default: 25).");
 MODULE_PARM_DESC(uvm_perf_eager_eviction_heat_ratio,
                  "Minimum hot-to-cold access heat ratio for proactive replacement (default: 2).");
+MODULE_PARM_DESC(uvm_perf_eager_eviction_cold_threshold,
+                 "Maximum decayed access heat of used roots for background eviction; allocation reclaim is exempt (default: 0).");
 MODULE_PARM_DESC(uvm_perf_eager_eviction_stale_intervals,
                  "Intervals without a sampled access before a zero-heat chunk is stale (default: 5).");
 MODULE_PARM_DESC(uvm_perf_eager_eviction_batch_count,
@@ -1824,75 +1828,129 @@ void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm)
         mod_delayed_work(system_wq, &pmm->eager_eviction.work, 0);
 }
 
-// Return whether the coldest used root chunk is sufficiently colder than the
-// hottest used root chunk to justify replacement below the high watermark.
-// list_lock must be held.
-static bool eager_eviction_has_cold_candidate(uvm_pmm_gpu_t *pmm)
+// Compare only used roots already eligible for background eviction.
+static bool eager_eviction_root_is_colder(uvm_gpu_root_chunk_t *root, uvm_gpu_root_chunk_t *other)
 {
+    if (!other)
+        return true;
+    if (root->access_heat != other->access_heat)
+        return root->access_heat < other->access_heat;
+    if (root->migration_score != other->migration_score)
+        return root->migration_score < other->migration_score;
+    if (root->resident_since_ns != other->resident_since_ns)
+        return root->resident_since_ns < other->resident_since_ns;
+    return root->last_access_epoch < other->last_access_epoch;
+}
+
+// Select the actual background victim under list_lock, rather than testing
+// for a cold root and then selecting a potentially different, hotter root.
+// Access heat reflects remote notifications, not ongoing local VRAM accesses.
+static uvm_gpu_chunk_t *eager_eviction_pick_chunk_locked(uvm_pmm_gpu_t *pmm, bool recovering)
+{
+    uvm_gpu_chunk_t *chunk;
     uvm_gpu_chunk_t *entry;
-    NvU64 cold_heat = U64_MAX;
+    uvm_gpu_root_chunk_t *coldest = NULL;
+    uvm_gpu_root_chunk_t *stale_zero = NULL;
+    uvm_pmm_alloc_list_t alloc_list;
     NvU64 hot_heat = 0;
-    NvU64 cold_epoch = U64_MAX;
-    NvU64 age;
+    NvU64 now = NV_GETTIME();
 
     uvm_assert_spinlock_locked(&pmm->list_lock);
 
-    // Empty and discarded roots are always preferable to resident used data.
-    if (!list_empty(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_UNUSED]) ||
-        !list_empty(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_DISCARDED])) {
-        return true;
+    // Reclaim free roots before migrating resident data, just like the
+    // allocation-driven picker. Prefer non-zero free roots.
+    chunk = list_first_chunk(find_free_list(pmm,
+                                            UVM_PMM_GPU_MEMORY_TYPE_USER,
+                                            UVM_CHUNK_SIZE_MAX,
+                                            UVM_PMM_LIST_NO_ZERO));
+    if (chunk)
+        UVM_ASSERT(!chunk->is_zero);
+
+    if (!chunk) {
+        chunk = list_first_chunk(find_free_list(pmm,
+                                                UVM_PMM_GPU_MEMORY_TYPE_USER,
+                                                UVM_CHUNK_SIZE_MAX,
+                                                UVM_PMM_LIST_ZERO));
+        if (chunk)
+            UVM_ASSERT(chunk->is_zero);
+    }
+    if (chunk)
+        return chunk;
+
+    // Preserve unused/discarded priority; neither needs used-data protection.
+    for (alloc_list = 0; alloc_list < UVM_PMM_ALLOC_LIST_COUNT; ++alloc_list) {
+        if (alloc_list == UVM_PMM_ALLOC_LIST_USED)
+            continue;
+        chunk = list_first_chunk(&pmm->root_chunks.alloc_list[alloc_list]);
+        if (chunk)
+            return chunk;
     }
 
+    // One pass finds both the hottest root and the coldest eligible victim.
+    // The cutoff and migration grace apply even during watermark recovery.
     list_for_each_entry(entry, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
         uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, entry);
 
         hot_heat = max(hot_heat, root->access_heat);
-        if (root->access_heat < cold_heat ||
-            (root->access_heat == cold_heat && root->last_access_epoch < cold_epoch)) {
-            cold_heat = root->access_heat;
-            cold_epoch = root->last_access_epoch;
+        if (root->access_heat > uvm_perf_eager_eviction_cold_threshold ||
+            (uvm_perf_migration_aware_eviction_enable && now < root->protected_until_ns)) {
+            continue;
+        }
+
+        if (eager_eviction_root_is_colder(root, coldest))
+            coldest = root;
+
+        // A fresh zero-heat root must not hide a stale candidate when the
+        // whole working set has zero sampled heat.
+        if (!recovering && root->access_heat == 0 &&
+            pmm->eager_eviction.epoch - root->last_access_epoch >=
+                max(uvm_perf_eager_eviction_stale_intervals, 1U) &&
+            eager_eviction_root_is_colder(root, stale_zero)) {
+            stale_zero = root;
         }
     }
 
-    if (cold_heat == U64_MAX)
-        return false;
+    if (!coldest)
+        return NULL;
 
-    age = pmm->eager_eviction.epoch - cold_epoch;
-    if (cold_heat == 0 && age >= max(uvm_perf_eager_eviction_stale_intervals, 1U))
-        return true;
+    // Recovery relaxes only the contrast/staleness requirement. If all used
+    // roots are hot or protected, pause prefetch and let aging/demand reclaim
+    // provide progress. Allocation and PMA eviction retain their own fallback.
+    if (recovering)
+        return &coldest->chunk;
 
-    if (cold_heat == 0)
-        return hot_heat != 0;
+    if (coldest->access_heat == 0) {
+        if (hot_heat != 0)
+            return &coldest->chunk;
+        if (stale_zero)
+            return &stale_zero->chunk;
+    }
+    else if (hot_heat / coldest->access_heat >= max(uvm_perf_eager_eviction_heat_ratio, 1U)) {
+        return &coldest->chunk;
+    }
 
-    return hot_heat / cold_heat >= max(uvm_perf_eager_eviction_heat_ratio, 1U);
+    return NULL;
 }
 
-static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force, uvm_gpu_root_chunk_t **out_root)
+static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool recovering, uvm_gpu_root_chunk_t **out_root)
 {
     NV_STATUS status;
+    uvm_gpu_chunk_t *chunk;
     uvm_gpu_root_chunk_t *root_chunk;
 
     uvm_mutex_lock(&pmm->lock);
+    uvm_spin_lock(&pmm->list_lock);
+    chunk = eager_eviction_pick_chunk_locked(pmm, recovering);
+    if (chunk)
+        chunk_start_eviction(pmm, chunk);
+    uvm_spin_unlock(&pmm->list_lock);
 
-    if (!force) {
-        bool has_candidate;
-
-        uvm_spin_lock(&pmm->list_lock);
-        has_candidate = eager_eviction_has_cold_candidate(pmm);
-        uvm_spin_unlock(&pmm->list_lock);
-
-        if (!has_candidate) {
-            uvm_mutex_unlock(&pmm->lock);
-            return false;
-        }
-    }
-
-    root_chunk = pick_root_chunk_to_evict(pmm);
-    if (!root_chunk) {
+    if (!chunk) {
         uvm_mutex_unlock(&pmm->lock);
         return false;
     }
 
+    root_chunk = root_chunk_from_chunk(pmm, chunk);
     status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
     uvm_mutex_unlock(&pmm->lock);
 

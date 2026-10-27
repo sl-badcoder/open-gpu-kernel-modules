@@ -31,6 +31,11 @@ Compare it with each individual branch using the same loaded parameters.
 skips redundant bitmap-tree walks without changing the selected prefetch mask.
 See [implementation and differential validation](prefetch-region-skip.md).
 
+`595.71.05/experiment/cold-only-background-eviction` builds on that prefetch
+branch. It enforces a configurable heat cutoff and migration grace for used
+background victims, selects/claims the checked victim in one pass, and retains
+allocation/PMA emergency fallback. See [policy and tests](cold-only-background-eviction.md).
+
 ## Build and compare
 
 Fetch the branches and check out one at a time. For example:
