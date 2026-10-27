@@ -27,6 +27,10 @@ those two branches and preserves their numeric defaults. The other two
 optimizations remain separate. See [combined behavior and tests](demand-first-coalesced-prefetch.md).
 Compare it with each individual branch using the same loaded parameters.
 
+`595.71.05/experiment/prefetch-region-skip` builds on the combined version and
+skips redundant bitmap-tree walks without changing the selected prefetch mask.
+See [implementation and differential validation](prefetch-region-skip.md).
+
 ## Build and compare
 
 Fetch the branches and check out one at a time. For example:

@@ -299,6 +299,13 @@ static void compute_prefetch_mask(uvm_va_block_region_t faulted_region,
         // Early out if we have already prefetched until the end of the VA block
         if (region.outer == max_prefetch_region.outer)
             break;
+
+        // The tree is unchanged during this loop. Every page in the selected
+        // node has the same ancestors, so another traversal within that node
+        // cannot select a larger region. Resume at its end, clamped to the
+        // faulted region since the iterator terminates on equality.
+        if (region.outer > page_index)
+            page_index = min(region.outer, faulted_region.outer) - 1;
     }
 }
 
