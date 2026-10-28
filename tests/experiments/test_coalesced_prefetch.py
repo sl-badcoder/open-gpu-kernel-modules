@@ -33,7 +33,9 @@ typedef struct { int unused; } uvm_va_block_context_t;
 static unsigned uvm_cpu_preferred_prefetch_chunk_mb=8;
 static int uvm_cpu_preferred_range_prefetches,uvm_cpu_preferred_prefetch_retries;
 static int uvm_cpu_preferred_prefetch_capacity_stops,uvm_cpu_preferred_prefetched_bytes;
+static int uvm_cpu_preferred_prefetch_budget_stops;
 static int submitted,waits,ends,admitted,mode,freed,allocations;
+static unsigned visited;
 static uvm_va_space_t space;
 static uvm_va_range_managed_t range={.va_range={&space}};
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
@@ -51,7 +53,7 @@ static void uvm_processor_mask_clear_atomic(int *p,int id) { (void)id;*p=0; }
 static bool uvm_processor_mask_test_and_set_atomic(int *p,int id) { bool v=*p;(void)id;*p=1;return v; }
 static void uvm_processor_mask_set_atomic(int *p,int id) { (void)id;*p=1; }
 static bool uvm_pmm_gpu_eager_eviction_watermark_reached(int *p) { (void)p;return mode==5 || (mode==1 && submitted==2); }
-static bool uvm_pmm_gpu_eager_eviction_prefetch_begin(int *p) { (void)p;if(mode==3)return false;assert(!admitted);admitted=1;return true; }
+static unsigned uvm_pmm_gpu_eager_eviction_prefetch_begin(int *p, unsigned requested) { (void)p;assert(requested==4);if(mode==3)return 0;assert(!admitted);admitted=1;return (mode==11 || mode==12)?2:(mode==13?1:requested); }
 static void uvm_pmm_gpu_eager_eviction_prefetch_end(int *p) { (void)p;assert(admitted && (waits==1 || !submitted));admitted=0;++ends; }
 static uvm_va_block_context_t *uvm_va_block_context_alloc(struct mm_struct *m) { (void)m;++allocations;return &ctx; }
 static void uvm_va_block_context_free(uvm_va_block_context_t *c) { (void)c;++freed; }
@@ -59,9 +61,9 @@ static size_t uvm_va_range_num_blocks(uvm_va_range_managed_t *r) { (void)r;retur
 static size_t uvm_va_range_block_index(uvm_va_range_managed_t *r,NvU64 a) { (void)r;return a/UVM_VA_BLOCK_SIZE; }
 static uvm_va_block_t *uvm_va_range_block(uvm_va_range_managed_t *r,size_t i) { (void)r;return &blocks[i]; }
 static NV_STATUS prefetch_block(uvm_va_block_t *b,uvm_gpu_t *g,struct mm_struct *m,uvm_va_block_context_t *c,uvm_tracker_t *t,NvU64 *bytes,bool *stop) {
-(void)b;(void)g;(void)m;(void)c;assert(admitted && !waits);if(mode==7 && !submitted){assert(blocks[0].gpu_prefetch_retry);range.cpu_prefetch_windows[0].gpu=NULL;}++submitted;++t->pending;*bytes+=4096;*stop=false;return mode==2 && submitted==2 ? 1:NV_OK;
+(void)g;(void)m;(void)c;visited |= 1U << (b->start/UVM_VA_BLOCK_SIZE);assert(admitted && !waits);if(mode==7 && !submitted){assert(blocks[0].gpu_prefetch_retry);range.cpu_prefetch_windows[0].gpu=NULL;}++submitted;++t->pending;*bytes+=4096;*stop=false;return mode==2 && submitted==2 ? 1:NV_OK;
 }
-static NV_STATUS uvm_tracker_wait_deinit(uvm_tracker_t *t) { if(t->pending){assert(admitted);assert(submitted==((mode==0 || mode==9 || mode==10)?4:2));++waits;t->pending=0;} return NV_OK; }
+static NV_STATUS uvm_tracker_wait_deinit(uvm_tracker_t *t) { if(t->pending){assert(admitted);assert(submitted==(mode==13?1:((mode==0 || mode==9 || mode==10)?4:2)));++waits;t->pending=0;} return NV_OK; }
 '''
 
 SCENARIOS = r'''
@@ -89,19 +91,35 @@ int main(void) {
     prefetch_window_end(&range,-1);
 
     // Execute the actual chunk orchestration, with migration mocked only.
-    for(mode=0;mode<=10;++mode) {
+    for(mode=0;mode<=13;++mode) {
         if(mode==5 || mode==6) continue;
         submitted=waits=ends=admitted=freed=allocations=0;
+        uvm_cpu_preferred_prefetch_budget_stops=0;visited=0;
         for(int i=0;i<4;++i) blocks[i]=(uvm_va_block_t){.managed_range=&range,.start=i*UVM_VA_BLOCK_SIZE};
         if(mode==4) blocks[0].gpu_prefetch_started=1;
         if(mode==7) {range.cpu_prefetch_windows[0].gpu=&gpu; range.cpu_prefetch_windows[0].first=1;range.cpu_prefetch_windows[0].outer=3;}
         if(mode==8) {range.cpu_prefetch_windows[0].gpu=&gpu; range.cpu_prefetch_windows[0].first=0;range.cpu_prefetch_windows[0].outer=4;}
         if(mode==9) {range.cpu_prefetch_windows[0].gpu=&other_gpu;range.cpu_prefetch_windows[0].first=0;range.cpu_prefetch_windows[0].outer=4;}
         if(mode==10) for(int i=0;i<8;++i){range.cpu_prefetch_windows[i].gpu=&other_gpu;range.cpu_prefetch_windows[i].first=0;range.cpu_prefetch_windows[i].outer=4;}
-        uvm_cpu_block_policy_prefetch_on_signal(&blocks[0],&gpu,NULL);
+        uvm_cpu_block_policy_prefetch_on_signal(&blocks[mode==12?3:(mode==13?2:0)],&gpu,NULL);
         assert(!admitted && !range.cpu_prefetch_lock);
         if(mode<3 || mode==7 || mode==9 || mode==10) assert(waits==1 && ends==1);
-        if(mode==1 || mode==3 || mode==7 || mode==8) assert(blocks[0].gpu_prefetch_retry);
+        if(mode==1 || mode==7 || mode==8) assert(blocks[0].gpu_prefetch_retry);
+        if(mode==3 || mode==11) {
+            assert(uvm_cpu_preferred_prefetch_budget_stops==1 && !blocks[0].gpu_prefetch_retry);
+            assert(blocks[0].gpu_prefetch_started);
+            int saved=mode;
+            mode=0; // Headroom recovered: an old budget stop must not replay.
+            uvm_cpu_block_policy_prefetch_on_signal(&blocks[0],&gpu,NULL);
+            mode=saved;
+            assert(submitted==(mode==11?2:0));
+            if(mode==11) assert(waits==1 && ends==1);
+        }
+        if(mode==12 || mode==13) {
+            assert(uvm_cpu_preferred_prefetch_budget_stops==1);
+            assert(visited==(mode==12?12U:4U));
+            assert(waits==1 && ends==1);
+        }
         if(mode==8) assert(!submitted && !waits && ends==1);
         if(mode==3 || mode==4) assert(!submitted && !waits && !ends);
         if(mode==8 || mode==9) assert(range.cpu_prefetch_windows[0].gpu && !range.cpu_prefetch_windows[1].gpu);

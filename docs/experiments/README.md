@@ -36,6 +36,13 @@ branch. It enforces a configurable heat cutoff and migration grace for used
 background victims, selects/claims the checked victim in one pass, and retains
 allocation/PMA emergency fallback. See [policy and tests](cold-only-background-eviction.md).
 
+`595.71.05/experiment/demand-paced-movement` builds on cold-only eviction. It
+changes the default window to **8 MiB**, admits one speculative session per
+GPU, and uses an exact **32 MiB headroom** target for both admission and
+recovery. The baseline defaults/tuning suggestions below describe the earlier
+branches; use the [demand-paced settings and measurement guide](demand-paced-movement.md)
+for this experiment. Explicit old module options override the new defaults.
+
 ## Build and compare
 
 Fetch the branches and check out one at a time. For example:

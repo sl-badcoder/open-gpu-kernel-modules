@@ -6,7 +6,7 @@ import tempfile
 import re
 
 def function(source, name):
-    start = re.search(r"^static [^\n]*\b" + name + r"\(", source, re.M).start()
+    start = re.search(r"^static [^\n{]*\b" + name + r"\([^;]*\)\s*\{", source, re.M).start()
     end = source.index('{', start) + 1
     depth = 1
     while depth:
@@ -33,6 +33,7 @@ typedef int NV_STATUS;
 #define PMM_CONTEXT_DEFAULT 0
 #define UVM_PMM_GPU_MEMORY_TYPE_USER 0
 #define UVM_CHUNK_SIZE_MAX 2097152
+#define UVM_PAGE_SIZE_64K 65536
 #define UVM_PMM_LIST_NO_ZERO 0
 #define UVM_PMM_LIST_ZERO 1
 #define UVM_PMM_ALLOC_LIST_UNUSED 0
@@ -40,20 +41,25 @@ typedef int NV_STATUS;
 #define UVM_PMM_ALLOC_LIST_USED 2
 #define UVM_PMM_ALLOC_LIST_COUNT 3
 #define U64_MAX UINT64_MAX
+#define NSEC_PER_MSEC 1000000ULL
 #define UVM_ASSERT assert
 #define max(a,b) ((a)>(b)?(a):(b))
+#define min_t(type,a,b) ((type)(a) < (type)(b) ? (type)(a) : (type)(b))
 #define NV_GETTIME() mock_now
 static NvU64 mock_now=1000;
 static unsigned uvm_perf_eager_eviction_cold_threshold;
 static unsigned uvm_perf_eager_eviction_heat_ratio=2;
 static unsigned uvm_perf_eager_eviction_stale_intervals=5;
 static bool uvm_perf_migration_aware_eviction_enable=true;
+static unsigned uvm_perf_migration_eviction_decay_ms=1000;
 struct chunk;
 struct list_head { struct chunk *first; };
 typedef struct chunk { struct { struct chunk *next; } list; bool is_zero, claimed; } uvm_gpu_chunk_t;
-typedef struct { uvm_gpu_chunk_t chunk; NvU64 access_heat,last_access_epoch,protected_until_ns,resident_since_ns; unsigned migration_score; } uvm_gpu_root_chunk_t;
+typedef struct { uvm_gpu_chunk_t chunk; NvU64 access_heat,last_access_epoch,access_heat_epoch,protected_until_ns,resident_since_ns,migration_score_update_ns; unsigned migration_score; } uvm_gpu_root_chunk_t;
 typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; } eager_eviction; struct list_head free_list[2]; } uvm_pmm_gpu_t;
-static unsigned visits, evictions, freed, mock_usage, fail_at;
+static void eager_eviction_age_root_locked(uvm_gpu_root_chunk_t *, NvU64, NvU64);
+static unsigned visits, evictions, freed, mock_usage, mock_target, fail_at;
+typedef struct { NvU64 used, high, target; } eager_eviction_usage_t;
 static int migration_status;
 #define list_for_each_entry(entry,head,member) for((entry)=(head)->first;(entry) && (++visits,1);(entry)=(entry)->member.next)
 static bool list_empty(struct list_head *h) {return !h->first;}
@@ -74,14 +80,14 @@ static void chunk_start_eviction(uvm_pmm_gpu_t *p,uvm_gpu_chunk_t *c) {
 static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *p,uvm_gpu_root_chunk_t *r,int context) {
     assert(p->lock && !p->list_lock && r->chunk.claimed && context==PMM_CONTEXT_DEFAULT);++evictions;return fail_at && evictions==fail_at ? 1 : migration_status;
 }
-static unsigned eager_eviction_usage_percent(uvm_pmm_gpu_t *p) {(void)p;return mock_usage;}
-static unsigned eager_eviction_usage_percent_pending(uvm_pmm_gpu_t *p,unsigned pending) {(void)p;return mock_usage-pending;}
+static bool eager_eviction_above_target(uvm_pmm_gpu_t *p,unsigned pending) {(void)p;return mock_usage > mock_target + pending;}
+static bool eager_eviction_usage(uvm_pmm_gpu_t *p,eager_eviction_usage_t *u) {(void)p;u->used=mock_usage;u->target=mock_target;return true;}
 static void free_root_chunk(uvm_pmm_gpu_t *p,uvm_gpu_root_chunk_t *r,int mode) {assert(!p->lock && !p->list_lock && r->chunk.claimed && mode==0);++freed;--mock_usage;}
 '''
 SCENARIOS = r'''
 static uvm_pmm_gpu_t p;
 static uvm_gpu_root_chunk_t roots[6];
-static void reset(void) {memset(&p,0,sizeof(p));memset(roots,0,sizeof(roots));p.eager_eviction.epoch=20;visits=evictions=freed=fail_at=0;mock_usage=100;migration_status=0;uvm_perf_eager_eviction_cold_threshold=0;uvm_perf_migration_aware_eviction_enable=true;}
+static void reset(void) {memset(&p,0,sizeof(p));memset(roots,0,sizeof(roots));p.eager_eviction.epoch=20;for (unsigned i=0;i<6;++i) roots[i].access_heat_epoch=20;visits=evictions=freed=fail_at=0;mock_usage=100;mock_target=95;migration_status=0;uvm_perf_eager_eviction_cold_threshold=0;uvm_perf_migration_aware_eviction_enable=true;}
 static void add(unsigned i,unsigned list) {roots[i].chunk.list.next=p.root_chunks.alloc_list[list].first;p.root_chunks.alloc_list[list].first=&roots[i].chunk;}
 static uvm_gpu_chunk_t *select_bg(bool recovering) {uvm_spin_lock(&p.list_lock);uvm_gpu_chunk_t *c=eager_eviction_pick_chunk_locked(&p,recovering);uvm_spin_unlock(&p.list_lock);return c;}
 int main(void) {
@@ -137,12 +143,12 @@ int main(void) {
 
     // Draining a short batch remains mandatory when only hot roots remain.
     reset();for(unsigned i=0;i<5;++i)add(i,2);roots[0].access_heat=64;
-    assert(eager_eviction_batch(&p,true,16,95)==4 && evictions==4 && freed==4 && mock_usage==96);
+    assert(eager_eviction_batch(&p,true,16)==4 && evictions==4 && freed==4 && mock_usage==96);
     assert(!roots[0].chunk.claimed);
     reset();for(unsigned i=0;i<5;++i)add(i,2);
-    assert(eager_eviction_batch(&p,true,16,98)==2 && evictions==2 && freed==2);
+    mock_target=98;assert(eager_eviction_batch(&p,true,16)==2 && evictions==2 && freed==2);
     reset();for(unsigned i=0;i<5;++i)add(i,2);fail_at=2;
-    assert(eager_eviction_batch(&p,true,16,95)==1 && evictions==2 && freed==1);
+    assert(eager_eviction_batch(&p,true,16)==1 && evictions==2 && freed==1);
 
     // Empty sets and failed migration do not publish a successful victim.
     reset();assert(!eager_eviction_one(&p,true,&out));add(0,2);migration_status=1;out=NULL;
@@ -157,7 +163,7 @@ def main():
     source = (ROOT / SOURCE).read_text()
     original = subprocess.check_output(['git','show','12ceb155:'+SOURCE], cwd=ROOT, text=True)
     code = PRELUDE
-    for name in ('get_first_allocated_chunk','pick_root_chunk_to_evict','eager_eviction_root_is_colder','eager_eviction_pick_chunk_locked','eager_eviction_one','eager_eviction_batch'):
+    for name in ('get_first_allocated_chunk','eager_eviction_age_root_locked','pick_root_chunk_to_evict','eager_eviction_root_is_colder','eager_eviction_pick_chunk_locked','eager_eviction_one','eager_eviction_batch'):
         code += function(source,name)
     code += function(original,'eager_eviction_has_cold_candidate').replace('eager_eviction_has_cold_candidate(', 'baseline_has_cold_candidate(')
     code += SCENARIOS

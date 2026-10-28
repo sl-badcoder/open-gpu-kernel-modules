@@ -374,7 +374,7 @@ typedef struct uvm_gpu_root_chunk_struct
     // access-counter servicing and aged by the eager eviction worker.
     NvU64 access_heat;
     NvU64 last_access_epoch;
-
+    NvU64 access_heat_epoch;
     // Snapshot of the logical VA-block migration history for data currently
     // backed by this physical root. These fields are reset whenever the root
     // is initialized for reuse.
@@ -465,7 +465,8 @@ typedef struct uvm_pmm_gpu_struct
         // Protected by list_lock. Recovery kicks do not accelerate heat decay.
         NvU64 next_aging_ns;
         // Protected by list_lock. Prefetch admissions and worker eviction
-        // batches are mutually exclusive; recovery persists down to low.
+        // batches are mutually exclusive; recovery persists down to the exact
+        // headroom target. At most one speculative session is admitted per GPU.
         unsigned prefetch_count;
         bool active;
         bool recovering_watermark;
@@ -667,13 +668,16 @@ void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
                                   uvm_va_block_transfer_mode_t transfer_mode);
 
 // Return true when proactive user-memory growth should stop at the configured
-// high watermark, until recovery reaches low, or during an eviction batch.
+// high watermark, until recovery reaches its headroom target, or during an eviction batch.
 // A true result also kicks the background eviction worker.
 bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm);
 
 // Admit a speculative chunk migration only outside the eager eviction phase.
 // Every successful begin must be paired with end after GPU work completes.
-bool uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm);
+// Return a whole-root speculative budget and claim the sole GPU session.
+// A zero grant requires no matching end call. PMA snapshots do not reserve
+// memory against demand allocations; callers must still prohibit eviction.
+unsigned uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm, unsigned requested_roots);
 void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm);
 
 static bool uvm_gpu_chunk_same_root(uvm_gpu_chunk_t *chunk1, uvm_gpu_chunk_t *chunk2)

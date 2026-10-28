@@ -31,12 +31,13 @@
 
 static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
 static unsigned uvm_cpu_preferred_block_promotion_enable __read_mostly = 1;
-static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly = 64;
+static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly = 8;
 static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_retries = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetched_bytes = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_prefetch_budget_stops = ATOMIC64_INIT(0);
 
 static int promotion_count_get(char *buffer, const struct kernel_param *kp)
 {
@@ -72,7 +73,7 @@ MODULE_PARM_DESC(uvm_cpu_preferred_blocks_enable, "Keep managed allocations CPU-
 module_param(uvm_cpu_preferred_block_promotion_enable, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_cpu_preferred_block_promotion_enable, "Promote complete populated 2MB VA blocks on GPU access-counter notifications. " "Zero leaves speculative prefetch enabled without block promotion.");
 module_param(uvm_cpu_preferred_prefetch_chunk_mb, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_chunk_mb, "Access-counter-guided prefetch chunk size in MiB. Non-zero values are rounded up to 2MB; " "zero disables speculative chunk prefetch.");
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_chunk_mb, "Maximum access-counter-guided prefetch window in MiB (default: 8). Non-zero values are rounded up to 2MB; " "zero disables speculative chunk prefetch.");
 module_param_cb(uvm_cpu_preferred_block_promotions, &promotion_count_ops, NULL, S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_block_promotions, "Number of successful access-counter VA-block promotion service operations.");
 module_param_cb(uvm_cpu_preferred_range_prefetches, &atomic64_count_ops, &uvm_cpu_preferred_range_prefetches,S_IRUGO);
@@ -84,6 +85,8 @@ MODULE_PARM_DESC(uvm_cpu_preferred_prefetched_bytes, "Number of bytes moved by a
 module_param_cb(uvm_cpu_preferred_prefetch_capacity_stops, &atomic64_count_ops, &uvm_cpu_preferred_prefetch_capacity_stops, S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_capacity_stops, "Number of managed allocation prefetches stopped when free VRAM was exhausted.");
 
+module_param_cb(uvm_cpu_preferred_prefetch_budget_stops, &atomic64_count_ops, &uvm_cpu_preferred_prefetch_budget_stops, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_budget_stops, "Number of speculative windows reduced or denied by headroom or session admission.");
 
 // check if block policy is enabled
 bool uvm_cpu_block_policy_enabled(void)
@@ -388,6 +391,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     NvU64 chunk_bytes;
     NvU64 prefetched_bytes = 0;
     unsigned prefetch_chunk_mb = READ_ONCE(uvm_cpu_preferred_prefetch_chunk_mb);
+    unsigned granted_roots;
     bool retry = false;
     bool capacity_stopped = false;
     bool prefetch_admitted = false;
@@ -428,25 +432,27 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     if (uvm_processor_mask_test_and_set_atomic(&trigger_block->gpu_prefetch_started, gpu->id))
         goto out;
 
-    // Hold one admission for the whole chunk, including its final GPU wait.
-    // Per-block watermark checks still stop submission when recovery begins.
-    if (!uvm_pmm_gpu_eager_eviction_prefetch_begin(&gpu->pmm)) {
-        atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
-        uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
-        goto out;
-    }
-    prefetch_admitted = true;
-
-    atomic64_inc(&uvm_cpu_preferred_range_prefetches);
-    if (retry)
-        atomic64_inc(&uvm_cpu_preferred_prefetch_retries);
-
     block_count = uvm_va_range_num_blocks(managed_range);
     trigger_index = uvm_va_range_block_index(managed_range, trigger_block->start);
     chunk_bytes = (NvU64)prefetch_chunk_mb * UVM_SIZE_1MB;
     chunk_block_count = (chunk_bytes + UVM_VA_BLOCK_SIZE - 1) / UVM_VA_BLOCK_SIZE;
     chunk_block_count = max_t(size_t, chunk_block_count, 1);
     chunk_block_count = min(chunk_block_count, block_count);
+
+    // Claim one GPU-wide speculative session and a whole-block headroom budget.
+    // Demand servicing has already run. A short/zero grant is intentional:
+    // do not replay the old window after recovery simply to refill VRAM.
+    granted_roots = uvm_pmm_gpu_eager_eviction_prefetch_begin(&gpu->pmm, (unsigned)chunk_block_count);
+    if (granted_roots < chunk_block_count)
+        atomic64_inc(&uvm_cpu_preferred_prefetch_budget_stops);
+    if (!granted_roots)
+        goto out;
+    chunk_block_count = granted_roots;
+    prefetch_admitted = true;
+
+    atomic64_inc(&uvm_cpu_preferred_range_prefetches);
+    if (retry)
+        atomic64_inc(&uvm_cpu_preferred_prefetch_retries);
 
     // Center the configurable chunk on the 2MB block which produced the
     // access-counter notification. Shift at allocation boundaries so a full
@@ -530,7 +536,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     // Keep completed attempts one-shot, but re-arm capacity-stopped attempts.
     // The started bit remains set so signals are cheap while usage is still
     // in watermark recovery or an eviction batch. Once recovery reaches the
-    // low watermark and eviction finishes, one service thread
+    // headroom target and eviction finishes, one service thread
     // claims gpu_prefetch_retry and starts the next attempt.
     if (capacity_stopped || overlap_skipped)
         uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
