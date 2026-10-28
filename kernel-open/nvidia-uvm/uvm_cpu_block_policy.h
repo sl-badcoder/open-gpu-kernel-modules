@@ -36,7 +36,8 @@ bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gp
 bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
 void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                              uvm_gpu_t *gpu,
-                                             struct mm_struct *mm);
+                                             struct mm_struct *mm,
+                                             bool allow_neighbors);
 void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
 void uvm_cpu_block_policy_record_promotion(void);
 

@@ -43,6 +43,7 @@
 #define UVM_PERF_ACCESS_COUNTER_THRESHOLD_MIN       1
 #define UVM_PERF_ACCESS_COUNTER_THRESHOLD_MAX       ((1 << 16) - 1)
 #define UVM_PERF_ACCESS_COUNTER_THRESHOLD_DEFAULT   256
+#define UVM_PERF_PREFETCH_MIN_SIGNAL_DENSITY_DEFAULT 25
 
 #define UVM_ACCESS_COUNTER_ACTION_BATCH_CLEAR       0x1
 #define UVM_ACCESS_COUNTER_ACTION_TARGETED_CLEAR    0x2
@@ -55,6 +56,7 @@
 typedef struct
 {
     uvm_va_block_t *blocks[UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY];
+    bool allow_neighbors[UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY];
     uvm_gpu_t *gpu;
     struct mm_struct *mm;
     NvU32 count;
@@ -65,7 +67,8 @@ static void demand_first_prefetch_queue_flush(demand_first_prefetch_queue_t *que
     NvU32 i;
 
     for (i = 0; i < queue->count; i++)
-        uvm_cpu_block_policy_prefetch_on_signal(queue->blocks[i], queue->gpu, queue->mm);
+        uvm_cpu_block_policy_prefetch_on_signal(queue->blocks[i], queue->gpu, queue->mm,
+                                                queue->allow_neighbors[i]);
 
     queue->count = 0;
 }
@@ -78,7 +81,8 @@ static void demand_first_prefetch_queue_discard(demand_first_prefetch_queue_t *q
 static void demand_first_prefetch_queue_push(demand_first_prefetch_queue_t *queue,
                                              uvm_va_block_t *block,
                                              uvm_gpu_t *gpu,
-                                             struct mm_struct *mm)
+                                             struct mm_struct *mm,
+                                             bool allow_neighbors)
 {
     if (queue->count == UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY)
         demand_first_prefetch_queue_flush(queue);
@@ -90,7 +94,9 @@ static void demand_first_prefetch_queue_push(demand_first_prefetch_queue_t *queu
 
     UVM_ASSERT(queue->gpu == gpu);
     UVM_ASSERT(queue->mm == mm);
-    queue->blocks[queue->count++] = block;
+    queue->blocks[queue->count] = block;
+    queue->allow_neighbors[queue->count] = allow_neighbors;
+    ++queue->count;
 }
 
 // Each page in a tracked physical range may belong to a different VA Block. We
@@ -121,6 +127,7 @@ static unsigned uvm_perf_access_counter_batch_count = UVM_PERF_ACCESS_COUNTER_BA
 
 // See module param documentation below
 static unsigned uvm_perf_access_counter_threshold = UVM_PERF_ACCESS_COUNTER_THRESHOLD_DEFAULT;
+static unsigned uvm_perf_prefetch_min_signal_density = UVM_PERF_PREFETCH_MIN_SIGNAL_DENSITY_DEFAULT;
 
 // Module parameters for the tunables
 module_param(uvm_perf_access_counter_migration_enable, int, S_IRUGO);
@@ -129,9 +136,12 @@ MODULE_PARM_DESC(uvm_perf_access_counter_migration_enable,
                  "Valid values: <= -1 (platform policy), 0 (off), >= 1 (on, default)");
 module_param(uvm_perf_access_counter_batch_count, uint, S_IRUGO);
 module_param(uvm_perf_access_counter_threshold, uint, S_IRUGO);
+module_param(uvm_perf_prefetch_min_signal_density, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(uvm_perf_access_counter_threshold,
                  "Number of remote accesses on a region required to trigger a notification."
                  "Valid values: [1, 65535]");
+MODULE_PARM_DESC(uvm_perf_prefetch_min_signal_density,
+                 "Minimum percent of a VA block covered by an access-counter signal before speculative neighbor prefetch is enabled (default: 25).");
 
 static void access_counter_buffer_flush_locked(uvm_access_counter_buffer_t *access_counters,
                                                uvm_gpu_buffer_flush_mode_t flush_mode);
@@ -1488,6 +1498,7 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     uvm_va_space_t *va_space = gpu_va_space->va_space;
     uvm_access_counter_service_batch_context_t *batch_context = &access_counters->batch_service_context;
     uvm_page_mask_t *accessed_pages = &batch_context->accessed_pages;
+    bool allow_neighbors;
     uvm_access_counter_buffer_entry_t **notifications = batch_context->notifications;
     uvm_service_block_context_t *service_context = &batch_context->block_service_context;
 
@@ -1522,6 +1533,13 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     // Atleast one notification should have been processed.
     UVM_ASSERT(index < *out_index);
 
+    // Classify before demand service can expand a sparse signal for block
+    // promotion. Sparse signals still migrate their actual pages, but do not
+    // fetch speculative neighbors.
+    allow_neighbors = (NvU64)uvm_page_mask_weight(accessed_pages) * 100 >=
+                      (NvU64)PAGES_PER_UVM_VA_BLOCK *
+                      min(READ_ONCE(uvm_perf_prefetch_min_signal_density), 100U);
+
     batch_context->block_service_context.access_counters_buffer_index = access_counters->index;
 
     status = service_notification_va_block_helper(mm, va_block, gpu, batch_context);
@@ -1554,7 +1572,7 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
         status = flags_status;
 
     if (status == NV_OK)
-        demand_first_prefetch_queue_push(prefetch_queue, va_block, gpu, mm);
+        demand_first_prefetch_queue_push(prefetch_queue, va_block, gpu, mm, allow_neighbors);
 
     return status;
 }

@@ -31,7 +31,7 @@
 
 static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
 static unsigned uvm_cpu_preferred_block_promotion_enable __read_mostly = 1;
-static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly = 64;
+static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly = 8;
 static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_retries = ATOMIC64_INIT(0);
@@ -373,7 +373,8 @@ static void prefetch_window_end(uvm_va_range_managed_t *managed_range, int slot)
 
 void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                              uvm_gpu_t *gpu,
-                                             struct mm_struct *mm)
+                                             struct mm_struct *mm,
+                                             bool allow_neighbors)
 {
     uvm_va_range_managed_t *managed_range = trigger_block->managed_range;
     uvm_va_space_t *va_space;
@@ -447,6 +448,15 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     chunk_block_count = (chunk_bytes + UVM_VA_BLOCK_SIZE - 1) / UVM_VA_BLOCK_SIZE;
     chunk_block_count = max_t(size_t, chunk_block_count, 1);
     chunk_block_count = min(chunk_block_count, block_count);
+    // Sparse signals retain the trigger-block session but never spend
+    // speculative bandwidth on neighboring blocks.
+    if (!allow_neighbors)
+        chunk_block_count = 1;
+    // Always retain the triggering block as a demand-adjacent migration
+    // opportunity. Sparse signals do not earn speculative neighbors, but
+    // they must not suppress the trigger itself when promotion is disabled.
+    if (!allow_neighbors)
+        chunk_block_count = 1;
 
     // Center the configurable chunk on the 2MB block which produced the
     // access-counter notification. Shift at allocation boundaries so a full

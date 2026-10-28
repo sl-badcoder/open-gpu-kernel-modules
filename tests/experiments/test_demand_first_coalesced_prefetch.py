@@ -35,10 +35,17 @@ int main(void) {
     uvm_gpu_t gpu={0}, other_gpu={0};
     demand_first_prefetch_queue_t queue={0};
 
+    // A sparse signal disables neighbor prefetch. Demand servicing happens
+    // before this policy call; this path must not submit speculative blocks.
+    reset(); mode=0;
+    uvm_cpu_block_policy_prefetch_on_signal(&blocks[0], &gpu, NULL, false);
+    assert(submitted==1 && waits==1 && !admitted);
+    assert_no_owned_window();
+
     // Queueing does not initiate prefetch; duplicate triggers remain cheap.
     reset();mode=0;
-    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL);
-    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL);
+    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL,true);
+    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL,true);
     assert(queue.count==2 && !submitted && !admitted);
     demand_first_prefetch_queue_flush(&queue);
     assert(!queue.count && submitted==4 && waits==1 && ends==1);
@@ -47,7 +54,7 @@ int main(void) {
     // Bounded flushes use the actual policy, including its one-shot tracking.
     reset();mode=0;
     for (unsigned i=0;i<=UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY;++i)
-        demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL);
+        demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL,true);
     assert(queue.count==1 && submitted==4);
     demand_first_prefetch_queue_flush(&queue);
     assert(!queue.count && submitted==4 && waits==1);
@@ -58,7 +65,7 @@ int main(void) {
     range.cpu_prefetch_windows[0].gpu=&gpu;
     range.cpu_prefetch_windows[0].first=1;
     range.cpu_prefetch_windows[0].outer=3;
-    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL);
+    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL,true);
     assert(!submitted);
     demand_first_prefetch_queue_flush(&queue);
     assert(submitted==2 && waits==1 && blocks[0].gpu_prefetch_retry);
@@ -69,7 +76,7 @@ int main(void) {
     range.cpu_prefetch_windows[0].gpu=&gpu;
     range.cpu_prefetch_windows[0].first=0;
     range.cpu_prefetch_windows[0].outer=4;
-    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL);
+    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL,true);
     demand_first_prefetch_queue_flush(&queue);
     assert(!submitted && !waits && ends==1 && blocks[0].gpu_prefetch_retry);
     prefetch_window_end(&range,0);
@@ -80,7 +87,7 @@ int main(void) {
     range.cpu_prefetch_windows[0].gpu=&other_gpu;
     range.cpu_prefetch_windows[0].first=0;
     range.cpu_prefetch_windows[0].outer=4;
-    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL);
+    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL,true);
     demand_first_prefetch_queue_flush(&queue);
     assert(submitted==4 && waits==1);
     prefetch_window_end(&range,0);
@@ -88,7 +95,7 @@ int main(void) {
 
     // Demand-error discard does not create a coverage window or admission.
     reset();mode=0;
-    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL);
+    demand_first_prefetch_queue_push(&queue,&blocks[0],&gpu,NULL,true);
     demand_first_prefetch_queue_discard(&queue);
     assert(!queue.count && !submitted && !waits && !ends);
     assert_no_owned_window();

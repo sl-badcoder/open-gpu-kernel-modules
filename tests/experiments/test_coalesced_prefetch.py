@@ -61,7 +61,7 @@ static uvm_va_block_t *uvm_va_range_block(uvm_va_range_managed_t *r,size_t i) { 
 static NV_STATUS prefetch_block(uvm_va_block_t *b,uvm_gpu_t *g,struct mm_struct *m,uvm_va_block_context_t *c,uvm_tracker_t *t,NvU64 *bytes,bool *stop) {
 (void)b;(void)g;(void)m;(void)c;assert(admitted && !waits);if(mode==7 && !submitted){assert(blocks[0].gpu_prefetch_retry);range.cpu_prefetch_windows[0].gpu=NULL;}++submitted;++t->pending;*bytes+=4096;*stop=false;return mode==2 && submitted==2 ? 1:NV_OK;
 }
-static NV_STATUS uvm_tracker_wait_deinit(uvm_tracker_t *t) { if(t->pending){assert(admitted);assert(submitted==((mode==0 || mode==9 || mode==10)?4:2));++waits;t->pending=0;} return NV_OK; }
+static NV_STATUS uvm_tracker_wait_deinit(uvm_tracker_t *t) { if(t->pending){assert(admitted);assert(submitted==1 || submitted==((mode==0 || mode==9 || mode==10)?4:2));++waits;t->pending=0;} return NV_OK; }
 '''
 
 SCENARIOS = r'''
@@ -98,7 +98,7 @@ int main(void) {
         if(mode==8) {range.cpu_prefetch_windows[0].gpu=&gpu; range.cpu_prefetch_windows[0].first=0;range.cpu_prefetch_windows[0].outer=4;}
         if(mode==9) {range.cpu_prefetch_windows[0].gpu=&other_gpu;range.cpu_prefetch_windows[0].first=0;range.cpu_prefetch_windows[0].outer=4;}
         if(mode==10) for(int i=0;i<8;++i){range.cpu_prefetch_windows[i].gpu=&other_gpu;range.cpu_prefetch_windows[i].first=0;range.cpu_prefetch_windows[i].outer=4;}
-        uvm_cpu_block_policy_prefetch_on_signal(&blocks[0],&gpu,NULL);
+        uvm_cpu_block_policy_prefetch_on_signal(&blocks[0],&gpu,NULL,true);
         assert(!admitted && !range.cpu_prefetch_lock);
         if(mode<3 || mode==7 || mode==9 || mode==10) assert(waits==1 && ends==1);
         if(mode==1 || mode==3 || mode==7 || mode==8) assert(blocks[0].gpu_prefetch_retry);

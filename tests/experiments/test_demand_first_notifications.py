@@ -24,6 +24,7 @@ def extract_function(text, name):
 
 PRELUDE = r'''
 #include <assert.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 typedef unsigned int NvU32;
@@ -43,7 +44,7 @@ typedef uvm_access_counter_service_batch_context_t batch_t;
 typedef struct access_struct { uvm_parent_gpu_t *parent_gpu; uvm_access_counter_service_batch_context_t batch_service_context; } uvm_access_counter_buffer_t;
 static int log_events[256]; static size_t log_count; static int log_event(int kind, int id) { return log_events[log_count++] = kind * 1000 + id; }
 static int current_kind;
-static void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *b, uvm_gpu_t *g, struct mm_struct *m) { (void)g; (void)m; log_event(3, b->id); }
+static void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *b, uvm_gpu_t *g, struct mm_struct *m, int allow_neighbors) { (void)g; (void)m; log_event(allow_neighbors ? 3 : 6, b->id); }
 static void preprocess_notifications(uvm_parent_gpu_t *p, batch_t *b) { (void)p; (void)b; }
 static struct mm_struct global_mm;
 static struct mm_struct *uvm_va_space_mm_retain_lock(uvm_va_space_t *v) { (void)v; return &global_mm; }
@@ -72,7 +73,7 @@ static NV_STATUS service_notifications_batch(uvm_gpu_va_space_t *g, struct mm_st
     if (e->demand_status != NV_OK) return e->demand_status;
     if (e->flags_status != NV_OK) return e->flags_status;
     log_event(2, e->block->id); /* notification flags */
-    demand_first_prefetch_queue_push(q, e->block, e->gpu, mm);
+    demand_first_prefetch_queue_push(q, e->block, e->gpu, mm, true);
     return NV_OK;
 }
 '''
@@ -100,6 +101,7 @@ int main(void) {
 
     block_prelude = r'''
 #include <assert.h>
+#include <stdbool.h>
 #include <stddef.h>
 typedef unsigned int NvU32; typedef unsigned long long NvU64; typedef int NV_STATUS;
 #define NV_OK 0
@@ -116,12 +118,17 @@ typedef struct entry_struct { uvm_va_space_t *va_space; uvm_gpu_t *gpu; NvU64 ad
 typedef struct batch_struct { uvm_access_counter_buffer_entry_t *notifications[4]; NvU32 num_notifications; uvm_page_mask_t accessed_pages; uvm_service_block_context_t block_service_context; } uvm_access_counter_service_batch_context_t;
 typedef struct access_struct { int index; uvm_access_counter_service_batch_context_t batch_service_context; } uvm_access_counter_buffer_t;
 static int demand_status, flags_status, queue_count, prefetch_ids[4];
-static void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *b, uvm_gpu_t *g, struct mm_struct *m) { (void)g; (void)m; prefetch_ids[queue_count++] = b->id; }
+static unsigned uvm_perf_prefetch_min_signal_density = 25;
+#define READ_ONCE(x) (x)
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define PAGES_PER_UVM_VA_BLOCK 4
+static NvU32 uvm_page_mask_weight(uvm_page_mask_t *m) { return (NvU32)*m; }
+static void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *b, uvm_gpu_t *g, struct mm_struct *m, int allow_neighbors) { (void)g; (void)m; prefetch_ids[queue_count++] = b->id + (allow_neighbors ? 100 : 0); }
 static void uvm_page_mask_zero(uvm_page_mask_t *m) { *m = 0; }
 static void uvm_assert_rwsem_locked(void *l) { (void)l; }
 static void uvm_va_block_context_init(uvm_va_block_context_t *c, struct mm_struct *m) { (void)c; (void)m; }
 static void uvm_mutex_lock(void *m) { (void)m; } static void uvm_mutex_unlock(void *m) { (void)m; }
-static void expand_notification_block(uvm_gpu_va_space_t *g, uvm_va_block_t *b, uvm_access_counter_buffer_t *a, uvm_va_block_context_t *c, uvm_page_mask_t *p, uvm_access_counter_buffer_entry_t *e) { (void)g;(void)b;(void)a;(void)c;(void)p;(void)e; }
+static void expand_notification_block(uvm_gpu_va_space_t *g, uvm_va_block_t *b, uvm_access_counter_buffer_t *a, uvm_va_block_context_t *c, uvm_page_mask_t *p, uvm_access_counter_buffer_entry_t *e) { (void)g;(void)b;(void)a;(void)c; *p = e->counter_value; }
 static NV_STATUS service_notification_va_block_helper(struct mm_struct *m, uvm_va_block_t *b, uvm_gpu_t *g, uvm_access_counter_service_batch_context_t *c) { (void)m;(void)b;(void)g;(void)c; return demand_status; }
 static uvm_gpu_chunk_t *uvm_va_block_lookup_gpu_chunk(uvm_va_block_t *b, uvm_gpu_t *g, NvU64 a) { (void)b;(void)g;(void)a; static uvm_gpu_chunk_t chunk; return &chunk; }
 static void uvm_pmm_gpu_mark_chunk_accessed(void *p, uvm_gpu_chunk_t *c, int v) { (void)p;(void)c;(void)v; }
@@ -136,8 +143,11 @@ int main(void) {
     NvU32 out=0;
     demand_status=9; flags_status=NV_OK; queue_count=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,0,&out,&queue)==9); assert(queue.count==0 && queue_count==0); demand_first_prefetch_queue_discard(&queue);
     demand_status=NV_OK; flags_status=8; queue_count=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,0,&out,&queue)==8); assert(queue.count==0 && queue_count==0); demand_first_prefetch_queue_discard(&queue);
-    demand_status=NV_OK; flags_status=NV_OK; queue_count=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,0,&out,&queue)==NV_OK); assert(queue.count==1 && queue.blocks[0]==&block);
+    demand_status=NV_OK; flags_status=NV_OK; queue_count=0; entry.counter_value=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,0,&out,&queue)==NV_OK); assert(queue.count==1 && queue.blocks[0]==&block);
     demand_first_prefetch_queue_flush(&queue); assert(queue_count==1 && prefetch_ids[0]==7);
+    entry.counter_value=1; queue_count=0; uvm_perf_prefetch_min_signal_density=25; assert(service_notifications_in_block(&gva,&mm,&access,&block,0,&out,&queue)==NV_OK); demand_first_prefetch_queue_flush(&queue); assert(queue_count==1 && prefetch_ids[0]==107);
+    entry.counter_value=1; queue_count=0; uvm_perf_prefetch_min_signal_density=100; assert(service_notifications_in_block(&gva,&mm,&access,&block,0,&out,&queue)==NV_OK); demand_first_prefetch_queue_flush(&queue); assert(queue_count==1 && prefetch_ids[0]==7);
+    entry.counter_value=4; queue_count=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,0,&out,&queue)==NV_OK); demand_first_prefetch_queue_flush(&queue); assert(queue_count==1 && prefetch_ids[0]==107);
     return 0;
 }
 '''
