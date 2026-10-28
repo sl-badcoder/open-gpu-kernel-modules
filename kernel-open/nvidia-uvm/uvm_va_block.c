@@ -4124,6 +4124,9 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
                 status = block_copy_pages(block, &copy_state, contig_region, &push);
                 if (status != NV_OK)
                     break;
+                if (cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION)
+                    block_context->make_resident.eviction_copy_bytes +=
+                        (NvU64)uvm_va_block_region_size(contig_region) * PAGE_SIZE;
             }
 
             if (block_copy_should_use_push(block, &copy_state)) {
@@ -4168,6 +4171,8 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
             status = block_copy_pages(block, &copy_state, uvm_va_block_region_for_page(page_index), &push);
             if (status != NV_OK)
                 return status;
+            if (cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION)
+                block_context->make_resident.eviction_copy_bytes += PAGE_SIZE;
         }
 
         last_index = page_index;
@@ -4180,6 +4185,9 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
             status = block_copy_pages(block, &copy_state, contig_region, &push);
             if (status != NV_OK)
                 return status;
+            if (cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION)
+                block_context->make_resident.eviction_copy_bytes +=
+                    (NvU64)uvm_va_block_region_size(contig_region) * PAGE_SIZE;
         }
 
         if (block_copy_should_use_push(block, &copy_state)) {
@@ -12924,7 +12932,8 @@ static void block_add_eviction_mappings_entry(void *args)
 NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                                     uvm_gpu_t *gpu,
                                     uvm_gpu_chunk_t *root_chunk,
-                                    uvm_tracker_t *tracker)
+                                    uvm_tracker_t *tracker,
+                                    NvU64 *bytes_copied)
 {
     NV_STATUS status = NV_OK;
     NvU32 i;
@@ -12942,6 +12951,9 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     bool pages_evicted;
 
     uvm_assert_mutex_locked(&va_block->lock);
+
+    if (bytes_copied)
+        *bytes_copied = 0;
 
     // The block might have been killed in the meantime
     if (!va_space)
@@ -12978,6 +12990,7 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     }
 
     pages_to_evict = &block_context->caller_page_mask;
+    block_context->make_resident.eviction_copy_bytes = 0;
     uvm_page_mask_zero(pages_to_evict);
     chunk_region.outer = 0;
 
@@ -13043,6 +13056,9 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     }
     if (status != NV_OK)
         goto out;
+
+    if (bytes_copied)
+        *bytes_copied = block_context->make_resident.eviction_copy_bytes;
 
     if (pages_evicted)
         uvm_cpu_block_policy_rearm_on_eviction(va_block, gpu);

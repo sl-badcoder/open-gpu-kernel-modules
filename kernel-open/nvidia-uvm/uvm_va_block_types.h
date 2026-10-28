@@ -239,6 +239,7 @@ typedef struct
         // Access counters notification buffer index. Only valid when cause is
         // UVM_MAKE_RESIDENT_CAUSE_ACCESS_COUNTER.
         NvU32 access_counters_buffer_index;
+        NvU64 eviction_copy_bytes;
     } make_resident;
 
     // State used by the mapping APIs (unmap, map, revoke). This could be used

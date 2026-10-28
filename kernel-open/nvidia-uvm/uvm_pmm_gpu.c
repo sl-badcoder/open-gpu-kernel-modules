@@ -197,6 +197,19 @@ static unsigned uvm_perf_eager_eviction_cold_threshold = 0;
 static unsigned uvm_perf_eager_eviction_stale_intervals = 5;
 static unsigned uvm_perf_eager_eviction_batch_count = 16;
 static bool uvm_perf_migration_aware_eviction_enable = true;
+static atomic64_t uvm_perf_eviction_copy_bytes = ATOMIC64_INIT(0);
+static atomic64_t uvm_perf_eviction_copy_roots = ATOMIC64_INIT(0);
+
+static int eviction_counter_get(char *buffer, const struct kernel_param *kp)
+{
+    atomic64_t *counter = (atomic64_t *)kp->arg;
+    return scnprintf(buffer, PAGE_SIZE, "%lld\n", (long long)atomic64_read(counter));
+}
+static const struct kernel_param_ops eviction_counter_ops = { .get = eviction_counter_get };
+module_param_cb(uvm_perf_eviction_copy_bytes, &eviction_counter_ops,
+                &uvm_perf_eviction_copy_bytes, S_IRUGO);
+module_param_cb(uvm_perf_eviction_copy_roots, &eviction_counter_ops,
+                &uvm_perf_eviction_copy_roots, S_IRUGO);
 static unsigned uvm_perf_migration_eviction_base_grace_ms = 100;
 static unsigned uvm_perf_migration_eviction_return_window_ms = 500;
 static unsigned uvm_perf_migration_eviction_score_grace_ms = 250;
@@ -1248,7 +1261,12 @@ static NV_STATUS evict_root_chunk_from_va_block(uvm_pmm_gpu_t *pmm,
 
     uvm_mutex_lock(&va_block->lock);
 
-    status = uvm_va_block_evict_chunks(va_block, gpu, &root_chunk->chunk, &tracker);
+    {
+        NvU64 bytes_copied = 0;
+        status = uvm_va_block_evict_chunks(va_block, gpu, &root_chunk->chunk, &tracker,
+                                           &bytes_copied);
+        root_chunk->eviction_copy_bytes += bytes_copied;
+    }
 
     uvm_mutex_unlock(&va_block->lock);
 
@@ -1374,6 +1392,7 @@ static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root
     const uvm_pmm_gpu_memory_type_t type = chunk->type;
 
     uvm_assert_mutex_locked(&pmm->lock);
+    root_chunk->eviction_copy_bytes = 0;
 
     // First pin all the free subchunks
     status = chunk_walk_pre_order(pmm, chunk, pin_free_chunks_func, NULL);
@@ -1406,6 +1425,8 @@ static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t *root
     uvm_spin_lock(&pmm->list_lock);
 
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
+    atomic64_add(root_chunk->eviction_copy_bytes, &uvm_perf_eviction_copy_bytes);
+    atomic64_inc(&uvm_perf_eviction_copy_roots);
     uvm_gpu_chunk_set_in_eviction(chunk, false);
     --pmm->root_chunks.in_eviction_count;
 
@@ -2323,6 +2344,7 @@ static uvm_gpu_chunk_t *claim_free_chunk(uvm_pmm_gpu_t *pmm, uvm_pmm_gpu_memory_
         root->migration_score_update_ns = 0;
         root->resident_since_ns = 0;
         root->protected_until_ns = 0;
+        root->eviction_copy_bytes = 0;
     }
 
     if (chunk->parent) {
@@ -2568,6 +2590,7 @@ static void init_root_chunk(uvm_pmm_gpu_t *pmm,
     root_chunk->migration_score_update_ns = 0;
     root_chunk->resident_since_ns = 0;
     root_chunk->protected_until_ns = 0;
+    root_chunk->eviction_copy_bytes = 0;
 
     if (initial_state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED)
         ++pmm->root_chunks.pinned_count;

@@ -382,6 +382,8 @@ typedef struct uvm_gpu_root_chunk_struct
     NvU64 migration_score_update_ns;
     NvU64 resident_since_ns;
     NvU64 protected_until_ns;
+    // Actual GPU-to-CPU payload copied while reclaiming this root.
+    NvU64 eviction_copy_bytes;
 
     // Pending operations for all GPU chunks under the root chunk.
     //
