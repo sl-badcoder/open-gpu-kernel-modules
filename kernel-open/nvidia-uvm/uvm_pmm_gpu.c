@@ -202,6 +202,8 @@ static unsigned uvm_perf_migration_eviction_return_window_ms = 500;
 static unsigned uvm_perf_migration_eviction_score_grace_ms = 250;
 static unsigned uvm_perf_migration_eviction_max_grace_ms = 2000;
 static unsigned uvm_perf_migration_eviction_decay_ms = 1000;
+static unsigned uvm_perf_migration_quick_return_protection_ms = 250;
+static unsigned uvm_perf_migration_quick_return_max_protection_ms = 2000;
 
 module_param(uvm_perf_eager_eviction_enable, bool, S_IRUGO);
 module_param(uvm_perf_eager_eviction_high_watermark, uint, S_IRUGO);
@@ -217,6 +219,8 @@ module_param(uvm_perf_migration_eviction_return_window_ms, uint, S_IRUGO);
 module_param(uvm_perf_migration_eviction_score_grace_ms, uint, S_IRUGO);
 module_param(uvm_perf_migration_eviction_max_grace_ms, uint, S_IRUGO);
 module_param(uvm_perf_migration_eviction_decay_ms, uint, S_IRUGO);
+module_param(uvm_perf_migration_quick_return_protection_ms, uint, S_IRUGO);
+module_param(uvm_perf_migration_quick_return_max_protection_ms, uint, S_IRUGO);
 
 MODULE_PARM_DESC(uvm_perf_eager_eviction_enable,
                  "Enable access-counter-guided background eviction (default: 1).");
@@ -246,6 +250,10 @@ MODULE_PARM_DESC(uvm_perf_migration_eviction_max_grace_ms,
                  "Maximum total migration-aware residency grace (default: 2000 ms).");
 MODULE_PARM_DESC(uvm_perf_migration_eviction_decay_ms,
                  "Time per halving of logical migration history (default: 1000 ms).");
+MODULE_PARM_DESC(uvm_perf_migration_quick_return_protection_ms,
+                 "Additional residency protection per quick return in milliseconds (default: 250).");
+MODULE_PARM_DESC(uvm_perf_migration_quick_return_max_protection_ms,
+                 "Maximum additional residency protection from quick returns in milliseconds (default: 2000).");
 
 #define UVM_PERF_PMA_BATCH_NONPINNED_ORDER_DEFAULT 6
 
@@ -2135,7 +2143,27 @@ static void migration_history_decay(uvm_va_block_gpu_state_t *gpu_state, NvU64 n
     else
         gpu_state->eviction_history.recent_pcie_bytes >>= shifts;
 
+    if (shifts >= 32)
+        gpu_state->eviction_history.quick_return_count = 0;
+    else
+        gpu_state->eviction_history.quick_return_count >>= shifts;
+
     gpu_state->eviction_history.last_score_update_ns += shifts * decay_ns;
+}
+
+static NvU64 migration_quick_return_protection_ns(NvU32 count)
+{
+    NvU64 per_return_ns;
+    NvU64 max_protection_ns;
+    NvU64 protection_ns;
+
+    if (!uvm_perf_migration_quick_return_protection_ms)
+        return 0;
+
+    per_return_ns = (NvU64)uvm_perf_migration_quick_return_protection_ms * NSEC_PER_MSEC;
+    max_protection_ns = (NvU64)uvm_perf_migration_quick_return_max_protection_ms * NSEC_PER_MSEC;
+    protection_ns = count > U64_MAX / per_return_ns ? U64_MAX : (NvU64)count * per_return_ns;
+    return min(protection_ns, max_protection_ns);
 }
 
 void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
@@ -2143,13 +2171,15 @@ void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
                                   uvm_processor_id_t src_id,
                                   NvU64 address,
                                   NvU64 bytes,
-                                  uvm_va_block_transfer_mode_t transfer_mode)
+                                  uvm_va_block_transfer_mode_t transfer_mode,
+                                  uvm_make_resident_cause_t cause)
 {
     uvm_gpu_t *gpu;
     uvm_va_block_gpu_state_t *gpu_state;
     NvU64 now;
     NvU64 end;
     bool arriving;
+    NvU64 quick_return_protection_ns = 0;
 
     if (!uvm_perf_migration_aware_eviction_enable ||
         transfer_mode != UVM_VA_BLOCK_TRANSFER_MODE_MOVE ||
@@ -2184,10 +2214,12 @@ void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
 
     if (!arriving) {
         gpu_state->eviction_history.last_gpu_to_cpu_ns = now;
+        gpu_state->eviction_history.last_gpu_to_cpu_cause = cause;
         return;
     }
 
     if (gpu_state->eviction_history.last_gpu_to_cpu_ns &&
+        gpu_state->eviction_history.last_gpu_to_cpu_cause == UVM_MAKE_RESIDENT_CAUSE_EVICTION &&
         now - gpu_state->eviction_history.last_gpu_to_cpu_ns <=
             (NvU64)uvm_perf_migration_eviction_return_window_ms * NSEC_PER_MSEC) {
         NvU64 increment = DIV_ROUND_UP(bytes, UVM_CHUNK_SIZE_2M);
@@ -2202,6 +2234,11 @@ void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
 
         if (gpu_state->eviction_history.quick_return_count != NV_U32_MAX)
             ++gpu_state->eviction_history.quick_return_count;
+
+        if (uvm_perf_migration_quick_return_protection_ms) {
+            quick_return_protection_ns = migration_quick_return_protection_ns(
+                gpu_state->eviction_history.quick_return_count);
+        }
 
         // Consume the eviction marker so fragments from one return migration
         // count as one cycle. A later GPU-to-CPU move arms it again.
@@ -2232,6 +2269,12 @@ void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
             }
 
             grace_ns = min(base_grace_ns + min(score_grace_ns, max_grace_ns), max_grace_ns);
+            if (quick_return_protection_ns) {
+                NvU64 total_grace_cap = max_grace_ns > U64_MAX - quick_return_protection_ns ?
+                                        U64_MAX : max_grace_ns + quick_return_protection_ns;
+                grace_ns = grace_ns > total_grace_cap - quick_return_protection_ns ?
+                           total_grace_cap : grace_ns + quick_return_protection_ns;
+            }
             root->migration_score = max(root->migration_score, gpu_state->eviction_history.score);
             root->migration_score_update_ns = now;
             root->resident_since_ns = max(root->resident_since_ns, now);

@@ -664,7 +664,8 @@ void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
                                   uvm_processor_id_t src_id,
                                   NvU64 address,
                                   NvU64 bytes,
-                                  uvm_va_block_transfer_mode_t transfer_mode);
+                                  uvm_va_block_transfer_mode_t transfer_mode,
+                                  uvm_make_resident_cause_t cause);
 
 // Return true when proactive user-memory growth should stop at the configured
 // high watermark, until recovery reaches low, or during an eviction batch.

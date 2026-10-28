@@ -228,6 +228,7 @@ typedef struct
     struct
     {
         NvU64 last_gpu_to_cpu_ns;
+        uvm_make_resident_cause_t last_gpu_to_cpu_cause;
         NvU64 last_score_update_ns;
         NvU64 recent_pcie_bytes;
         NvU32 score;
