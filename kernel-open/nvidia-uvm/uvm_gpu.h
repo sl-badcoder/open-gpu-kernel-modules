@@ -48,6 +48,10 @@
 #include "uvm_perf_prefetch.h"
 #include "nv-kthread-q.h"
 #include <linux/mmu_notifier.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
+#include <linux/workqueue.h>
+#include "uvm_vab.h"
 #include "uvm_conf_computing.h"
 
 #define UVM_PARENT_GPU_UUID_PREFIX "GPU-"
@@ -922,6 +926,7 @@ struct uvm_gpu_struct
 
         // "gpus/UVM-GPU-${physical-UUID}/${sub_processor_index}/info"
         struct proc_dir_entry *info_file;
+        struct proc_dir_entry *vab_file;
     } procfs;
 
     // Placeholder for per-GPU performance heuristics information
@@ -1004,6 +1009,29 @@ struct uvm_parent_gpu_struct
 
     // Access bits buffer information
     UvmGpuAccessBitsBufferAlloc vab_info;
+
+    // One sampler per physical GPU. Only dump_lock is held across RM calls;
+    // cache_lock is never held while acquiring a PMM lock or calling RM.
+    struct {
+        struct mutex dump_lock;
+        spinlock_t cache_lock;
+        struct delayed_work work;
+        uvm_vab_snapshot_t sample;
+        NvU64 samples;
+        NvU64 dump_errors;
+        NvU64 pm_skips;
+        NvU64 rising_bits;
+        NvU64 falling_bits;
+        NvU64 unchanged_samples;
+        NvU64 dump_duration_ns;
+        NvU32 enabled_bits;
+        NvU32 set_bits;
+        NV_STATUS last_dump_status;
+        bool allocated;
+        bool supported;
+        bool stopping;
+        bool running;
+    } vab;
 
 #if UVM_IS_CONFIG_HMM() || defined(NV_MEMORY_DEVICE_COHERENT_PRESENT)
     uvm_pmm_gpu_devmem_t *devmem;
@@ -1986,5 +2014,15 @@ typedef enum
 int uvm_device_p2p_static_bar(uvm_parent_gpu_t *gpu);
 
 NV_STATUS uvm_test_query_egm_state(UVM_TEST_QUERY_EGM_STATE_PARAMS *params, struct file *filp);
+
+void uvm_gpu_vab_init(uvm_parent_gpu_t *parent_gpu);
+void uvm_gpu_vab_start(uvm_parent_gpu_t *parent_gpu);
+void uvm_gpu_vab_stop(uvm_parent_gpu_t *parent_gpu);
+void uvm_gpu_vab_invalidate(uvm_parent_gpu_t *parent_gpu);
+void uvm_gpu_vab_get_snapshot(uvm_parent_gpu_t *parent_gpu, uvm_vab_snapshot_t *snapshot);
+NV_STATUS uvm_gpu_vab_test_dump(uvm_parent_gpu_t *parent_gpu,
+                                UVM_ACCESS_BITS_DUMP_MODE mode,
+                                UvmGpuAccessBitsBufferAlloc *snapshot);
+void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s);
 
 #endif // __UVM_GPU_H__

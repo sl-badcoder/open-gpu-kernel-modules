@@ -8,7 +8,7 @@ import tempfile
 ROOT = Path(__file__).parents[2]
 
 def function(source, name):
-    match = re.search(r"^static [^\n]*\b" + name + r"\(", source, re.M)
+    match = re.search(r"^(?:static [^\n]*|void )\b" + name + r"\(", source, re.M)
     if match is None:
         raise ValueError(name)
     start = match.start()
@@ -28,6 +28,8 @@ PRELUDE = r'''
 #include <string.h>
 #include <limits.h>
 typedef uint64_t NvU64;
+typedef unsigned NvU32;
+/* VAB classifier */
 typedef unsigned uvm_pmm_alloc_list_t;
 typedef int NV_STATUS;
 #define NV_OK 0
@@ -52,9 +54,20 @@ static unsigned uvm_perf_eager_eviction_stale_intervals=5;
 static bool uvm_perf_migration_aware_eviction_enable=true;
 struct chunk;
 struct list_head { struct chunk *first; };
-typedef struct chunk { struct { struct chunk *next; } list; bool is_zero, claimed; } uvm_gpu_chunk_t;
+typedef struct chunk { struct { struct chunk *next; } list; bool is_zero, claimed; NvU64 address; } uvm_gpu_chunk_t;
 typedef struct { uvm_gpu_chunk_t chunk; NvU64 access_heat,last_access_epoch,protected_until_ns,resident_since_ns; unsigned migration_score; } uvm_gpu_root_chunk_t;
-typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; } eager_eviction; struct list_head free_list[2]; } uvm_pmm_gpu_t;
+typedef struct { NvU64 used_cold,used_hot,used_unknown,selected_hot,selected_cold,selected_unknown,background_roots_freed,background_failures,usage_percent,prefetch_inflight,recovering_watermark,background_active; } uvm_pmm_gpu_vab_stats_t;
+typedef struct { int dummy; } uvm_parent_gpu_t;
+typedef struct { uvm_parent_gpu_t *parent; } uvm_gpu_t;
+static uvm_gpu_t mock_gpu;
+typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
+static uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *p) {(void)p; return &mock_gpu;}
+static uvm_vab_snapshot_t mock_snapshot;
+static unsigned snapshot_calls;
+static void uvm_gpu_vab_get_snapshot(uvm_parent_gpu_t *p,uvm_vab_snapshot_t *s) {
+    (void)p; ++snapshot_calls; *s=mock_snapshot;
+    s->valid=s->valid && uvm_vab_sample_fresh(mock_now,s->sampled_ns,300);
+}
 static unsigned visits, evictions, freed, mock_usage, fail_at;
 static int migration_status;
 #define list_for_each_entry(entry,head,member) for((entry)=(head)->first;(entry) && (++visits,1);(entry)=(entry)->member.next)
@@ -86,6 +99,8 @@ static uvm_pmm_gpu_t p;
 static uvm_gpu_root_chunk_t roots[6];
 static void reset(void) {
     memset(&p,0,sizeof(p));memset(roots,0,sizeof(roots));p.eager_eviction.epoch=20;
+    memset(&mock_snapshot,0,sizeof(mock_snapshot));snapshot_calls=0;
+    for(unsigned i=0;i<6;++i)roots[i].chunk.address=(NvU64)i*UVM_CHUNK_SIZE_MAX;
     visits=evictions=freed=fail_at=0;mock_usage=100;migration_status=0;
     uvm_perf_migration_aware_eviction_enable=true;
 }
@@ -98,6 +113,11 @@ static bool admits(void) {
     bool result=eager_eviction_has_cold_candidate(&p);
     uvm_spin_unlock(&p.list_lock);
     return result;
+}
+static void observation(void) {
+    mock_snapshot.valid=true;
+    mock_snapshot.sampled_ns=mock_now;mock_snapshot.linear_base=0;mock_snapshot.granularity=5;
+    for(unsigned i=0;i<64;++i)mock_snapshot.enabled_mask[i]=~0ULL;
 }
 int main(void) {
     uvm_gpu_root_chunk_t *out=NULL;
@@ -144,6 +164,51 @@ int main(void) {
     assert(!eager_eviction_batch(&p,false,16,95) && !evictions && !freed);
     reset();add(0,2);migration_status=1;out=NULL;
     assert(!eager_eviction_one(&p,true,&out) && !out && !p.lock && !p.list_lock);
+
+    // Observe mode reports the chosen root but never changes the old ranking.
+    reset();add(0,2);add(1,2);roots[1].migration_score=9;observation();
+    mock_snapshot.access_bits[0]=1;
+    assert(eager_eviction_one(&p,true,&out) && out==&roots[0]);
+    assert(snapshot_calls==1 && p.vab_stats.selected_hot==1);
+
+    // Cold/hot/masked observations never change the migration-aware ranking.
+    reset();add(0,2);add(1,2);roots[1].migration_score=9;observation();
+    mock_snapshot.access_bits[0]=2;
+    assert(eager_eviction_one(&p,true,&out) && out==&roots[0]);
+    assert(p.vab_stats.selected_cold==1);
+    reset();add(0,2);add(1,2);roots[1].migration_score=9;observation();
+    mock_snapshot.access_bits[0]=1;mock_snapshot.enabled_mask[0]&=~1ULL;
+    assert(eager_eviction_one(&p,true,&out) && out==&roots[0]);
+    assert(p.vab_stats.selected_unknown==1);
+    reset();add(0,2);add(1,2);roots[1].migration_score=9;observation();
+    mock_snapshot.access_bits[0]=3;
+    assert(eager_eviction_one(&p,true,&out) && out==&roots[0]);
+    assert(p.vab_stats.selected_hot==1);
+
+    // Newly resident data is unknown when a known timestamp follows sampling.
+    reset();add(0,2);add(1,2);roots[1].migration_score=9;observation();
+    roots[0].resident_since_ns=mock_now+1;
+    assert(eager_eviction_one(&p,true,&out) && out==&roots[0]);
+    assert(p.vab_stats.selected_unknown==1);
+
+    // Observing cold bits does not admit any extra background evictions.
+    reset();add(0,2);add(1,2);roots[0].access_heat=roots[1].access_heat=4;
+    observation();mock_snapshot.access_bits[0]=1;assert(!admits());
+    mock_snapshot.access_bits[0]=0;assert(!admits());
+
+    // The procfs view counts invalid/unmapped observations as unknown.
+    uvm_pmm_gpu_vab_stats_t stats;
+    mock_snapshot.valid=false;uvm_pmm_gpu_vab_stats(&p,&mock_snapshot,&stats);
+    assert(stats.used_unknown==2 && !stats.used_hot && !stats.used_cold);
+    observation();mock_snapshot.access_bits[0]=1;
+    uvm_pmm_gpu_vab_stats(&p,&mock_snapshot,&stats);
+    assert(stats.used_hot==1 && stats.used_cold==1 && !stats.used_unknown);
+
+    reset();for(unsigned i=0;i<5;++i)add(i,2);
+    assert(eager_eviction_batch(&p,true,16,98)==2 && p.vab_stats.background_roots_freed==2);
+    reset();for(unsigned i=0;i<5;++i)add(i,2);fail_at=2;
+    assert(eager_eviction_batch(&p,true,16,95)==1);
+    assert(p.vab_stats.background_roots_freed==1 && p.vab_stats.background_failures==1);
     puts("Demand-first production eviction admission, ranking, forced recovery and batch checks passed.");
     return 0;
 }
@@ -151,8 +216,9 @@ int main(void) {
 
 def main():
     source=(ROOT / 'kernel-open/nvidia-uvm/uvm_pmm_gpu.c').read_text()
-    code=PRELUDE
-    for name in ('get_first_allocated_chunk','pick_root_chunk_to_evict','eager_eviction_has_cold_candidate','eager_eviction_one','eager_eviction_batch'):
+    header=(ROOT / 'kernel-open/nvidia-uvm/uvm_vab.h').read_text().replace('#include "nvtypes.h"','')
+    code=PRELUDE.replace('/* VAB classifier */',header)
+    for name in ('get_first_allocated_chunk','pick_root_chunk_to_evict','eager_eviction_has_cold_candidate','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):
         code+=function(source,name)
     code+=SCENARIOS
     with tempfile.TemporaryDirectory(prefix='demand-first-eviction-') as directory:

@@ -76,6 +76,7 @@ NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_kvmalloc.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_devmem.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_pmm_sysmem.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_pmm_gpu.c
+NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_gpu_vab.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_migrate.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_populate_pageable.c
 NVIDIA_UVM_SOURCES += nvidia-uvm/uvm_migrate_pageable.c

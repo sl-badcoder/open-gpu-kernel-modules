@@ -1,0 +1,315 @@
+// SPDX-License-Identifier: MIT
+// Native-granularity VAB observation alongside the demand-first policy.
+#include "uvm_api.h"
+#include "uvm_gpu.h"
+#include "uvm_global.h"
+#include "uvm_procfs.h"
+#include "nv_uvm_interface.h"
+#include <linux/bitops.h>
+#include <linux/string.h>
+
+// Observation is enabled independently of the unverified physical mapping.
+// 0 = baseline (no dumps), 1 = observe. Eviction decisions stay unchanged.
+static unsigned uvm_perf_vab_mode = 1;
+static unsigned uvm_perf_vab_interval_ms = 100;
+static unsigned long long uvm_perf_vab_eviction_linear_base = ~0ULL;
+module_param(uvm_perf_vab_mode, uint, S_IRUGO | S_IWUSR);
+module_param(uvm_perf_vab_interval_ms, uint, S_IRUGO | S_IWUSR);
+module_param(uvm_perf_vab_eviction_linear_base, ullong, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_vab_mode, "VAB mode: 0=no sampling, 1=observe (default); other values disable sampling.");
+MODULE_PARM_DESC(uvm_perf_vab_interval_ms, "VAB dump interval in ms (default 100, clamped to 5..1000).");
+MODULE_PARM_DESC(uvm_perf_vab_eviction_linear_base, "Explicit assertion of a single linear physical VAB bit mapping; unset leaves region classification unknown.");
+
+static unsigned vab_mode(void)
+{
+    unsigned mode = READ_ONCE(uvm_perf_vab_mode);
+    return mode <= 1 ? mode : 0;
+}
+
+static unsigned vab_interval_ms(void)
+{
+    return clamp(READ_ONCE(uvm_perf_vab_interval_ms), 5U, 1000U);
+}
+
+// cache_lock must be held. Mode and freshness are applied at consumption time,
+// so switching to baseline immediately invalidates observations.
+static void vab_snapshot_locked(uvm_parent_gpu_t *parent_gpu, uvm_vab_snapshot_t *snapshot)
+{
+    unsigned mode = vab_mode();
+
+    *snapshot = parent_gpu->vab.sample;
+    snapshot->linear_base = uvm_perf_vab_eviction_linear_base;
+    snapshot->valid = snapshot->valid && parent_gpu->vab.running &&
+                      !READ_ONCE(parent_gpu->vab.stopping) && mode != 0 &&
+                      uvm_vab_sample_fresh(NV_GETTIME(), snapshot->sampled_ns,
+                                           (NvU64)3 * vab_interval_ms() * NSEC_PER_MSEC);
+}
+
+void uvm_gpu_vab_get_snapshot(uvm_parent_gpu_t *parent_gpu, uvm_vab_snapshot_t *snapshot)
+{
+    unsigned long flags;
+
+    // No RM calls: this is safe inside PMM and RM's PMA reclaim callbacks.
+    spin_lock_irqsave(&parent_gpu->vab.cache_lock, flags);
+    vab_snapshot_locked(parent_gpu, snapshot);
+    spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+}
+
+static void vab_sample(uvm_parent_gpu_t *parent_gpu)
+{
+    UvmGpuAccessBitsBufferAlloc raw;
+    NvU64 started_ns = NV_GETTIME();
+    NvU64 duration_ns;
+    NV_STATUS status;
+    unsigned long flags;
+    unsigned i;
+    unsigned enabled = 0;
+    unsigned set = 0;
+    NvU64 rising = 0;
+    NvU64 falling = 0;
+
+    if (!vab_mode()) {
+        spin_lock_irqsave(&parent_gpu->vab.cache_lock, flags);
+        parent_gpu->vab.sample.valid = false;
+        spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+        return;
+    }
+
+    // Do not wait on suspend while GPU removal may wait for this worker.
+    if (!uvm_down_read_trylock(&g_uvm_global.pm.lock)) {
+        spin_lock_irqsave(&parent_gpu->vab.cache_lock, flags);
+        ++parent_gpu->vab.pm_skips;
+        parent_gpu->vab.sample.valid = false;
+        spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+        return;
+    }
+
+    mutex_lock(&parent_gpu->vab.dump_lock);
+    // A mode-1 worker may have waited behind a diagnostic dump while mode was
+    // switched to 0. Never issue a late CURRENT that clears its aggregation.
+    if (!vab_mode()) {
+        mutex_unlock(&parent_gpu->vab.dump_lock);
+        spin_lock_irqsave(&parent_gpu->vab.cache_lock, flags);
+        parent_gpu->vab.sample.valid = false;
+        spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+        uvm_up_read(&g_uvm_global.pm.lock);
+        return;
+    }
+    status = nvUvmInterfaceAccessBitsDump(parent_gpu->rm_device,
+                                          &parent_gpu->vab_info,
+                                          UVM_ACCESS_BITS_DUMP_MODE_CURRENT);
+    if (status == NV_OK)
+        raw = parent_gpu->vab_info;
+    mutex_unlock(&parent_gpu->vab.dump_lock);
+    duration_ns = NV_GETTIME() - started_ns;
+
+    spin_lock_irqsave(&parent_gpu->vab.cache_lock, flags);
+    parent_gpu->vab.last_dump_status = status;
+    parent_gpu->vab.dump_duration_ns = duration_ns;
+    if (status != NV_OK) {
+        ++parent_gpu->vab.dump_errors;
+        parent_gpu->vab.sample.valid = false;
+        spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+        uvm_up_read(&g_uvm_global.pm.lock);
+        return;
+    }
+
+    for (i = 0; i < UVM_VAB_WORD_COUNT; ++i) {
+        NvU64 mask = raw.enabledMask[i];
+        NvU64 bits = raw.currentBits[i] & mask;
+
+        enabled += hweight64(mask);
+        set += hweight64(bits);
+        if (parent_gpu->vab.samples) {
+            NvU64 common = mask & parent_gpu->vab.sample.enabled_mask[i];
+            NvU64 previous = parent_gpu->vab.sample.access_bits[i];
+            rising += hweight64(bits & ~previous & common);
+            falling += hweight64(previous & ~bits & common);
+        }
+        parent_gpu->vab.sample.access_bits[i] = bits;
+        parent_gpu->vab.sample.enabled_mask[i] = mask;
+    }
+    if (parent_gpu->vab.samples && !rising && !falling)
+        ++parent_gpu->vab.unchanged_samples;
+    else
+        parent_gpu->vab.unchanged_samples = 0;
+    ++parent_gpu->vab.samples;
+    parent_gpu->vab.rising_bits += rising;
+    parent_gpu->vab.falling_bits += falling;
+    parent_gpu->vab.enabled_bits = enabled;
+    parent_gpu->vab.set_bits = set;
+    parent_gpu->vab.sample.granularity = raw.granularity;
+    // Use the start time, not dump completion: a root arriving during the
+    // dump must not be classified from an observation preceding its arrival.
+    parent_gpu->vab.sample.sampled_ns = started_ns;
+    parent_gpu->vab.sample.valid = !raw.bDirtyBits && raw.granularity <= 15 && enabled != 0;
+    spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+    // Publish before releasing PM: suspend invalidates under the write lock,
+    // and must not be followed by publication of a pre-suspend observation.
+    uvm_up_read(&g_uvm_global.pm.lock);
+}
+
+static void vab_sample_work(struct work_struct *work)
+{
+    uvm_parent_gpu_t *parent_gpu = container_of(to_delayed_work(work), uvm_parent_gpu_t, vab.work);
+
+    if (READ_ONCE(parent_gpu->vab.stopping))
+        return;
+    UVM_ENTRY_VOID(vab_sample(parent_gpu));
+    if (!READ_ONCE(parent_gpu->vab.stopping))
+        schedule_delayed_work(&parent_gpu->vab.work, msecs_to_jiffies(vab_interval_ms()));
+}
+
+void uvm_gpu_vab_init(uvm_parent_gpu_t *parent_gpu)
+{
+    mutex_init(&parent_gpu->vab.dump_lock);
+    spin_lock_init(&parent_gpu->vab.cache_lock);
+    INIT_DELAYED_WORK(&parent_gpu->vab.work, vab_sample_work);
+    parent_gpu->vab.stopping = true;
+    parent_gpu->vab.last_dump_status = NV_ERR_INVALID_STATE;
+}
+
+void uvm_gpu_vab_start(uvm_parent_gpu_t *parent_gpu)
+{
+    unsigned i;
+    unsigned enabled = 0;
+    unsigned long flags;
+    bool supported;
+
+    BUILD_BUG_ON(ARRAY_SIZE(parent_gpu->vab_info.currentBits) != UVM_VAB_WORD_COUNT);
+    for (i = 0; i < UVM_VAB_WORD_COUNT; ++i)
+        enabled += hweight64(parent_gpu->vab_info.enabledMask[i]);
+    supported = parent_gpu->access_bits_supported && !parent_gpu->smc.enabled &&
+                parent_gpu->vab_info.accessBitsBufferHandle && !parent_gpu->vab_info.bDirtyBits &&
+                parent_gpu->vab_info.granularity <= 15 && enabled != 0;
+
+    spin_lock_irqsave(&parent_gpu->vab.cache_lock, flags);
+    parent_gpu->vab.allocated = parent_gpu->vab_info.accessBitsBufferHandle != 0;
+    parent_gpu->vab.supported = supported;
+    parent_gpu->vab.enabled_bits = enabled;
+    memcpy(parent_gpu->vab.sample.enabled_mask, parent_gpu->vab_info.enabledMask,
+           sizeof(parent_gpu->vab.sample.enabled_mask));
+    parent_gpu->vab.sample.granularity = parent_gpu->vab_info.granularity;
+    parent_gpu->vab.running = supported;
+    parent_gpu->vab.stopping = !supported;
+    spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+    if (!supported) {
+        pr_info("VAB observation inactive: unsupported/SMC/dirty configuration or empty enabled mask\n");
+        return;
+    }
+    pr_info("VAB observation: mode=%u granularity=%llu KiB enabled_bits=%u mapping=%s\n",
+            vab_mode(), 64ULL << parent_gpu->vab_info.granularity, enabled,
+            uvm_perf_vab_eviction_linear_base == ~0ULL ? "unknown" : "explicit linear assumption");
+    schedule_delayed_work(&parent_gpu->vab.work, msecs_to_jiffies(vab_interval_ms()));
+}
+
+void uvm_gpu_vab_stop(uvm_parent_gpu_t *parent_gpu)
+{
+    unsigned long flags;
+
+    WRITE_ONCE(parent_gpu->vab.stopping, true);
+    cancel_delayed_work_sync(&parent_gpu->vab.work);
+    spin_lock_irqsave(&parent_gpu->vab.cache_lock, flags);
+    parent_gpu->vab.running = false;
+    parent_gpu->vab.sample.valid = false;
+    spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+}
+
+void uvm_gpu_vab_invalidate(uvm_parent_gpu_t *parent_gpu)
+{
+    unsigned long flags;
+
+    spin_lock_irqsave(&parent_gpu->vab.cache_lock, flags);
+    parent_gpu->vab.sample.valid = false;
+    spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+}
+
+NV_STATUS uvm_gpu_vab_test_dump(uvm_parent_gpu_t *parent_gpu,
+                                UVM_ACCESS_BITS_DUMP_MODE mode,
+                                UvmGpuAccessBitsBufferAlloc *snapshot)
+{
+    NV_STATUS status;
+
+    mutex_lock(&parent_gpu->vab.dump_lock);
+    // CURRENT changes aggregation. Keep diagnostic DIFF/AGGREGATE sequences
+    // separate from sampling; mode 0 permits the direct test ioctl again.
+    if (vab_mode() && READ_ONCE(parent_gpu->vab.running)) {
+        status = NV_ERR_IN_USE;
+    }
+    else {
+        status = nvUvmInterfaceAccessBitsDump(parent_gpu->rm_device, &parent_gpu->vab_info, mode);
+        if (status == NV_OK)
+            *snapshot = parent_gpu->vab_info;
+    }
+    mutex_unlock(&parent_gpu->vab.dump_lock);
+    return status;
+}
+
+void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
+{
+    uvm_parent_gpu_t *parent_gpu = gpu->parent;
+    uvm_vab_snapshot_t snapshot;
+    uvm_pmm_gpu_vab_stats_t roots;
+    NvU64 samples, errors, skips, rising, falling, unchanged, duration;
+    NvU32 enabled, set;
+    NV_STATUS status;
+    bool allocated, supported, running;
+    unsigned i;
+    unsigned long flags;
+    NvU64 now = NV_GETTIME();
+
+    spin_lock_irqsave(&parent_gpu->vab.cache_lock, flags);
+    vab_snapshot_locked(parent_gpu, &snapshot);
+    samples = parent_gpu->vab.samples;
+    errors = parent_gpu->vab.dump_errors;
+    skips = parent_gpu->vab.pm_skips;
+    rising = parent_gpu->vab.rising_bits;
+    falling = parent_gpu->vab.falling_bits;
+    unchanged = parent_gpu->vab.unchanged_samples;
+    duration = parent_gpu->vab.dump_duration_ns;
+    enabled = parent_gpu->vab.enabled_bits;
+    set = parent_gpu->vab.set_bits;
+    status = parent_gpu->vab.last_dump_status;
+    allocated = parent_gpu->vab.allocated;
+    supported = parent_gpu->vab.supported;
+    running = parent_gpu->vab.running && !parent_gpu->vab.stopping;
+    spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+
+    // Cache and PMM locks are never nested in this order. Take a fixed sample
+    // before scanning the child's used roots; readers never call RM.
+    uvm_pmm_gpu_vab_stats(&gpu->pmm, &snapshot, &roots);
+    seq_printf(s, "mode %u\ninterval_ms %u\nallocated %u\nsupported %u\nworker_running %u\nsampling_active %u\n",
+               vab_mode(), vab_interval_ms(), allocated, supported, running, running && vab_mode() != 0);
+    seq_printf(s, "mapping_configured %u\nlinear_base 0x%llx\nsample_valid %u\n",
+               snapshot.linear_base != ~0ULL, snapshot.linear_base, snapshot.valid);
+    seq_puts(s, "selection_active 0\nclassification_scope physical_region_at_sample\n");
+    seq_printf(s, "granularity_kib %llu\nbitmap_bits %u\nenabled_bits %u\nset_bits %u\nclear_bits %u\n",
+               snapshot.granularity <= 15 ? 64ULL << snapshot.granularity : 0,
+               UVM_VAB_WORD_COUNT * 64, enabled, set, enabled - min(enabled, set));
+    seq_printf(s, "samples %llu\ndump_errors %llu\npm_skips %llu\nlast_dump_status 0x%08x\n",
+               samples, errors, skips, status);
+    if (snapshot.sampled_ns && now >= snapshot.sampled_ns)
+        seq_printf(s, "sample_age_ms %llu\n", (now - snapshot.sampled_ns) / NSEC_PER_MSEC);
+    else
+        seq_puts(s, "sample_age_ms unknown\n");
+    seq_printf(s, "last_dump_us %llu\nrising_bits %llu\nfalling_bits %llu\nunchanged_samples %llu\n",
+               duration / 1000, rising, falling, unchanged);
+    seq_printf(s, "used_roots_hot %llu\nused_roots_cold %llu\nused_roots_unknown %llu\n",
+               roots.used_hot, roots.used_cold, roots.used_unknown);
+    seq_printf(s, "selected_hot %llu\nselected_cold %llu\nselected_unknown %llu\n",
+               roots.selected_hot, roots.selected_cold, roots.selected_unknown);
+    seq_printf(s, "background_roots_freed %llu\nbackground_failures %llu\n",
+               roots.background_roots_freed, roots.background_failures);
+    seq_printf(s, "usage_percent %llu\nprefetch_inflight %llu\nrecovering_watermark %llu\nbackground_active %llu\n",
+               roots.usage_percent, roots.prefetch_inflight, roots.recovering_watermark, roots.background_active);
+
+    // Raw words expose hot/cold bits even without a physical range mapping.
+    // Word zero is first; bit i belongs to word i/64 at position i%64.
+    seq_puts(s, "enabled_mask");
+    for (i = 0; i < UVM_VAB_WORD_COUNT; ++i)
+        seq_printf(s, " %016llx", snapshot.enabled_mask[i]);
+    seq_puts(s, "\naccess_bits");
+    for (i = 0; i < UVM_VAB_WORD_COUNT; ++i)
+        seq_printf(s, " %016llx", snapshot.access_bits[i]);
+    seq_puts(s, "\n");
+}

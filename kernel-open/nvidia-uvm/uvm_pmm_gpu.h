@@ -58,6 +58,7 @@
 #include "uvm_va_block_types.h"
 #include "uvm_linux.h"
 #include "uvm_types.h"
+#include "uvm_vab.h"
 #include "nv_uvm_user_types.h"
 #if UVM_IS_CONFIG_HMM() || defined(CONFIG_PCI_P2PDMA)
 #include <linux/memremap.h>
@@ -173,6 +174,21 @@ static void uvm_pmm_list_zero_checks(void)
 {
     BUILD_BUG_ON(UVM_PMM_LIST_ZERO_COUNT > 2);
 }
+
+typedef struct {
+    NvU64 used_cold;
+    NvU64 used_hot;
+    NvU64 used_unknown;
+    NvU64 selected_hot;
+    NvU64 selected_cold;
+    NvU64 selected_unknown;
+    NvU64 background_roots_freed;
+    NvU64 background_failures;
+    NvU64 usage_percent;
+    NvU64 prefetch_inflight;
+    NvU64 recovering_watermark;
+    NvU64 background_active;
+} uvm_pmm_gpu_vab_stats_t;
 
 // Lists for allocated root chunks. When picking a root chunk to evict, lists
 // with lower numerical order are checked first.
@@ -340,6 +356,7 @@ typedef struct uvm_gpu_root_chunk_struct
 
 typedef struct uvm_pmm_gpu_struct
 {
+    uvm_pmm_gpu_vab_stats_t vab_stats;
     // Sizes of the MMU
     uvm_chunk_sizes_mask_t chunk_sizes[UVM_PMM_GPU_MEMORY_TYPE_COUNT];
 
@@ -436,6 +453,10 @@ uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *pmm);
 
 // Initialize PMM on GPU
 NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm);
+
+void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
+                           const uvm_vab_snapshot_t *snapshot,
+                           uvm_pmm_gpu_vab_stats_t *stats);
 
 // Deinitialize the PMM on GPU
 void uvm_pmm_gpu_deinit(uvm_pmm_gpu_t *pmm);

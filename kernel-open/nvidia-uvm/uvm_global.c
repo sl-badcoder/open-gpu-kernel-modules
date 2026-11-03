@@ -322,6 +322,10 @@ static NV_STATUS uvm_suspend(void)
     for_each_gpu_id_in_mask(gpu_id, &g_uvm_global.retained_gpus) {
         gpu = uvm_gpu_get(gpu_id);
 
+        // A VAB observation must not survive a suspend/resume boundary, even
+        // when the raw monotonic clock excludes the time spent asleep.
+        uvm_gpu_vab_invalidate(gpu->parent);
+
         // Since fault buffer state may be lost across sleep cycles, UVM must
         // ensure any outstanding replayable faults are dismissed. The RM
         // guarantees that all user channels have been preempted before

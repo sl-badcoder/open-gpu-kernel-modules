@@ -1000,9 +1000,26 @@ static int nv_procfs_read_gpu_access_counters_entry(struct seq_file *s, void *v)
     UVM_ENTRY_RET(nv_procfs_read_gpu_access_counters(s, v));
 }
 
+static int nv_procfs_read_gpu_vab(struct seq_file *s, void *v)
+{
+    uvm_gpu_t *gpu = s->private;
+
+    if (!uvm_down_read_trylock(&g_uvm_global.pm.lock))
+        return -EAGAIN;
+    uvm_gpu_vab_print(gpu, s);
+    uvm_up_read(&g_uvm_global.pm.lock);
+    return 0;
+}
+
+static int nv_procfs_read_gpu_vab_entry(struct seq_file *s, void *v)
+{
+    UVM_ENTRY_RET(nv_procfs_read_gpu_vab(s, v));
+}
+
 UVM_DEFINE_SINGLE_PROCFS_FILE(gpu_info_entry);
 UVM_DEFINE_SINGLE_PROCFS_FILE(gpu_fault_stats_entry);
 UVM_DEFINE_SINGLE_PROCFS_FILE(gpu_access_counters_entry);
+UVM_DEFINE_SINGLE_PROCFS_FILE(gpu_vab_entry);
 
 static void uvm_parent_gpu_uuid_string(char *buffer, const NvProcessorUuid *uuid)
 {
@@ -1138,11 +1155,17 @@ static NV_STATUS init_procfs_files(uvm_gpu_t *gpu)
     if (gpu->procfs.info_file == NULL)
         return NV_ERR_OPERATING_SYSTEM;
 
+    // Observation must remain available in release builds without test ioctls.
+    gpu->procfs.vab_file = NV_CREATE_PROC_FILE("vab", gpu->procfs.dir, gpu_vab_entry, gpu);
+    if (gpu->procfs.vab_file == NULL)
+        return NV_ERR_OPERATING_SYSTEM;
+
     return NV_OK;
 }
 
 static void deinit_procfs_files(uvm_gpu_t *gpu)
 {
+    proc_remove(gpu->procfs.vab_file);
     proc_remove(gpu->procfs.info_file);
 }
 
@@ -1250,6 +1273,7 @@ static NV_STATUS alloc_parent_gpu(const NvProcessorUuid *gpu_uuid,
         return NV_ERR_NO_MEMORY;
 
     parent_gpu->id = gpu_id;
+    uvm_gpu_vab_init(parent_gpu);
 
     uvm_uuid_copy(&parent_gpu->uuid, gpu_uuid);
     uvm_sema_init(&parent_gpu->isr.replayable_faults.service_lock, 1, UVM_LOCK_ORDER_ISR);
@@ -2796,19 +2820,20 @@ cleanup:
 
 static NV_STATUS parent_gpu_init_access_bits(uvm_parent_gpu_t *parent_gpu)
 {
-    UVM_ASSERT(parent_gpu->vab_info.accessBitsBufferHandle == 0);
-    return uvm_rm_locked_call(nvUvmInterfaceAccessBitsBufAlloc(parent_gpu->rm_device, &parent_gpu->vab_info));
-}
+    NV_STATUS status;
 
-static NV_STATUS parent_gpu_update_access_bits(uvm_parent_gpu_t *parent_gpu, UVM_ACCESS_BITS_DUMP_MODE mode)
-{
-    return nvUvmInterfaceAccessBitsDump(parent_gpu->rm_device, &parent_gpu->vab_info, mode);
+    UVM_ASSERT(parent_gpu->vab_info.accessBitsBufferHandle == 0);
+    status = uvm_rm_locked_call(nvUvmInterfaceAccessBitsBufAlloc(parent_gpu->rm_device, &parent_gpu->vab_info));
+    if (status == NV_OK)
+        uvm_gpu_vab_start(parent_gpu);
+    return status;
 }
 
 static NV_STATUS parent_gpu_deinit_access_bits(uvm_parent_gpu_t *parent_gpu)
 {
     NV_STATUS status = NV_OK;
 
+    uvm_gpu_vab_stop(parent_gpu);
     if (parent_gpu->vab_info.accessBitsBufferHandle) {
         status =  uvm_rm_locked_call(nvUvmInterfaceAccessBitsBufFree(parent_gpu->rm_device, &parent_gpu->vab_info));
         parent_gpu->vab_info.accessBitsBufferHandle = 0;
@@ -4316,6 +4341,7 @@ NV_STATUS uvm_test_get_gpu_time(UVM_TEST_GET_GPU_TIME_PARAMS *params, struct fil
 
 NV_STATUS uvm_test_dump_access_bits(UVM_TEST_DUMP_ACCESS_BITS_PARAMS *params, struct file *filp)
 {
+    UvmGpuAccessBitsBufferAlloc snapshot;
     uvm_va_space_t *va_space = uvm_va_space_get(filp);
     uvm_gpu_t *gpu = NULL;
     NV_STATUS status = NV_OK;
@@ -4335,9 +4361,10 @@ NV_STATUS uvm_test_dump_access_bits(UVM_TEST_DUMP_ACCESS_BITS_PARAMS *params, st
     // values.
     params->granularity_size_kb = (NvU64)(64) << gpu->parent->vab_info.granularity;
 
-    status = parent_gpu_update_access_bits(gpu->parent, params->mode);
-    if (status != NV_OK)
+    if (params->current_bits_length > ARRAY_SIZE(snapshot.currentBits)) {
+        status = NV_ERR_INVALID_ARGUMENT;
         goto done;
+    }
 
     // If this is a length query, we are done after we set the length
     if (params->current_bits_length == 0) {
@@ -4345,9 +4372,13 @@ NV_STATUS uvm_test_dump_access_bits(UVM_TEST_DUMP_ACCESS_BITS_PARAMS *params, st
         goto done;
     }
 
+    status = uvm_gpu_vab_test_dump(gpu->parent, params->mode, &snapshot);
+    if (status != NV_OK)
+        goto done;
+
     // Copy the bits to user space
     if (copy_to_user(params->current_bits,
-                     gpu->parent->vab_info.currentBits,
+                     snapshot.currentBits,
                      sizeof(NvU64) * params->current_bits_length)) {
         status = NV_ERR_INVALID_ADDRESS;
         goto done;

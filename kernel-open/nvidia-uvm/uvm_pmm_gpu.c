@@ -1616,6 +1616,24 @@ static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
         }
     }
 
+    // Observation never changes the baseline ranking above. Record the
+    // sampled physical state of the victim that baseline selection chose.
+    if (coldest) {
+        uvm_vab_snapshot_t snapshot;
+        uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, coldest);
+        uvm_vab_region_state_t state;
+
+        uvm_gpu_vab_get_snapshot(uvm_pmm_to_gpu(pmm)->parent, &snapshot);
+        state = uvm_vab_classify(&snapshot, coldest->address, UVM_CHUNK_SIZE_MAX,
+                                 root->resident_since_ns);
+        if (state == UVM_VAB_REGION_COLD)
+            ++pmm->vab_stats.selected_cold;
+        else if (state == UVM_VAB_REGION_HOT)
+            ++pmm->vab_stats.selected_hot;
+        else
+            ++pmm->vab_stats.selected_unknown;
+    }
+
     return coldest;
 }
 
@@ -1903,8 +1921,12 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force, uvm_gpu_root_chun
     status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
     uvm_mutex_unlock(&pmm->lock);
 
-    if (status != NV_OK)
+    if (status != NV_OK) {
+        uvm_spin_lock(&pmm->list_lock);
+        ++pmm->vab_stats.background_failures;
+        uvm_spin_unlock(&pmm->list_lock);
         return false;
+    }
 
     // Keep the root pinned until the caller drains the submitted batch.
     *out_root = root_chunk;
@@ -1936,8 +1958,12 @@ static unsigned eager_eviction_batch(uvm_pmm_gpu_t *pmm, bool force, unsigned li
 
         // Drain successful submissions even if selecting a later root failed.
         // free_root_chunk waits for each root's tracker before releasing VRAM.
-        for (i = 0; i < count; ++i)
+        for (i = 0; i < count; ++i) {
             free_root_chunk(pmm, pending[i], FREE_ROOT_CHUNK_MODE_DEFAULT);
+            uvm_spin_lock(&pmm->list_lock);
+            ++pmm->vab_stats.background_roots_freed;
+            uvm_spin_unlock(&pmm->list_lock);
+        }
     }
 
     return submitted;
@@ -3605,6 +3631,36 @@ static void process_lazy_free_entry(void *args)
     UVM_ENTRY_VOID(uvm_pmm_gpu_process_lazy_free(args));
 }
 
+void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
+                           const uvm_vab_snapshot_t *snapshot,
+                           uvm_pmm_gpu_vab_stats_t *stats)
+{
+    uvm_gpu_chunk_t *entry;
+
+    uvm_spin_lock(&pmm->list_lock);
+    *stats = pmm->vab_stats;
+    stats->usage_percent = eager_eviction_usage_percent(pmm);
+    stats->prefetch_inflight = pmm->eager_eviction.prefetch_count;
+    stats->recovering_watermark = pmm->eager_eviction.recovering_watermark;
+    stats->background_active = pmm->eager_eviction.active;
+    stats->used_cold = 0;
+    stats->used_hot = 0;
+    stats->used_unknown = 0;
+    list_for_each_entry(entry, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
+        uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, entry);
+        uvm_vab_region_state_t state = uvm_vab_classify(snapshot, entry->address,
+                                                       UVM_CHUNK_SIZE_MAX,
+                                                       root->resident_since_ns);
+        if (state == UVM_VAB_REGION_COLD)
+            ++stats->used_cold;
+        else if (state == UVM_VAB_REGION_HOT)
+            ++stats->used_hot;
+        else
+            ++stats->used_unknown;
+    }
+    uvm_spin_unlock(&pmm->list_lock);
+}
+
 NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
 {
     uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
@@ -3616,6 +3672,8 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     NV_STATUS status = NV_OK;
     uvm_pmm_alloc_list_t alloc_list;
     size_t i, j, k;
+
+    memset(&pmm->vab_stats, 0, sizeof(pmm->vab_stats));
 
     // UVM_CHUNK_SIZE_INVALID is UVM_CHUNK_SIZE_MAX shifted left by 1. This
     // protects UVM_CHUNK_SIZE_INVALID from being negative
