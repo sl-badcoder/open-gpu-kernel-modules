@@ -77,6 +77,8 @@ typedef struct parent {
 typedef struct {int dummy;}uvm_pmm_gpu_t;
 typedef struct {uvm_parent_gpu_t *parent;uvm_pmm_gpu_t pmm;}uvm_gpu_t;
 static uvm_parent_gpu_t *active_parent;
+static unsigned readiness_kicks;
+static void uvm_gpu_vab_kick_readiness(uvm_parent_gpu_t *p){assert(pm_held&&!p->vab.cache_lock);++readiness_kicks;}
 static unsigned dumps;static NV_STATUS dump_status;static NvU64 dump_bits=1;
 static NV_STATUS nvUvmInterfaceAccessBitsDump(void *dev,UvmGpuAccessBitsBufferAlloc *r,unsigned mode){
  (void)mode;uvm_parent_gpu_t *p=dev;assert(pm_held&&p->vab.dump_lock.held&&!p->vab.cache_lock);++dumps;
@@ -118,7 +120,8 @@ int main(void){
  assert(dumps==count&&strstr(report.text,"mode 1\n")&&strstr(report.text,"selection_active 0\n"));
  assert(strstr(report.text,"granularity_kib 4096\n")&&strstr(report.text,"used_roots_cold 1\n"));
  assert(strstr(report.text,"used_roots_hot 1\n")&&strstr(report.text,"rising_bits 1\n"));
- uvm_perf_vab_mode=2;uvm_gpu_vab_get_snapshot(&p,&s);assert(!s.valid); // Unsupported mode cannot change policy.
+ uvm_perf_vab_mode=2;uvm_gpu_vab_get_snapshot(&p,&s);assert(s.valid&&s.eviction_enabled);
+ vab_sample(&p);assert(readiness_kicks==1);
  uvm_perf_vab_mode=1;uvm_perf_vab_eviction_linear_base=~0ULL;uvm_gpu_vab_get_snapshot(&p,&s);assert(s.valid);
  uvm_perf_vab_mode=0;count=dumps;vab_sample(&p);assert(dumps==count);
  uvm_gpu_vab_get_snapshot(&p,&s);assert(!s.valid);

@@ -188,6 +188,10 @@ typedef struct {
     NvU64 prefetch_inflight;
     NvU64 recovering_watermark;
     NvU64 background_active;
+    NvU64 selection_changes;
+    NvU64 selection_fallbacks;
+    NvU64 eligible_roots;
+    NvU64 readiness_pending;
 } uvm_pmm_gpu_vab_stats_t;
 
 // Lists for allocated root chunks. When picking a root chunk to evict, lists
@@ -347,6 +351,12 @@ typedef struct uvm_gpu_root_chunk_struct
     NvU64 migration_score_update_ns;
     NvU64 resident_since_ns;
     NvU64 protected_until_ns;
+    // Separate from optional migration scoring; invalidated for every
+    // destination population/copy and root reuse, published only after the
+    // owning managed block's tracker is complete.
+    NvU64 vab_generation;
+    NvU64 vab_ready_generation;
+    NvU64 vab_ready_ns;
 
     // Pending operations for all GPU chunks under the root chunk.
     //
@@ -357,6 +367,8 @@ typedef struct uvm_gpu_root_chunk_struct
 typedef struct uvm_pmm_gpu_struct
 {
     uvm_pmm_gpu_vab_stats_t vab_stats;
+    size_t vab_scan_cursor;
+    NvU64 vab_scan_next_ns;
     // Sizes of the MMU
     uvm_chunk_sizes_mask_t chunk_sizes[UVM_PMM_GPU_MEMORY_TYPE_COUNT];
 
@@ -457,6 +469,8 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm);
 void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
                            const uvm_vab_snapshot_t *snapshot,
                            uvm_pmm_gpu_vab_stats_t *stats);
+void uvm_pmm_gpu_vab_invalidate_block(uvm_va_block_t *block, uvm_gpu_t *gpu);
+void uvm_pmm_gpu_vab_kick(uvm_pmm_gpu_t *pmm);
 
 // Deinitialize the PMM on GPU
 void uvm_pmm_gpu_deinit(uvm_pmm_gpu_t *pmm);

@@ -9,21 +9,21 @@
 #include <linux/string.h>
 
 // Observation is enabled independently of the unverified physical mapping.
-// 0 = baseline (no dumps), 1 = observe. Eviction decisions stay unchanged.
+// 0 = baseline (no dumps), 1 = observe, 2 = prefer eligible cold roots.
 static unsigned uvm_perf_vab_mode = 1;
 static unsigned uvm_perf_vab_interval_ms = 100;
 static unsigned long long uvm_perf_vab_eviction_linear_base = ~0ULL;
 module_param(uvm_perf_vab_mode, uint, S_IRUGO | S_IWUSR);
 module_param(uvm_perf_vab_interval_ms, uint, S_IRUGO | S_IWUSR);
 module_param(uvm_perf_vab_eviction_linear_base, ullong, S_IRUGO);
-MODULE_PARM_DESC(uvm_perf_vab_mode, "VAB mode: 0=no sampling, 1=observe (default); other values disable sampling.");
+MODULE_PARM_DESC(uvm_perf_vab_mode, "VAB mode: 0=no sampling, 1=observe (default), 2=cold-first eviction; other values disable sampling.");
 MODULE_PARM_DESC(uvm_perf_vab_interval_ms, "VAB dump interval in ms (default 100, clamped to 5..1000).");
 MODULE_PARM_DESC(uvm_perf_vab_eviction_linear_base, "Explicit assertion of a single linear physical VAB bit mapping; unset leaves region classification unknown.");
 
 static unsigned vab_mode(void)
 {
     unsigned mode = READ_ONCE(uvm_perf_vab_mode);
-    return mode <= 1 ? mode : 0;
+    return mode <= 2 ? mode : 0;
 }
 
 static unsigned vab_interval_ms(void)
@@ -39,10 +39,18 @@ static void vab_snapshot_locked(uvm_parent_gpu_t *parent_gpu, uvm_vab_snapshot_t
 
     *snapshot = parent_gpu->vab.sample;
     snapshot->linear_base = uvm_perf_vab_eviction_linear_base;
+    snapshot->eviction_enabled = mode == 2;
     snapshot->valid = snapshot->valid && parent_gpu->vab.running &&
                       !READ_ONCE(parent_gpu->vab.stopping) && mode != 0 &&
                       uvm_vab_sample_fresh(NV_GETTIME(), snapshot->sampled_ns,
                                            (NvU64)3 * vab_interval_ms() * NSEC_PER_MSEC);
+}
+
+bool uvm_gpu_vab_eviction_requested(uvm_parent_gpu_t *parent_gpu)
+{
+    return vab_mode() == 2 && uvm_perf_vab_eviction_linear_base != ~0ULL &&
+           READ_ONCE(parent_gpu->vab.supported) && READ_ONCE(parent_gpu->vab.running) &&
+           !READ_ONCE(parent_gpu->vab.stopping);
 }
 
 void uvm_gpu_vab_get_snapshot(uvm_parent_gpu_t *parent_gpu, uvm_vab_snapshot_t *snapshot)
@@ -144,6 +152,8 @@ static void vab_sample(uvm_parent_gpu_t *parent_gpu)
     parent_gpu->vab.sample.sampled_ns = started_ns;
     parent_gpu->vab.sample.valid = !raw.bDirtyBits && raw.granularity <= 15 && enabled != 0;
     spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+    if (uvm_gpu_vab_eviction_requested(parent_gpu))
+        uvm_gpu_vab_kick_readiness(parent_gpu);
     // Publish before releasing PM: suspend invalidates under the write lock,
     // and must not be followed by publication of a pre-suspend observation.
     uvm_up_read(&g_uvm_global.pm.lock);
@@ -282,7 +292,9 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
                vab_mode(), vab_interval_ms(), allocated, supported, running, running && vab_mode() != 0);
     seq_printf(s, "mapping_configured %u\nlinear_base 0x%llx\nsample_valid %u\n",
                snapshot.linear_base != ~0ULL, snapshot.linear_base, snapshot.valid);
-    seq_puts(s, "selection_active 0\nclassification_scope physical_region_at_sample\n");
+    seq_printf(s, "selection_active %u\nclassification_scope %s\n",
+               snapshot.eviction_enabled && snapshot.valid && snapshot.linear_base != ~0ULL,
+               snapshot.eviction_enabled ? "eligible_full_managed_root" : "physical_region_at_sample");
     seq_printf(s, "granularity_kib %llu\nbitmap_bits %u\nenabled_bits %u\nset_bits %u\nclear_bits %u\n",
                snapshot.granularity <= 15 ? 64ULL << snapshot.granularity : 0,
                UVM_VAB_WORD_COUNT * 64, enabled, set, enabled - min(enabled, set));
@@ -300,6 +312,8 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
                roots.selected_hot, roots.selected_cold, roots.selected_unknown);
     seq_printf(s, "background_roots_freed %llu\nbackground_failures %llu\n",
                roots.background_roots_freed, roots.background_failures);
+    seq_printf(s, "selection_changes %llu\nselection_fallbacks %llu\neligible_roots %llu\nreadiness_pending %llu\n",
+               roots.selection_changes, roots.selection_fallbacks, roots.eligible_roots, roots.readiness_pending);
     seq_printf(s, "usage_percent %llu\nprefetch_inflight %llu\nrecovering_watermark %llu\nbackground_active %llu\n",
                roots.usage_percent, roots.prefetch_inflight, roots.recovering_watermark, roots.background_active);
 

@@ -2967,6 +2967,10 @@ NV_STATUS uvm_va_block_populate_pages_gpu(uvm_va_block_t *block,
     if (page_index == region.outer)
         return NV_OK;
 
+    // Invalidate before any destination initialization, including paths that
+    // do not migrate data or have migration-aware eviction disabled.
+    uvm_pmm_gpu_vab_invalidate_block(block, gpu);
+
     chunk_index = block_gpu_chunk_index(block, gpu, page_index, &chunk_size);
     chunk_region = uvm_va_block_chunk_region(block, chunk_size, page_index);
 
@@ -4014,6 +4018,11 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
 
     if (migrated_pages && !uvm_page_mask_andnot(copy_mask, copy_mask, migrated_pages))
         return NV_OK;
+
+    // Covers MOVE, COPY/read duplication and GPU-to-GPU arrivals before any
+    // destination memset/copy is submitted. Completion is polled separately.
+    if (UVM_ID_IS_GPU(dst_id))
+        uvm_pmm_gpu_vab_invalidate_block(block, uvm_gpu_get(dst_id));
 
     copy_state.src.id = src_id;
     copy_state.dst.id = dst_id;

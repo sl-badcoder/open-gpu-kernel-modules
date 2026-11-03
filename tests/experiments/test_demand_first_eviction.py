@@ -37,6 +37,8 @@ typedef int NV_STATUS;
 #define FREE_ROOT_CHUNK_MODE_DEFAULT 0
 #define PMM_CONTEXT_DEFAULT 0
 #define UVM_PMM_GPU_MEMORY_TYPE_USER 0
+#define UVM_PMM_GPU_CHUNK_STATE_ALLOCATED 1
+#define UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT 2
 #define UVM_CHUNK_SIZE_MAX 2097152
 #define UVM_PMM_LIST_NO_ZERO 0
 #define UVM_PMM_LIST_ZERO 1
@@ -54,9 +56,9 @@ static unsigned uvm_perf_eager_eviction_stale_intervals=5;
 static bool uvm_perf_migration_aware_eviction_enable=true;
 struct chunk;
 struct list_head { struct chunk *first; };
-typedef struct chunk { struct { struct chunk *next; } list; bool is_zero, claimed; NvU64 address; } uvm_gpu_chunk_t;
-typedef struct { uvm_gpu_chunk_t chunk; NvU64 access_heat,last_access_epoch,protected_until_ns,resident_since_ns; unsigned migration_score; } uvm_gpu_root_chunk_t;
-typedef struct { NvU64 used_cold,used_hot,used_unknown,selected_hot,selected_cold,selected_unknown,background_roots_freed,background_failures,usage_percent,prefetch_inflight,recovering_watermark,background_active; } uvm_pmm_gpu_vab_stats_t;
+typedef struct chunk { struct { struct chunk *next; } list; bool is_zero, claimed; NvU64 address; unsigned state; void *va_block; } uvm_gpu_chunk_t;
+typedef struct { uvm_gpu_chunk_t chunk; NvU64 access_heat,last_access_epoch,protected_until_ns,resident_since_ns; unsigned migration_score; NvU64 vab_generation,vab_ready_generation,vab_ready_ns; } uvm_gpu_root_chunk_t;
+typedef struct { NvU64 used_cold,used_hot,used_unknown,selected_hot,selected_cold,selected_unknown,background_roots_freed,background_failures,usage_percent,prefetch_inflight,recovering_watermark,background_active,selection_changes,selection_fallbacks,eligible_roots,readiness_pending; } uvm_pmm_gpu_vab_stats_t;
 typedef struct { int dummy; } uvm_parent_gpu_t;
 typedef struct { uvm_parent_gpu_t *parent; } uvm_gpu_t;
 static uvm_gpu_t mock_gpu;
@@ -100,7 +102,9 @@ static uvm_gpu_root_chunk_t roots[6];
 static void reset(void) {
     memset(&p,0,sizeof(p));memset(roots,0,sizeof(roots));p.eager_eviction.epoch=20;
     memset(&mock_snapshot,0,sizeof(mock_snapshot));snapshot_calls=0;
-    for(unsigned i=0;i<6;++i)roots[i].chunk.address=(NvU64)i*UVM_CHUNK_SIZE_MAX;
+    for(unsigned i=0;i<6;++i){roots[i].chunk.address=(NvU64)i*UVM_CHUNK_SIZE_MAX;
+        roots[i].chunk.state=UVM_PMM_GPU_CHUNK_STATE_ALLOCATED;roots[i].chunk.va_block=(void *)1;}
+    mock_now=1000;
     visits=evictions=freed=fail_at=0;mock_usage=100;migration_status=0;
     uvm_perf_migration_aware_eviction_enable=true;
 }
@@ -209,6 +213,65 @@ int main(void) {
     reset();for(unsigned i=0;i<5;++i)add(i,2);fail_at=2;
     assert(eager_eviction_batch(&p,true,16,95)==1);
     assert(p.vab_stats.background_roots_freed==1 && p.vab_stats.background_failures==1);
+
+    // Mode 2 changes the actual victim, while retaining the baseline winner
+    // for exact counterfactual change accounting.
+    reset();add(0,2);add(1,2);roots[1].migration_score=9;observation();mock_snapshot.eviction_enabled=true;
+    mock_snapshot.access_bits[0]=1;
+    for(unsigned i=0;i<2;++i){roots[i].vab_generation=roots[i].vab_ready_generation=1;roots[i].vab_ready_ns=900;}
+    assert(eager_eviction_one(&p,true,&out)&&out==&roots[1]);
+    assert(p.vab_stats.selection_changes==1&&!p.vab_stats.selection_fallbacks&&p.vab_stats.selected_cold==1);
+
+    // No 'changed decision' is claimed when baseline also selects cold data.
+    reset();add(0,2);add(1,2);roots[1].migration_score=9;observation();mock_snapshot.eviction_enabled=true;
+    mock_snapshot.access_bits[0]=2;
+    for(unsigned i=0;i<2;++i){roots[i].vab_generation=roots[i].vab_ready_generation=1;roots[i].vab_ready_ns=900;}
+    assert(eager_eviction_one(&p,true,&out)&&out==&roots[0]);
+    assert(!p.vab_stats.selection_changes&&!p.vab_stats.selection_fallbacks);
+
+    // All-hot pressure recovery falls back, and fresh protected cold data
+    // does not displace an unprotected legacy candidate.
+    reset();add(0,2);add(1,2);roots[1].migration_score=9;observation();mock_snapshot.eviction_enabled=true;
+    mock_snapshot.access_bits[0]=3;
+    for(unsigned i=0;i<2;++i){roots[i].vab_generation=roots[i].vab_ready_generation=1;roots[i].vab_ready_ns=900;}
+    assert(eager_eviction_one(&p,true,&out)&&out==&roots[0]&&p.vab_stats.selection_fallbacks==1);
+    reset();add(0,2);add(1,2);observation();mock_snapshot.eviction_enabled=true;mock_snapshot.access_bits[0]=1;
+    roots[1].protected_until_ns=mock_now+100;
+    for(unsigned i=0;i<2;++i){roots[i].vab_generation=roots[i].vab_ready_generation=1;roots[i].vab_ready_ns=900;}
+    assert(eager_eviction_one(&p,true,&out)&&out==&roots[0]);
+
+    // Background admission below high water claims the exact VAB-cold root,
+    // even though its migration score would lose the legacy ranking.
+    reset();add(0,2);add(1,2);roots[0].access_heat=roots[1].access_heat=4;roots[1].migration_score=9;
+    observation();mock_snapshot.eviction_enabled=true;mock_snapshot.access_bits[0]=1;
+    for(unsigned i=0;i<2;++i){roots[i].vab_generation=roots[i].vab_ready_generation=1;roots[i].vab_ready_ns=900;}
+    assert(!admits());assert(eager_eviction_one(&p,false,&out)&&out==&roots[1]);
+    reset();add(0,2);add(1,2);observation();mock_snapshot.eviction_enabled=true;mock_snapshot.access_bits[0]=3;
+    for(unsigned i=0;i<2;++i){roots[i].vab_generation=roots[i].vab_ready_generation=1;roots[i].vab_ready_ns=900;}
+    assert(!eager_eviction_one(&p,false,&out)&&!evictions);
+
+    // Arrivals invalidate readiness independently of old migration scoring.
+    reset();add(0,2);add(1,2);roots[1].migration_score=9;observation();mock_snapshot.eviction_enabled=true;
+    mock_snapshot.access_bits[0]=1;uvm_perf_migration_aware_eviction_enable=false;
+    for(unsigned i=0;i<2;++i){roots[i].vab_generation=roots[i].vab_ready_generation=1;roots[i].vab_ready_ns=900;}
+    vab_root_changed(&roots[1]);assert(roots[1].vab_generation==2&&!roots[1].vab_ready_ns);
+    uvm_spin_lock(&p.list_lock);assert(vab_root_state(&roots[1],&mock_snapshot)==UVM_VAB_REGION_UNKNOWN);uvm_spin_unlock(&p.list_lock);
+    roots[1].vab_ready_generation=2;roots[1].vab_ready_ns=1010;
+    assert(vab_root_state(&roots[1],&mock_snapshot)==UVM_VAB_REGION_UNKNOWN);
+    mock_snapshot.sampled_ns=1020;mock_now=1030;
+    assert(vab_root_state(&roots[1],&mock_snapshot)==UVM_VAB_REGION_COLD);
+    assert(eager_eviction_one(&p,true,&out)&&out==&roots[1]);
+
+    // Split, unmapped, stale and unready roots never become VAB-cold.
+    reset();observation();mock_snapshot.eviction_enabled=true;
+    roots[0].vab_generation=roots[0].vab_ready_generation=1;roots[0].vab_ready_ns=900;
+    roots[0].chunk.state=UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT;
+    assert(vab_root_state(&roots[0],&mock_snapshot)==UVM_VAB_REGION_UNKNOWN);
+    roots[0].chunk.state=UVM_PMM_GPU_CHUNK_STATE_ALLOCATED;roots[0].chunk.va_block=NULL;
+    assert(vab_root_state(&roots[0],&mock_snapshot)==UVM_VAB_REGION_UNKNOWN);
+
+    // Exercise the unchanged allocation/PMA wrapper and its fallback path.
+    reset();add(0,2);uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[0]);uvm_mutex_unlock(&p.lock);
     puts("Demand-first production eviction admission, ranking, forced recovery and batch checks passed.");
     return 0;
 }
@@ -218,7 +281,7 @@ def main():
     source=(ROOT / 'kernel-open/nvidia-uvm/uvm_pmm_gpu.c').read_text()
     header=(ROOT / 'kernel-open/nvidia-uvm/uvm_vab.h').read_text().replace('#include "nvtypes.h"','')
     code=PRELUDE.replace('/* VAB classifier */',header)
-    for name in ('get_first_allocated_chunk','pick_root_chunk_to_evict','eager_eviction_has_cold_candidate','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):
+    for name in ('vab_root_changed','vab_candidate_better','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_has_cold_candidate','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):
         code+=function(source,name)
     code+=SCENARIOS
     with tempfile.TemporaryDirectory(prefix='demand-first-eviction-') as directory:

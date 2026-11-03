@@ -2829,6 +2829,22 @@ static NV_STATUS parent_gpu_init_access_bits(uvm_parent_gpu_t *parent_gpu)
     return status;
 }
 
+void uvm_gpu_vab_kick_readiness(uvm_parent_gpu_t *parent_gpu)
+{
+    NvU32 index;
+
+    // GPU removal owns global_lock while cancelling this sampler. A trylock
+    // avoids waiting on that remover; child work is cancelled by PMM teardown.
+    if (!uvm_mutex_trylock(&g_uvm_global.global_lock))
+        return;
+    for_each_sub_processor_index(index) {
+        uvm_gpu_t *gpu = parent_gpu->gpus[index];
+        if (gpu && gpu->pmm.initialized)
+            uvm_pmm_gpu_vab_kick(&gpu->pmm);
+    }
+    uvm_mutex_unlock(&g_uvm_global.global_lock);
+}
+
 static NV_STATUS parent_gpu_deinit_access_bits(uvm_parent_gpu_t *parent_gpu)
 {
     NV_STATUS status = NV_OK;

@@ -503,6 +503,14 @@ void uvm_pmm_gpu_chunk_pin(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     chunk_pin(pmm, chunk);
 }
 
+static void vab_root_changed(uvm_gpu_root_chunk_t *root)
+{
+    if (++root->vab_generation == 0)
+        ++root->vab_generation;
+    root->vab_ready_generation = 0;
+    root->vab_ready_ns = 0;
+}
+
 // Unpin a chunk and update its root chunk's pinned leaf chunks count if the
 // chunk is not a root chunk.
 static void chunk_unpin(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_pmm_gpu_chunk_state_t new_state)
@@ -740,6 +748,7 @@ void uvm_pmm_gpu_unpin_allocated(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm
 
     uvm_spin_lock(&pmm->list_lock);
 
+    vab_root_changed(root_chunk_from_chunk(pmm, chunk));
     chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
     chunk_update_lists_locked(pmm, chunk);
 
@@ -1550,94 +1559,92 @@ static uvm_pmm_alloc_list_t get_alloc_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
     return UVM_PMM_ALLOC_LIST_COUNT;
 }
 
-static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
+// Keep the original migration/protection ranking as the fallback and as the
+// tie breaker between equally classified candidates.
+static bool vab_candidate_better(uvm_gpu_root_chunk_t *root, uvm_gpu_root_chunk_t *other, NvU64 now)
 {
-    uvm_pmm_alloc_list_t alloc_list;
-    uvm_gpu_chunk_t *coldest = NULL;
-    uvm_gpu_chunk_t *entry;
-    NvU64 now = NV_GETTIME();
-
-    uvm_assert_spinlock_locked(&pmm->list_lock);
-
-    for (alloc_list = 0; alloc_list < UVM_PMM_ALLOC_LIST_COUNT; alloc_list++) {
-        uvm_gpu_chunk_t *chunk = list_first_chunk(&pmm->root_chunks.alloc_list[alloc_list]);
-
-        // Preserve the existing unused/discarded priority. For used memory,
-        // order eviction by decayed access heat and then by oldest access.
-        if (chunk && alloc_list != UVM_PMM_ALLOC_LIST_USED)
-            return chunk;
-    }
-
-    list_for_each_entry(entry, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
-        uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, entry);
-        uvm_gpu_root_chunk_t *coldest_root;
-        bool root_protected = uvm_perf_migration_aware_eviction_enable &&
-                              now < root->protected_until_ns;
-        bool coldest_protected;
-
-        if (!coldest) {
-            coldest = entry;
-            continue;
-        }
-
-        coldest_root = root_chunk_from_chunk(pmm, coldest);
-        coldest_protected = uvm_perf_migration_aware_eviction_enable &&
-                            now < coldest_root->protected_until_ns;
-
-        // Always prefer an unprotected root. If all roots are protected, pick
-        // the one whose protection expires first so allocation can still make
-        // forward progress under critical memory pressure.
-        if (coldest_protected != root_protected) {
-            if (!root_protected)
-                coldest = entry;
-            continue;
-        }
-
-        if (root_protected && root->protected_until_ns != coldest_root->protected_until_ns) {
-            if (root->protected_until_ns < coldest_root->protected_until_ns)
-                coldest = entry;
-            continue;
-        }
-
-        // Migration score and residency age are stable without local-VRAM
-        // access information. Access-counter heat remains a final tie-breaker
-        // for the remote demand which originally brought data to this GPU.
-        if (root->migration_score < coldest_root->migration_score ||
-            (root->migration_score == coldest_root->migration_score &&
-             root->resident_since_ns < coldest_root->resident_since_ns) ||
-            (root->migration_score == coldest_root->migration_score &&
-             root->resident_since_ns == coldest_root->resident_since_ns &&
-             root->access_heat < coldest_root->access_heat) ||
-            (root->migration_score == coldest_root->migration_score &&
-             root->resident_since_ns == coldest_root->resident_since_ns &&
-             root->access_heat == coldest_root->access_heat &&
-             root->last_access_epoch < coldest_root->last_access_epoch)) {
-            coldest = entry;
-        }
-    }
-
-    // Observation never changes the baseline ranking above. Record the
-    // sampled physical state of the victim that baseline selection chose.
-    if (coldest) {
-        uvm_vab_snapshot_t snapshot;
-        uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, coldest);
-        uvm_vab_region_state_t state;
-
-        uvm_gpu_vab_get_snapshot(uvm_pmm_to_gpu(pmm)->parent, &snapshot);
-        state = uvm_vab_classify(&snapshot, coldest->address, UVM_CHUNK_SIZE_MAX,
-                                 root->resident_since_ns);
-        if (state == UVM_VAB_REGION_COLD)
-            ++pmm->vab_stats.selected_cold;
-        else if (state == UVM_VAB_REGION_HOT)
-            ++pmm->vab_stats.selected_hot;
-        else
-            ++pmm->vab_stats.selected_unknown;
-    }
-
-    return coldest;
+    bool protected, other_protected;
+    if (!other)
+        return true;
+    protected = uvm_perf_migration_aware_eviction_enable && now < root->protected_until_ns;
+    other_protected = uvm_perf_migration_aware_eviction_enable && now < other->protected_until_ns;
+    if (protected != other_protected)
+        return !protected;
+    if (protected && root->protected_until_ns != other->protected_until_ns)
+        return root->protected_until_ns < other->protected_until_ns;
+    return root->migration_score < other->migration_score ||
+           (root->migration_score == other->migration_score && root->resident_since_ns < other->resident_since_ns) ||
+           (root->migration_score == other->migration_score && root->resident_since_ns == other->resident_since_ns && root->access_heat < other->access_heat) ||
+           (root->migration_score == other->migration_score && root->resident_since_ns == other->resident_since_ns && root->access_heat == other->access_heat && root->last_access_epoch < other->last_access_epoch);
 }
 
-static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
+static uvm_vab_region_state_t vab_root_state(uvm_gpu_root_chunk_t *root, const uvm_vab_snapshot_t *snapshot)
+{
+    if (snapshot->eviction_enabled) {
+        if (root->chunk.state != UVM_PMM_GPU_CHUNK_STATE_ALLOCATED ||
+            !root->chunk.va_block || !root->vab_ready_ns ||
+            root->vab_ready_generation != root->vab_generation)
+            return UVM_VAB_REGION_UNKNOWN;
+        return uvm_vab_classify(snapshot, root->chunk.address, UVM_CHUNK_SIZE_MAX, root->vab_ready_ns);
+    }
+    return uvm_vab_classify(snapshot, root->chunk.address, UVM_CHUNK_SIZE_MAX, root->resident_since_ns);
+}
+
+static uvm_gpu_chunk_t *vab_pick_allocated(uvm_pmm_gpu_t *pmm,
+                                          const uvm_vab_snapshot_t *snapshot,
+                                          bool cold_only)
+{
+    uvm_gpu_root_chunk_t *baseline = NULL, *cold = NULL, *selected;
+    uvm_gpu_chunk_t *entry;
+    uvm_pmm_alloc_list_t list;
+    NvU64 now = NV_GETTIME();
+    uvm_vab_region_state_t state;
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+    for (list = 0; list < UVM_PMM_ALLOC_LIST_USED; ++list) {
+        entry = list_first_chunk(&pmm->root_chunks.alloc_list[list]);
+        if (entry)
+            return entry;
+    }
+    list_for_each_entry(entry, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
+        uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, entry);
+        if (vab_candidate_better(root, baseline, now))
+            baseline = root;
+        if (snapshot->eviction_enabled &&
+            (!uvm_perf_migration_aware_eviction_enable || now >= root->protected_until_ns) &&
+            vab_root_state(root, snapshot) == UVM_VAB_REGION_COLD &&
+            vab_candidate_better(root, cold, now))
+            cold = root;
+    }
+    if (cold_only && !cold)
+        return NULL;
+    selected = snapshot->eviction_enabled && cold ? cold : baseline;
+    if (!selected)
+        return NULL;
+    if (snapshot->eviction_enabled) {
+        if (selected != baseline)
+            ++pmm->vab_stats.selection_changes;
+        if (!cold)
+            ++pmm->vab_stats.selection_fallbacks;
+    }
+    state = vab_root_state(selected, snapshot);
+    if (state == UVM_VAB_REGION_COLD)
+        ++pmm->vab_stats.selected_cold;
+    else if (state == UVM_VAB_REGION_HOT)
+        ++pmm->vab_stats.selected_hot;
+    else
+        ++pmm->vab_stats.selected_unknown;
+    return &selected->chunk;
+}
+
+static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
+{
+    uvm_vab_snapshot_t snapshot;
+    uvm_gpu_vab_get_snapshot(uvm_pmm_to_gpu(pmm)->parent, &snapshot);
+    return vab_pick_allocated(pmm, &snapshot, false);
+}
+
+static uvm_gpu_root_chunk_t *vab_pick_root(uvm_pmm_gpu_t *pmm, const uvm_vab_snapshot_t *snapshot, bool cold_only)
 {
     uvm_gpu_chunk_t *chunk;
 
@@ -1664,7 +1671,7 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
     // TODO: Bug 1765193: Move the chunks to the tail of the used list whenever
     // they get mapped.
     if (!chunk)
-        chunk = get_first_allocated_chunk(pmm);
+        chunk = snapshot ? vab_pick_allocated(pmm, snapshot, cold_only) : get_first_allocated_chunk(pmm);
 
     if (chunk)
         chunk_start_eviction(pmm, chunk);
@@ -1675,6 +1682,11 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
         return root_chunk_from_chunk(pmm, chunk);
 
     return NULL;
+}
+
+static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
+{
+    return vab_pick_root(pmm, NULL, false);
 }
 
 static NV_STATUS pick_and_evict_root_chunk(uvm_pmm_gpu_t *pmm,
@@ -1896,10 +1908,15 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force, uvm_gpu_root_chun
 {
     NV_STATUS status;
     uvm_gpu_root_chunk_t *root_chunk;
+    uvm_vab_snapshot_t snapshot;
+    bool cold_only;
+
+    uvm_gpu_vab_get_snapshot(uvm_pmm_to_gpu(pmm)->parent, &snapshot);
+    cold_only = !force && snapshot.eviction_enabled && snapshot.valid && snapshot.linear_base != ~0ULL;
 
     uvm_mutex_lock(&pmm->lock);
 
-    if (!force) {
+    if (!force && !cold_only) {
         bool has_candidate;
 
         uvm_spin_lock(&pmm->list_lock);
@@ -1912,7 +1929,7 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force, uvm_gpu_root_chun
         }
     }
 
-    root_chunk = pick_root_chunk_to_evict(pmm);
+    root_chunk = vab_pick_root(pmm, &snapshot, cold_only);
     if (!root_chunk) {
         uvm_mutex_unlock(&pmm->lock);
         return false;
@@ -1969,7 +1986,55 @@ static unsigned eager_eviction_batch(uvm_pmm_gpu_t *pmm, bool force, unsigned li
     return submitted;
 }
 
-static void eager_eviction_work(struct work_struct *work)
+static void vab_prepare_roots(uvm_pmm_gpu_t *pmm)
+{
+    uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
+    unsigned budget = min_t(size_t, 1024, pmm->root_chunks.count);
+    NvU64 now = NV_GETTIME();
+
+    if (!uvm_gpu_vab_eviction_requested(gpu->parent) || now < pmm->vab_scan_next_ns)
+        return;
+    if (!uvm_down_read_trylock(&g_uvm_global.pm.lock))
+        return;
+    pmm->vab_scan_next_ns = now + 25ULL * NSEC_PER_MSEC;
+    while (budget-- && pmm->root_chunks.count) {
+        size_t index = pmm->vab_scan_cursor++ % pmm->root_chunks.count;
+        uvm_gpu_root_chunk_t *root = &pmm->root_chunks.array[index];
+        uvm_va_block_t *block = NULL;
+        NvU64 generation = 0;
+        bool complete;
+
+        uvm_spin_lock(&pmm->list_lock);
+        if (root->chunk.state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED &&
+            uvm_gpu_chunk_is_user(&root->chunk) && !chunk_is_in_eviction(pmm, &root->chunk) &&
+            root->chunk.va_block && !root->vab_ready_ns) {
+            block = root->chunk.va_block;
+            generation = root->vab_generation;
+            uvm_va_block_retain(block);
+        }
+        uvm_spin_unlock(&pmm->list_lock);
+        if (!block)
+            continue;
+        if (uvm_mutex_trylock(&block->lock)) {
+            complete = !uvm_va_block_is_hmm(block) && uvm_tracker_query(&block->tracker) == NV_OK;
+            uvm_spin_lock(&pmm->list_lock);
+            if (complete && generation && root->vab_generation == generation &&
+                root->chunk.state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED &&
+                root->chunk.va_block == block && !chunk_is_in_eviction(pmm, &root->chunk)) {
+                root->vab_ready_generation = generation;
+                root->vab_ready_ns = NV_GETTIME();
+            }
+            else if (!complete)
+                ++pmm->vab_stats.readiness_pending;
+            uvm_spin_unlock(&pmm->list_lock);
+            uvm_mutex_unlock(&block->lock);
+        }
+        uvm_va_block_release(block);
+    }
+    uvm_up_read(&g_uvm_global.pm.lock);
+}
+
+static void eager_eviction_work_impl(struct work_struct *work)
 {
     uvm_pmm_gpu_t *pmm = container_of(to_delayed_work(work), uvm_pmm_gpu_t, eager_eviction.work);
     unsigned usage;
@@ -1982,8 +2047,14 @@ static void eager_eviction_work(struct work_struct *work)
     NvU64 now;
     bool recovering;
 
-    if (!eager_eviction_supported(pmm) || READ_ONCE(pmm->eager_eviction.stopping))
+    if (READ_ONCE(pmm->eager_eviction.stopping))
         return;
+
+    vab_prepare_roots(pmm);
+    if (!eager_eviction_supported(pmm)) {
+        eager_eviction_schedule(pmm, delay);
+        return;
+    }
 
     // Exponential decay makes the ordering responsive to phase changes and
     // naturally turns regions with no new notifications into cold candidates.
@@ -2051,15 +2122,27 @@ reschedule:
     eager_eviction_schedule(pmm, delay);
 }
 
+static void eager_eviction_work(struct work_struct *work)
+{
+    UVM_ENTRY_VOID(eager_eviction_work_impl(work));
+}
+
 static void eager_eviction_schedule(uvm_pmm_gpu_t *pmm, unsigned long delay)
 {
-    if (!eager_eviction_supported(pmm) || READ_ONCE(pmm->eager_eviction.stopping))
+    if ((!eager_eviction_supported(pmm) &&
+         !uvm_gpu_vab_eviction_requested(uvm_pmm_to_gpu(pmm)->parent)) ||
+        READ_ONCE(pmm->eager_eviction.stopping))
         return;
 
     // Do not postpone an already-pending aging pass when accesses are
     // frequent. A zero-delay kick therefore runs now or leaves the existing
     // (at most one interval old) pass in place.
     schedule_delayed_work(&pmm->eager_eviction.work, delay);
+}
+
+void uvm_pmm_gpu_vab_kick(uvm_pmm_gpu_t *pmm)
+{
+    eager_eviction_schedule(pmm, 0);
 }
 
 void uvm_pmm_gpu_mark_chunk_accessed(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, NvU32 counter_value)
@@ -2111,6 +2194,21 @@ static void migration_history_decay(uvm_va_block_gpu_state_t *gpu_state, NvU64 n
         gpu_state->eviction_history.recent_pcie_bytes >>= shifts;
 
     gpu_state->eviction_history.last_score_update_ns += shifts * decay_ns;
+}
+
+void uvm_pmm_gpu_vab_invalidate_block(uvm_va_block_t *block, uvm_gpu_t *gpu)
+{
+    uvm_gpu_chunk_t *chunk;
+
+    uvm_assert_mutex_locked(&block->lock);
+    if (uvm_va_block_is_hmm(block) || uvm_va_block_size(block) != UVM_CHUNK_SIZE_MAX)
+        return;
+    chunk = uvm_va_block_lookup_gpu_chunk(block, gpu, block->start);
+    if (!chunk || chunk->parent)
+        return;
+    uvm_spin_lock(&gpu->pmm.list_lock);
+    vab_root_changed(root_chunk_from_chunk(&gpu->pmm, chunk));
+    uvm_spin_unlock(&gpu->pmm.list_lock);
 }
 
 void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
@@ -2292,6 +2390,7 @@ static uvm_gpu_chunk_t *claim_free_chunk(uvm_pmm_gpu_t *pmm, uvm_pmm_gpu_memory_
     if (chunk_is_root_chunk(chunk)) {
         uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, chunk);
 
+        vab_root_changed(root);
         root->access_heat = 0;
         root->last_access_epoch = pmm->eager_eviction.epoch;
         root->migration_score = 0;
@@ -2537,6 +2636,7 @@ static void init_root_chunk(uvm_pmm_gpu_t *pmm,
     chunk->type = type;
     chunk->state = initial_state;
     chunk->is_zero = is_zero;
+    vab_root_changed(root_chunk);
     root_chunk->access_heat = 0;
     root_chunk->last_access_epoch = pmm->eager_eviction.epoch;
     root_chunk->migration_score = 0;
@@ -3646,11 +3746,12 @@ void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
     stats->used_cold = 0;
     stats->used_hot = 0;
     stats->used_unknown = 0;
+    stats->eligible_roots = 0;
     list_for_each_entry(entry, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
         uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, entry);
-        uvm_vab_region_state_t state = uvm_vab_classify(snapshot, entry->address,
-                                                       UVM_CHUNK_SIZE_MAX,
-                                                       root->resident_since_ns);
+        uvm_vab_region_state_t state = vab_root_state(root, snapshot);
+        if (snapshot->eviction_enabled && state != UVM_VAB_REGION_UNKNOWN)
+            ++stats->eligible_roots;
         if (state == UVM_VAB_REGION_COLD)
             ++stats->used_cold;
         else if (state == UVM_VAB_REGION_HOT)
@@ -3674,6 +3775,8 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     size_t i, j, k;
 
     memset(&pmm->vab_stats, 0, sizeof(pmm->vab_stats));
+    pmm->vab_scan_cursor = 0;
+    pmm->vab_scan_next_ns = 0;
 
     // UVM_CHUNK_SIZE_INVALID is UVM_CHUNK_SIZE_MAX shifted left by 1. This
     // protects UVM_CHUNK_SIZE_INVALID from being negative

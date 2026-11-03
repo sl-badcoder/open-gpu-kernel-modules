@@ -2020,6 +2020,8 @@ void uvm_gpu_vab_start(uvm_parent_gpu_t *parent_gpu);
 void uvm_gpu_vab_stop(uvm_parent_gpu_t *parent_gpu);
 void uvm_gpu_vab_invalidate(uvm_parent_gpu_t *parent_gpu);
 void uvm_gpu_vab_get_snapshot(uvm_parent_gpu_t *parent_gpu, uvm_vab_snapshot_t *snapshot);
+bool uvm_gpu_vab_eviction_requested(uvm_parent_gpu_t *parent_gpu);
+void uvm_gpu_vab_kick_readiness(uvm_parent_gpu_t *parent_gpu);
 NV_STATUS uvm_gpu_vab_test_dump(uvm_parent_gpu_t *parent_gpu,
                                 UVM_ACCESS_BITS_DUMP_MODE mode,
                                 UvmGpuAccessBitsBufferAlloc *snapshot);

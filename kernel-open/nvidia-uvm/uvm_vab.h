@@ -19,6 +19,7 @@ typedef struct {
     NvU64 linear_base;
     NvU32 granularity;
     bool valid;
+    bool eviction_enabled;
 } uvm_vab_snapshot_t;
 
 static inline bool uvm_vab_sample_fresh(NvU64 now, NvU64 sampled, NvU64 max_age)
@@ -26,11 +27,9 @@ static inline bool uvm_vab_sample_fresh(NvU64 now, NvU64 sampled, NvU64 max_age)
     return sampled != 0 && now >= sampled && now - sampled <= max_age;
 }
 
-// This describes a physical range at sample time, not the recency of its
-// current contents. The legacy residency timestamp only covers known MOVE
-// arrivals; COPY/read duplication and disabled migration history can leave it
-// zero or older. Complete arrival tracking is required before using this
-// observation as a VAB-driven eviction decision.
+// Classify bits at sample time. Observation passes legacy migration history;
+// eviction passes the dedicated completion/readiness boundary after validating
+// the root's ownership generation. Neither mode guesses hardware reset timing.
 static inline uvm_vab_region_state_t uvm_vab_classify(const uvm_vab_snapshot_t *snapshot,
                                                        NvU64 address,
                                                        NvU64 size,
