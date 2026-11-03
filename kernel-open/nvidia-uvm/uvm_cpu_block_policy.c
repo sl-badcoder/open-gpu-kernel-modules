@@ -1,0 +1,567 @@
+/*******************************************************************************
+    Copyright (c) 2026 NVIDIA Corporation
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to
+    deal in the Software without restriction, including without limitation the
+    rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+    sell copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+        The above copyright notice and this permission notice shall be
+        included in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+*******************************************************************************/
+
+#include "uvm_cpu_block_policy.h"
+#include "uvm_global.h"
+#include "uvm_gpu.h"
+#include "uvm_linux.h"
+#include "uvm_perf_thrashing.h"
+#include "uvm_va_block.h"
+#include "uvm_va_range.h"
+#include "uvm_va_space.h"
+
+static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
+static unsigned uvm_cpu_preferred_block_promotion_enable __read_mostly = 1;
+static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly = 8;
+static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_prefetch_retries = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_prefetched_bytes = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
+
+static int promotion_count_get(char *buffer, const struct kernel_param *kp)
+{
+    (void)kp;
+
+    return scnprintf(buffer,
+                     PAGE_SIZE,
+                     "%lld\n",
+                     (long long)atomic64_read(&uvm_cpu_preferred_block_promotions));
+}
+
+static const struct kernel_param_ops promotion_count_ops = {
+    .get = promotion_count_get,
+};
+
+static int atomic64_count_get(char *buffer, const struct kernel_param *kp)
+{
+    atomic64_t *counter = kp->arg;
+
+    return scnprintf(buffer, PAGE_SIZE, "%lld\n", (long long)atomic64_read(counter));
+}
+
+static const struct kernel_param_ops atomic64_count_ops = {
+    .get = atomic64_count_get,
+};
+
+/**
+ * Introduced module params + description
+ * Define new module params here
+ */
+module_param(uvm_cpu_preferred_blocks_enable, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_blocks_enable, "Keep managed allocations CPU-preferred and enable access-counter-guided migration policy.");
+module_param(uvm_cpu_preferred_block_promotion_enable, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_cpu_preferred_block_promotion_enable, "Promote complete populated 2MB VA blocks on GPU access-counter notifications. " "Zero leaves speculative prefetch enabled without block promotion.");
+module_param(uvm_cpu_preferred_prefetch_chunk_mb, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_chunk_mb, "Access-counter-guided prefetch chunk size in MiB. Non-zero values are rounded up to 2MB; " "zero disables speculative chunk prefetch.");
+module_param_cb(uvm_cpu_preferred_block_promotions, &promotion_count_ops, NULL, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_block_promotions, "Number of successful access-counter VA-block promotion service operations.");
+module_param_cb(uvm_cpu_preferred_range_prefetches, &atomic64_count_ops, &uvm_cpu_preferred_range_prefetches,S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_range_prefetches,"Number of access-counter-guided managed allocation chunk prefetches started.");
+module_param_cb(uvm_cpu_preferred_prefetch_retries, &atomic64_count_ops, &uvm_cpu_preferred_prefetch_retries, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_retries, "Number of capacity-stopped managed allocation prefetches retried.");
+module_param_cb(uvm_cpu_preferred_prefetched_bytes, &atomic64_count_ops, &uvm_cpu_preferred_prefetched_bytes, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetched_bytes, "Number of bytes moved by access-counter-guided managed allocation chunk prefetches.");
+module_param_cb(uvm_cpu_preferred_prefetch_capacity_stops, &atomic64_count_ops, &uvm_cpu_preferred_prefetch_capacity_stops, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_capacity_stops, "Number of managed allocation prefetches stopped when free VRAM was exhausted.");
+
+
+// check if block policy is enabled
+bool uvm_cpu_block_policy_enabled(void)
+{
+    return uvm_cpu_preferred_blocks_enable != 0;
+}
+
+// check if gpu is supported
+static bool gpu_supported(uvm_va_space_t *va_space, uvm_gpu_t *gpu)
+{
+    if (!gpu || !gpu->parent->access_counters_supported || gpu->parent->is_integrated_gpu)
+        return false;
+
+    return uvm_processor_mask_test(&va_space->accessible_from[uvm_id_value(UVM_ID_CPU)], gpu->id);
+}
+
+
+void uvm_cpu_block_policy_init_range(uvm_va_range_managed_t *managed_range)
+{
+    uvm_va_space_t *va_space = managed_range->va_range.va_space;
+    uvm_gpu_t *gpu;
+
+    uvm_assert_rwsem_locked_write(&va_space->lock);
+    uvm_spin_lock_init(&managed_range->cpu_prefetch_lock, UVM_LOCK_ORDER_LEAF);
+
+    if (!uvm_cpu_block_policy_enabled() || g_uvm_global.conf_computing_enabled)
+        return;
+
+    managed_range->cpu_access_counter_policy = true;
+    managed_range->policy.preferred_location = UVM_ID_CPU;
+    managed_range->policy.preferred_nid = NUMA_NO_NODE;
+
+    for_each_va_space_gpu(gpu, va_space) {
+        if (gpu_supported(va_space, gpu))
+            uvm_processor_mask_set(&managed_range->policy.accessed_by, gpu->id);
+    }
+}
+
+bool uvm_cpu_block_policy_should_add_accessed_by(uvm_va_range_managed_t *managed_range,
+                                                uvm_gpu_t *gpu)
+{
+    uvm_va_space_t *va_space = managed_range->va_range.va_space;
+    uvm_va_block_t *va_block;
+
+    uvm_assert_rwsem_locked_write(&va_space->lock);
+
+    if (!managed_range->cpu_access_counter_policy ||
+        !UVM_ID_IS_CPU(managed_range->policy.preferred_location) ||
+        !gpu_supported(va_space, gpu)) {
+        return false;
+    }
+
+    // A GPU may be unregistered and registered again in the same VA space.
+    // Permit the newly registered instance to trigger each block again.
+    for_each_va_block_in_va_range(managed_range, va_block) {
+        uvm_processor_mask_clear_atomic(&va_block->gpu_prefetch_started, gpu->id);
+        uvm_processor_mask_clear_atomic(&va_block->gpu_prefetch_retry, gpu->id);
+    }
+
+    uvm_processor_mask_set(&managed_range->policy.accessed_by, gpu->id);
+    return true;
+}
+
+bool uvm_cpu_block_policy_should_service_4k(uvm_va_range_managed_t *managed_range,
+                                           uvm_gpu_t *gpu)
+{
+    uvm_va_space_t *va_space = managed_range->va_range.va_space;
+
+    uvm_assert_rwsem_locked(&va_space->lock);
+
+    return managed_range->cpu_access_counter_policy &&
+           UVM_ID_IS_CPU(managed_range->policy.preferred_location) &&
+           gpu_supported(va_space, gpu) &&
+           uvm_processor_mask_test(&managed_range->policy.accessed_by, gpu->id);
+}
+
+bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+{
+    uvm_va_range_managed_t *managed_range;
+
+    if (!READ_ONCE(uvm_cpu_preferred_block_promotion_enable) ||
+        !gpu ||
+        uvm_va_block_is_hmm(va_block)) {
+        return false;
+    }
+
+    uvm_assert_mutex_locked(&va_block->lock);
+    managed_range = va_block->managed_range;
+    if (!managed_range || !managed_range->cpu_access_counter_policy)
+        return false;
+
+    return uvm_cpu_block_policy_should_service_4k(managed_range, gpu);
+}
+
+static bool should_handle_gpu_signal(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+{
+    uvm_va_range_managed_t *managed_range;
+
+    if (!gpu || uvm_va_block_is_hmm(va_block))
+        return false;
+
+    managed_range = va_block->managed_range;
+
+    return managed_range &&
+           managed_range->cpu_access_counter_policy &&
+           UVM_ID_IS_CPU(managed_range->policy.preferred_location) &&
+           gpu_supported(managed_range->va_range.va_space, gpu);
+}
+
+bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+{
+    return READ_ONCE(uvm_cpu_preferred_block_promotion_enable) &&
+           should_handle_gpu_signal(va_block, gpu);
+}
+
+static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
+                                uvm_gpu_t *gpu,
+                                struct mm_struct *mm,
+                                uvm_va_block_context_t *block_context,
+                                uvm_tracker_t *prefetch_tracker,
+                                NvU64 *prefetched_bytes,
+                                bool *capacity_stop)
+{
+    NV_STATUS status;
+    uvm_va_block_retry_t retry;
+    uvm_page_mask_t prefetch_mask;
+    const uvm_page_mask_t *cpu_resident;
+    const uvm_page_mask_t *gpu_resident;
+    const uvm_page_mask_t *thrashing_pages;
+
+    *capacity_stop = false;
+    uvm_mutex_lock(&va_block->lock);
+
+    cpu_resident = uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, NUMA_NO_NODE);
+    if (!cpu_resident) {
+        status = NV_OK;
+        goto out_unlock;
+    }
+
+    uvm_page_mask_copy(&prefetch_mask, cpu_resident);
+
+    gpu_resident = uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE);
+    if (gpu_resident)
+        uvm_page_mask_andnot(&prefetch_mask, &prefetch_mask, gpu_resident);
+
+    // Do not speculatively move pages which UVM's thrashing policy is
+    // currently protecting from migration.
+    thrashing_pages = uvm_perf_thrashing_get_thrashing_pages(va_block);
+    if (thrashing_pages)
+        uvm_page_mask_andnot(&prefetch_mask, &prefetch_mask, thrashing_pages);
+
+    if (uvm_page_mask_empty(&prefetch_mask)) {
+        status = NV_OK;
+        goto out_unlock;
+    }
+
+    uvm_va_block_context_init(block_context, mm);
+    uvm_page_mask_zero(&block_context->make_resident.pages_changed_residency);
+    uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
+
+    uvm_va_block_retry_init(&retry);
+    retry.allow_eviction = false;
+
+    status = uvm_va_block_make_resident(va_block,
+                                        &retry,
+                                        block_context,
+                                        gpu->id,
+                                        uvm_va_block_region_from_block(va_block),
+                                        &prefetch_mask,
+                                        NULL,
+                                        UVM_MAKE_RESIDENT_CAUSE_PREFETCH);
+
+    if (status == NV_OK) {
+        *prefetched_bytes +=
+            (NvU64)uvm_page_mask_weight(&block_context->make_resident.pages_changed_residency) * PAGE_SIZE;
+
+        // make_resident updates physical residency but does not install a
+        // destination GPU PTE. Map the prefetched pages locally now so their
+        // first use does not fall back to an AccessedBy system-memory mapping.
+        do {
+            status = uvm_va_block_map(va_block,
+                                      block_context,
+                                      gpu->id,
+                                      uvm_va_block_region_from_block(va_block),
+                                      &prefetch_mask,
+                                      UVM_PROT_READ_WRITE_ATOMIC,
+                                      UvmEventMapRemoteCauseInvalid,
+                                      &va_block->tracker);
+        } while (status == NV_ERR_MORE_PROCESSING_REQUIRED);
+    }
+    else {
+        *capacity_stop = retry.no_eviction_allocation_failed;
+    }
+
+    // Collect dependencies while the block tracker is locked, including any
+    // work submitted before an error. The chunk waits once after submission.
+    {
+        NV_STATUS tracker_status = uvm_tracker_add_tracker_safe(prefetch_tracker, &va_block->tracker);
+        if (status == NV_OK)
+            status = tracker_status;
+    }
+
+    uvm_mutex_unlock(&va_block->lock);
+    uvm_va_block_retry_deinit(&retry, va_block);
+    return status;
+
+out_unlock:
+    uvm_mutex_unlock(&va_block->lock);
+    return status;
+}
+
+typedef struct
+{
+    size_t first;
+    size_t outer;
+} prefetch_coverage_t;
+
+// Snapshot older in-flight windows before advertising this one. This gives
+// concurrent calls an acyclic ownership order: a call only skips older work.
+// When all slots are occupied, continue without publishing another window.
+static int prefetch_window_begin(uvm_va_range_managed_t *managed_range,
+                                  uvm_gpu_t *gpu,
+                                  uvm_va_block_t *trigger_block,
+                                  size_t first,
+                                  size_t outer,
+                                  prefetch_coverage_t *coverage,
+                                  unsigned *coverage_count)
+{
+    unsigned i;
+    int slot = -1;
+
+    *coverage_count = 0;
+    uvm_spin_lock(&managed_range->cpu_prefetch_lock);
+    for (i = 0; i < ARRAY_SIZE(managed_range->cpu_prefetch_windows); ++i) {
+        if (!managed_range->cpu_prefetch_windows[i].gpu) {
+            if (slot < 0)
+                slot = i;
+            continue;
+        }
+
+        if (managed_range->cpu_prefetch_windows[i].gpu == gpu &&
+            managed_range->cpu_prefetch_windows[i].first < outer &&
+            managed_range->cpu_prefetch_windows[i].outer > first) {
+            coverage[*coverage_count].first = managed_range->cpu_prefetch_windows[i].first;
+            coverage[*coverage_count].outer = managed_range->cpu_prefetch_windows[i].outer;
+            ++*coverage_count;
+        }
+    }
+
+    // Publish the retry before older owners can remove their windows. A
+    // notification racing their completion must not see started without retry.
+    if (*coverage_count)
+        uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
+
+    if (slot >= 0) {
+        managed_range->cpu_prefetch_windows[slot].first = first;
+        managed_range->cpu_prefetch_windows[slot].outer = outer;
+        managed_range->cpu_prefetch_windows[slot].gpu = gpu;
+    }
+    uvm_spin_unlock(&managed_range->cpu_prefetch_lock);
+    return slot;
+}
+
+static bool prefetch_window_covers(const prefetch_coverage_t *coverage,
+                                   unsigned count,
+                                   size_t index)
+{
+    unsigned i;
+
+    for (i = 0; i < count; ++i) {
+        if (index >= coverage[i].first && index < coverage[i].outer)
+            return true;
+    }
+
+    return false;
+}
+
+static void prefetch_window_end(uvm_va_range_managed_t *managed_range, int slot)
+{
+    if (slot < 0)
+        return;
+
+    uvm_spin_lock(&managed_range->cpu_prefetch_lock);
+    managed_range->cpu_prefetch_windows[slot].gpu = NULL;
+    uvm_spin_unlock(&managed_range->cpu_prefetch_lock);
+}
+
+void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
+                                             uvm_gpu_t *gpu,
+                                             struct mm_struct *mm,
+                                             bool allow_neighbors)
+{
+    uvm_va_range_managed_t *managed_range = trigger_block->managed_range;
+    uvm_va_space_t *va_space;
+    uvm_va_block_context_t *block_context;
+    size_t block_count;
+    size_t chunk_block_count;
+    size_t end_index;
+    size_t start_index;
+    size_t trigger_index;
+    size_t block_index;
+    size_t candidate_index;
+    NvU64 chunk_bytes;
+    NvU64 prefetched_bytes = 0;
+    unsigned prefetch_chunk_mb = READ_ONCE(uvm_cpu_preferred_prefetch_chunk_mb);
+    bool retry = false;
+    bool capacity_stopped = false;
+    bool prefetch_admitted = false;
+    bool overlap_skipped = false;
+    prefetch_coverage_t coverage[ARRAY_SIZE(managed_range->cpu_prefetch_windows)];
+    unsigned coverage_count = 0;
+    int window_slot = -1;
+    uvm_tracker_t prefetch_tracker = UVM_TRACKER_INIT();
+
+    if (!managed_range ||
+        prefetch_chunk_mb == 0 ||
+        !should_handle_gpu_signal(trigger_block, gpu)) {
+        return;
+    }
+
+    va_space = managed_range->va_range.va_space;
+    uvm_assert_rwsem_locked_read(&va_space->lock);
+
+    if (uvm_processor_mask_test(&trigger_block->gpu_prefetch_started, gpu->id)) {
+        if (!uvm_processor_mask_test(&trigger_block->gpu_prefetch_retry, gpu->id)) {
+            return;
+        }
+
+        // Claim this retry before clearing started. This prevents concurrent
+        // GPU service threads from both turning the retry into a new attempt.
+        if (!uvm_processor_mask_test_and_clear_atomic(&trigger_block->gpu_prefetch_retry, gpu->id))
+            return;
+
+        uvm_processor_mask_clear_atomic(&trigger_block->gpu_prefetch_started, gpu->id);
+        retry = true;
+    }
+
+    block_context = uvm_va_block_context_alloc(mm);
+    if (!block_context)
+        return;
+
+    if (uvm_processor_mask_test_and_set_atomic(&trigger_block->gpu_prefetch_started, gpu->id))
+        goto out;
+
+    prefetch_admitted = false;
+
+    atomic64_inc(&uvm_cpu_preferred_range_prefetches);
+    if (retry)
+        atomic64_inc(&uvm_cpu_preferred_prefetch_retries);
+
+    block_count = uvm_va_range_num_blocks(managed_range);
+    trigger_index = uvm_va_range_block_index(managed_range, trigger_block->start);
+    chunk_bytes = (NvU64)prefetch_chunk_mb * UVM_SIZE_1MB;
+    chunk_block_count = (chunk_bytes + UVM_VA_BLOCK_SIZE - 1) / UVM_VA_BLOCK_SIZE;
+    chunk_block_count = max_t(size_t, chunk_block_count, 1);
+    chunk_block_count = min(chunk_block_count, block_count);
+    // Sparse signals retain the trigger-block session but never spend
+    // speculative bandwidth on neighboring blocks.
+    if (!allow_neighbors)
+        chunk_block_count = 1;
+    // Always retain the triggering block as a demand-adjacent migration
+    // opportunity. Sparse signals do not earn speculative neighbors, but
+    // they must not suppress the trigger itself when promotion is disabled.
+    if (!allow_neighbors)
+        chunk_block_count = 1;
+
+    // Center the configurable chunk on the 2MB block which produced the
+    // access-counter notification. Shift at allocation boundaries so a full
+    // chunk is still considered whenever the range is large enough.
+    start_index = trigger_index > chunk_block_count / 2 ?
+                      trigger_index - chunk_block_count / 2 :
+                      0;
+    if (start_index + chunk_block_count > block_count)
+        start_index = block_count - chunk_block_count;
+    end_index = start_index + chunk_block_count;
+    window_slot = prefetch_window_begin(managed_range, gpu, trigger_block, start_index, end_index, coverage, &coverage_count);
+
+    // Migrate the block which produced the notification before considering
+    // its speculative neighbors. Otherwise, walking from start_index could
+    // consume the available prefetch headroom and stop before reaching the
+    // block which actually triggered this operation.
+    for (block_index = 0; block_index < chunk_block_count; ++block_index) {
+        uvm_va_block_t *va_block;
+        NV_STATUS status;
+        bool capacity_stop;
+
+        if (block_index == 0) {
+            candidate_index = trigger_index;
+        }
+        else {
+            candidate_index = start_index + block_index - 1;
+            if (candidate_index >= trigger_index)
+                ++candidate_index;
+        }
+
+        UVM_ASSERT(candidate_index >= start_index && candidate_index < end_index);
+
+        // Older callers own these indices. Keep this trigger retryable: an
+        // older call may stop for capacity before submitting its entire window.
+        if (prefetch_window_covers(coverage, coverage_count, candidate_index)) {
+            overlap_skipped = true;
+            continue;
+        }
+
+        va_block = candidate_index == trigger_index ?
+                       trigger_block :
+                       uvm_va_range_block(managed_range, candidate_index);
+
+        // Managed pages are populated lazily. Avoid instantiating untouched VA
+        // blocks just to create speculative zero-filled backing.
+        if (!va_block)
+            continue;
+
+        status = prefetch_block(va_block,
+                                gpu,
+                                mm,
+                                block_context,
+                                &prefetch_tracker,
+                                &prefetched_bytes,
+                                &capacity_stop);
+        if (capacity_stop) {
+            atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
+            capacity_stopped = true;
+            break;
+        }
+
+        if (status != NV_OK) {
+            UVM_DBG_PRINT("Managed allocation prefetch stopped with %s on GPU %s\n",
+                          nvstatusToString(status),
+                          gpu->parent->name);
+            break;
+        }
+    }
+
+    atomic64_add(prefetched_bytes, &uvm_cpu_preferred_prefetched_bytes);
+
+    // Keep completed attempts one-shot, but re-arm capacity-stopped attempts.
+    // One subsequent signal can atomically claim the retry. Speculative
+    // allocations themselves do not evict; they stop again if capacity is
+    // still unavailable.
+    if (capacity_stopped || overlap_skipped)
+        uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
+
+out:
+    // No VA-block lock is held here. Drain all submitted work even when
+    // submission stopped for capacity or an error.
+    {
+        NV_STATUS status = uvm_tracker_wait_deinit(&prefetch_tracker);
+        if (status != NV_OK) {
+            UVM_DBG_PRINT("Managed allocation prefetch completion failed with %s on GPU %s\n",
+                          nvstatusToString(status),
+                          gpu->parent->name);
+        }
+    }
+
+    // Coverage ends after submitted copies and mappings finish. Eviction
+    // never leaves a persistent coverage cache which could suppress new demand.
+    prefetch_window_end(managed_range, window_slot);
+
+    (void)prefetch_admitted;
+
+    uvm_va_block_context_free(block_context);
+}
+
+void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+{
+    uvm_assert_mutex_locked(&va_block->lock);
+
+    // A completed prefetch is one-shot only while its trigger block remains
+    // GPU-resident. Once any part of that block is evicted to the CPU, a new
+    // remote-access notification is genuine new demand and may start another
+    // chunk prefetch. Also discard capacity-retry state: the eviction itself
+    // supplies headroom and the next notification should be a fresh attempt.
+    uvm_processor_mask_clear_atomic(&va_block->gpu_prefetch_retry, gpu->id);
+    uvm_processor_mask_clear_atomic(&va_block->gpu_prefetch_started, gpu->id);
+}
+
+void uvm_cpu_block_policy_record_promotion(void)
+{
+    atomic64_inc(&uvm_cpu_preferred_block_promotions);
+}

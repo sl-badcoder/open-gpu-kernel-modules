@@ -166,6 +166,7 @@
 #include "uvm_api.h"
 #include "uvm_gpu.h"
 #include "uvm_pmm_gpu.h"
+#include "uvm_vab.h"
 #include "uvm_mem.h"
 #include "uvm_mmu.h"
 #include "uvm_global.h"
@@ -1479,13 +1480,39 @@ static uvm_pmm_alloc_list_t get_alloc_list(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
 static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
 {
     uvm_pmm_alloc_list_t alloc_list;
+    UvmGpuAccessBitsBufferAlloc snapshot;
+    NvU64 linear_base;
 
     uvm_assert_spinlock_locked(&pmm->list_lock);
 
     for (alloc_list = 0; alloc_list < UVM_PMM_ALLOC_LIST_COUNT; alloc_list++) {
         uvm_gpu_chunk_t *chunk = list_first_chunk(&pmm->root_chunks.alloc_list[alloc_list]);
-        if (chunk)
-            return chunk;
+        uvm_gpu_chunk_t *candidate;
+
+        if (!chunk)
+            continue;
+
+        // Preserve unused/discarded priority. Within the used list prefer the
+        // oldest cold root: every covering bit must be enabled and zero. Fine VAB bits
+        // are aggregated over the root; coarse bits give all overlapping roots
+        // the same classification. Uncovered or disabled bits are unknown.
+        if (alloc_list == UVM_PMM_ALLOC_LIST_USED &&
+            uvm_gpu_vab_snapshot(uvm_pmm_to_gpu(pmm)->parent, &snapshot, &linear_base)) {
+            list_for_each_entry(candidate, &pmm->root_chunks.alloc_list[alloc_list], list) {
+                if (uvm_vab_region_cold(snapshot.currentBits,
+                                              snapshot.enabledMask,
+                                              ARRAY_SIZE(snapshot.currentBits),
+                                              snapshot.granularity,
+                                              linear_base,
+                                              candidate->address,
+                                              UVM_CHUNK_SIZE_MAX))
+                    return candidate;
+            }
+        }
+
+        // No cold root is available, or no policy applies to this list.
+        // Retain the original oldest-root fallback so hot roots never pin memory.
+        return chunk;
     }
 
     return NULL;

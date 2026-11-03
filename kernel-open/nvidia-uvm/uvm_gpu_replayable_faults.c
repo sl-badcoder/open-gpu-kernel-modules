@@ -38,6 +38,7 @@
 #include "uvm_perf_thrashing.h"
 #include "uvm_gpu_non_replayable_faults.h"
 #include "uvm_ats_faults.h"
+#include "uvm_cpu_block_policy.h"
 #include "uvm_test.h"
 
 // The documentation at the beginning of uvm_gpu_non_replayable_faults.c
@@ -1520,6 +1521,11 @@ static NV_STATUS service_fault_batch_block_locked(uvm_gpu_va_space_t *gpu_va_spa
                                                       UVM_SERVICE_OPERATION_REPLAYABLE_FAULTS,
                                                       hmm_migratable,
                                                       &read_duplicate);
+
+        if (uvm_cpu_block_policy_should_promote_on_fault(va_block, gpu)) {
+            new_residency = gpu->id;
+            read_duplicate = false;
+        }
 
         // If this is a ATS processor and the page is already resident in the
         // correct location then it should already be mapped on the CPU so handle this as a

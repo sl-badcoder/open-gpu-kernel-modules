@@ -48,6 +48,9 @@
 #include "uvm_perf_prefetch.h"
 #include "nv-kthread-q.h"
 #include <linux/mmu_notifier.h>
+#include <linux/workqueue.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include "uvm_conf_computing.h"
 
 #define UVM_PARENT_GPU_UUID_PREFIX "GPU-"
@@ -1004,6 +1007,17 @@ struct uvm_parent_gpu_struct
 
     // Access bits buffer information
     UvmGpuAccessBitsBufferAlloc vab_info;
+
+    // Dump serialization is separate from PMM locks. The cache lock is never
+    // held across an RM call or while acquiring a PMM lock.
+    struct {
+        struct mutex dump_lock;
+        spinlock_t cache_lock;
+        struct delayed_work work;
+        UvmGpuAccessBitsBufferAlloc sample;
+        NvU64 sampled_ns;
+        bool stopping;
+    } vab_eviction;
 
 #if UVM_IS_CONFIG_HMM() || defined(NV_MEMORY_DEVICE_COHERENT_PRESENT)
     uvm_pmm_gpu_devmem_t *devmem;
@@ -1986,5 +2000,15 @@ typedef enum
 int uvm_device_p2p_static_bar(uvm_parent_gpu_t *gpu);
 
 NV_STATUS uvm_test_query_egm_state(UVM_TEST_QUERY_EGM_STATE_PARAMS *params, struct file *filp);
+
+void uvm_gpu_vab_init(uvm_parent_gpu_t *parent_gpu);
+void uvm_gpu_vab_start(uvm_parent_gpu_t *parent_gpu);
+void uvm_gpu_vab_stop(uvm_parent_gpu_t *parent_gpu);
+NV_STATUS uvm_gpu_vab_dump(uvm_parent_gpu_t *parent_gpu,
+                           UVM_ACCESS_BITS_DUMP_MODE mode,
+                           UvmGpuAccessBitsBufferAlloc *snapshot);
+bool uvm_gpu_vab_snapshot(uvm_parent_gpu_t *parent_gpu,
+                           UvmGpuAccessBitsBufferAlloc *snapshot,
+                           NvU64 *linear_base);
 
 #endif // __UVM_GPU_H__
