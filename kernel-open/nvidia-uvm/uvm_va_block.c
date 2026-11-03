@@ -40,6 +40,7 @@
 #include "uvm_perf_prefetch.h"
 #include "uvm_mem.h"
 #include "uvm_gpu_access_counters.h"
+#include "uvm_cpu_block_policy.h"
 #include "uvm_va_space_mm.h"
 #include "uvm_test_ioctl.h"
 #include "uvm_va_policy.h"
@@ -173,6 +174,8 @@ void uvm_va_block_retry_init(uvm_va_block_retry_t *retry)
         return;
 
     uvm_tracker_init(&retry->tracker);
+    retry->allow_eviction = true;
+    retry->no_eviction_allocation_failed = false;
     INIT_LIST_HEAD(&retry->used_chunks);
     INIT_LIST_HEAD(&retry->free_chunks);
 }
@@ -1972,6 +1975,11 @@ static NV_STATUS block_alloc_gpu_chunk(uvm_va_block_t *block,
         }
 
         if (status == NV_ERR_NO_MEMORY) {
+            if (!retry->allow_eviction) {
+                retry->no_eviction_allocation_failed = true;
+                return status;
+            }
+
             // If that fails with no memory, try allocating with eviction and
             // return back to the caller immediately so that the operation can
             // be restarted.
@@ -4153,6 +4161,13 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
                                                     &block_context->make_resident);
             }
 
+            uvm_pmm_gpu_record_migration(block,
+                                         dst_id,
+                                         src_id,
+                                         uvm_va_block_region_start(block, contig_region),
+                                         uvm_va_block_region_size(contig_region),
+                                         transfer_mode);
+
             contig_start_index = page_index;
             contig_cause = page_cause;
         }
@@ -4201,6 +4216,13 @@ static NV_STATUS block_copy_resident_pages_between(uvm_va_block_t *block,
                                                 contig_cause,
                                                 &block_context->make_resident);
         }
+
+        uvm_pmm_gpu_record_migration(block,
+                                     dst_id,
+                                     src_id,
+                                     uvm_va_block_region_start(block, contig_region),
+                                     uvm_va_block_region_size(contig_region),
+                                     transfer_mode);
 
         if (block_copy_should_use_push(block, &copy_state) && copying_gpu)
             status = block_copy_end_push(block, &copy_state, copy_tracker, status, &push);
@@ -4833,8 +4855,12 @@ NV_STATUS uvm_va_block_make_resident_copy(uvm_va_block_t *va_block,
 retry_no_p2p:
 
     status = block_populate_pages(va_block, va_block_retry, va_block_context, dest_id, region, page_mask, p2p_mode);
-    if (status != NV_OK)
+    if (status != NV_OK) {
+        if (UVM_ID_IS_GPU(dest_id) && va_block_retry && !va_block_retry->allow_eviction)
+            block_cleanup_temp_pinned_gpu_chunks(va_block, dest_id);
+
         goto out;
+    }
 
     status = block_copy_resident_pages(va_block,
                                        va_block_context,
@@ -12997,6 +13023,7 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     uvm_va_space_t *va_space = uvm_va_block_get_va_space_maybe_dead(va_block);
     struct mm_struct *mm;
     bool accessed_by_set = false;
+    bool pages_evicted;
 
     uvm_assert_mutex_locked(&va_block->lock);
 
@@ -13075,6 +13102,7 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                      &va_block->discarded_pages,
                      uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE));
     uvm_page_mask_and(pages_to_evict, pages_to_evict, &block_context->scratch_page_mask);
+    pages_evicted = !uvm_page_mask_empty(pages_to_evict);
     uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
 
     if (uvm_va_block_is_hmm(va_block)) {
@@ -13114,6 +13142,9 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     }
     if (status != NV_OK)
         goto out;
+
+    if (pages_evicted)
+        uvm_cpu_block_policy_rearm_on_eviction(va_block, gpu);
 
     // VA space lock may not be held and hence we cannot reestablish any
     // mappings here and need to defer it to a work queue.

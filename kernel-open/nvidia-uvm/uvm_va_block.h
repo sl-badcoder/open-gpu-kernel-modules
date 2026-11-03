@@ -221,6 +221,18 @@ typedef struct
 
     // Set of pages using EGM mappings.
     uvm_page_mask_t egm_pages;
+
+    // Migration history used by the GPU PMM eviction policy. Unlike the
+    // physical root-chunk score, this state follows the logical VA block when
+    // its backing storage moves between CPU memory and this GPU.
+    struct
+    {
+        NvU64 last_gpu_to_cpu_ns;
+        NvU64 last_score_update_ns;
+        NvU64 recent_pcie_bytes;
+        NvU32 score;
+        NvU32 quick_return_count;
+    } eviction_history;
 } uvm_va_block_gpu_state_t;
 
 typedef struct
@@ -320,6 +332,19 @@ struct uvm_va_block_struct
     // resident. This is used when determining whether GPU chunks need to
     // zeroed.
     uvm_processor_mask_t ever_fully_resident;
+
+    // GPUs for which this 2MB VA block has triggered an access-counter-guided
+    // prefetch chunk since it was last evicted. Bits are updated atomically
+    // since GPU service threads may run concurrently under the VA space read
+    // lock.
+    uvm_processor_mask_t gpu_prefetch_started;
+
+    // GPUs for which the access-counter-guided prefetch chunk stopped because
+    // there was not enough GPU memory. A subsequent signal may claim the retry
+    // after eager eviction has lowered GPU memory usage below its high
+    // watermark. Bits are updated atomically for the same reason as
+    // gpu_prefetch_started.
+    uvm_processor_mask_t gpu_prefetch_retry;
 
     // Per-processor mapping bit vector, used for fast lookup of which
     // processors are active in this block.
@@ -590,6 +615,16 @@ struct uvm_va_block_retry_struct
 {
     // A tracker used for all allocations from PMM.
     uvm_tracker_t tracker;
+
+    // Whether a failed GPU allocation may evict existing GPU memory and retry.
+    // Opportunistic prefetching disables eviction so that it only consumes
+    // currently available VRAM.
+    bool allow_eviction;
+
+    // Set when an allocation failed specifically because eviction was
+    // disabled. This distinguishes a capacity stop from unrelated allocation
+    // failures which also return NV_ERR_NO_MEMORY.
+    bool no_eviction_allocation_failed;
 
     // List of allocated chunks (uvm_gpu_chunk_t). Currently all chunks are of
     // the same size. However it can contain chunks from multiple GPUs. All

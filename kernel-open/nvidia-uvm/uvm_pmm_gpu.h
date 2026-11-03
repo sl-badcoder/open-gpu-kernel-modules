@@ -317,6 +317,21 @@ typedef struct uvm_gpu_root_chunk_struct
 {
     uvm_gpu_chunk_t chunk;
 
+    // Decaying access-counter heat used to order user-memory eviction.
+    //
+    // Protected by the owning PMM's list_lock. The score is updated from
+    // access-counter servicing and aged by the eager eviction worker.
+    NvU64 access_heat;
+    NvU64 last_access_epoch;
+
+    // Snapshot of the logical VA-block migration history for data currently
+    // backed by this physical root. These fields are reset whenever the root
+    // is initialized for reuse.
+    NvU32 migration_score;
+    NvU64 migration_score_update_ns;
+    NvU64 resident_since_ns;
+    NvU64 protected_until_ns;
+
     // Pending operations for all GPU chunks under the root chunk.
     //
     // Protected by the corresponding root chunk bit lock.
@@ -390,6 +405,23 @@ typedef struct uvm_pmm_gpu_struct
     // Inject an error after evicting a number of chunks. 0 means no error left
     // to be injected.
     NvU32 inject_pma_evict_error_after_num_chunks;
+
+    struct
+    {
+        // Periodically ages access heat and proactively evicts cold user
+        // memory. The worker uses the existing VA-block eviction path, so VA
+        // mappings and migration bookkeeping remain unchanged.
+        struct delayed_work work;
+        NvU64 epoch;
+        // Protected by list_lock. Recovery kicks do not accelerate heat decay.
+        NvU64 next_aging_ns;
+        // Protected by list_lock. Prefetch admissions and worker eviction
+        // batches are mutually exclusive; recovery persists down to low.
+        unsigned prefetch_count;
+        bool active;
+        bool recovering_watermark;
+        bool stopping;
+    } eager_eviction;
 
     // The mask of the initialized chunk sizes
     DECLARE_BITMAP(chunk_split_cache_initialized, UVM_PMM_CHUNK_SPLIT_CACHE_SIZES);
@@ -588,6 +620,31 @@ void uvm_pmm_gpu_mark_root_chunk_unused(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chu
 
 // Mark an allocated chunk as discarded
 void uvm_pmm_gpu_mark_root_chunk_discarded(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
+
+// Add an access-counter sample to the root chunk backing chunk and request an
+// eager policy pass. chunk may be NULL when a notification did not result in
+// GPU residency.
+void uvm_pmm_gpu_mark_chunk_accessed(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, NvU32 counter_value);
+
+// Record a CPU <-> GPU move for migration-aware eviction. The VA block lock
+// must be held. History is retained in the logical {VA block, GPU} state while
+// the current score is copied to any physical roots backing an arrival.
+void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
+                                  uvm_processor_id_t dst_id,
+                                  uvm_processor_id_t src_id,
+                                  NvU64 address,
+                                  NvU64 bytes,
+                                  uvm_va_block_transfer_mode_t transfer_mode);
+
+// Return true when proactive user-memory growth should stop at the configured
+// high watermark, until recovery reaches low, or during an eviction batch.
+// A true result also kicks the background eviction worker.
+bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm);
+
+// Admit a speculative chunk migration only outside the eager eviction phase.
+// Every successful begin must be paired with end after GPU work completes.
+bool uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm);
+void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm);
 
 static bool uvm_gpu_chunk_same_root(uvm_gpu_chunk_t *chunk1, uvm_gpu_chunk_t *chunk2)
 {
