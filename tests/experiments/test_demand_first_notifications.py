@@ -135,8 +135,6 @@ static void uvm_va_block_context_init(uvm_va_block_context_t *c, struct mm_struc
 static void uvm_mutex_lock(void *m) { (void)m; } static void uvm_mutex_unlock(void *m) { (void)m; }
 static void expand_notification_block(uvm_gpu_va_space_t *g, struct mm_struct *m, uvm_va_block_t *b, uvm_access_counter_buffer_t *a, uvm_va_block_context_t *c, uvm_page_mask_t *p, uvm_access_counter_buffer_entry_t *e) { (void)g;(void)m;(void)b;(void)a;(void)c; *p = e->counter_value; }
 static NV_STATUS service_notification_va_block_helper(struct mm_struct *m, uvm_va_block_t *b, uvm_gpu_t *g, uvm_access_counter_service_batch_context_t *c, bool *did_migrate) { (void)m;(void)b;(void)g;(void)c; *did_migrate = demand_status == NV_OK; return demand_status; }
-static uvm_gpu_chunk_t *uvm_va_block_lookup_gpu_chunk(uvm_va_block_t *b, uvm_gpu_t *g, NvU64 a) { (void)b;(void)g;(void)a; static uvm_gpu_chunk_t chunk; return &chunk; }
-static void uvm_pmm_gpu_mark_chunk_accessed(void *p, uvm_gpu_chunk_t *c, int v) { (void)p;(void)c;(void)v; }
 static NV_STATUS notify_tools_and_process_flags(uvm_va_space_t *v, uvm_gpu_t *g, uvm_access_counter_buffer_t *a, NvU64 x, uvm_access_counter_buffer_entry_t **e, NvU32 n, NvU32 f, void *m) { (void)v;(void)g;(void)a;(void)x;(void)e;(void)n;(void)f;(void)m; return flags_status; }
 '''
     block_queue = text[text.index("#define UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY"):text.index("// Each page in a tracked physical range")]

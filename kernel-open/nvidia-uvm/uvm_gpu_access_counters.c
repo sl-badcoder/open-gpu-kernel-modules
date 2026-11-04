@@ -1578,15 +1578,6 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     has_accessed_pages = !uvm_page_mask_empty(accessed_pages);
     status = service_notification_va_block_helper(mm, va_block, gpu, batch_context, &did_migrate);
 
-    if (status == NV_OK && !is_hmm) {
-        for (i = index; i < *out_index; i++) {
-            uvm_access_counter_buffer_entry_t *entry = notifications[i];
-            uvm_gpu_chunk_t *chunk = uvm_va_block_lookup_gpu_chunk(va_block, gpu, entry->address);
-
-            uvm_pmm_gpu_mark_chunk_accessed(&gpu->pmm, chunk, entry->counter_value);
-        }
-    }
-
     uvm_mutex_unlock(&va_block->lock);
 
     if (is_hmm)

@@ -28,8 +28,8 @@ static inline bool uvm_vab_sample_fresh(NvU64 now, NvU64 sampled, NvU64 max_age)
     return sampled != 0 && now >= sampled && now - sampled <= max_age;
 }
 
-// Classify bits at sample time. Observation passes legacy migration history;
-// eviction passes the dedicated completion/readiness boundary after validating
+// Classify physical bits at sample time. Eviction passes the dedicated
+// completion/readiness boundary after validating
 // the root's ownership generation. Neither mode guesses hardware reset timing.
 static inline uvm_vab_region_state_t uvm_vab_classify(const uvm_vab_snapshot_t *snapshot,
                                                        NvU64 address,

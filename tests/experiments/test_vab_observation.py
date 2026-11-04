@@ -95,7 +95,8 @@ static void disable_sampling(void){uvm_perf_vab_mode=0;}
 int main(void){
  uvm_parent_gpu_t p={0};uvm_vab_snapshot_t s;UvmGpuAccessBitsBufferAlloc raw;
  active_parent=&p;p.rm_device=&p;uvm_gpu_vab_init(&p);
- assert(uvm_perf_vab_mode==1 && uvm_perf_vab_eviction_linear_base==~0ULL);
+ assert(uvm_perf_vab_mode==3 && uvm_perf_vab_eviction_linear_base==~0ULL);
+ uvm_perf_vab_mode=1;
  uvm_gpu_vab_get_snapshot(&p,&s);assert(!s.valid);
  p.access_bits_supported=true;p.vab_info.accessBitsBufferHandle=1;p.vab_info.granularity=6;
  uvm_gpu_vab_start(&p);assert(!schedules); // Empty mask must not start a worker.

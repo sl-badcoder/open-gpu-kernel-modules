@@ -10,13 +10,13 @@
 
 // Observation is enabled independently of the unverified physical mapping.
 // 0 = baseline (no dumps), 1 = observe, 2 = cold-first, 3 = VAB recency.
-static unsigned uvm_perf_vab_mode = 1;
+static unsigned uvm_perf_vab_mode = 3;
 static unsigned uvm_perf_vab_interval_ms = 100;
 static unsigned long long uvm_perf_vab_eviction_linear_base = ~0ULL;
 module_param(uvm_perf_vab_mode, uint, S_IRUGO | S_IWUSR);
 module_param(uvm_perf_vab_interval_ms, uint, S_IRUGO | S_IWUSR);
 module_param(uvm_perf_vab_eviction_linear_base, ullong, S_IRUGO);
-MODULE_PARM_DESC(uvm_perf_vab_mode, "VAB mode: 0=no sampling, 1=observe (default), 2=cold-first eviction, 3=VAB recency eviction; other values disable sampling.");
+MODULE_PARM_DESC(uvm_perf_vab_mode, "VAB mode: 0=no sampling, 1=observe, 2=cold-first eviction, 3=VAB recency eviction (default); other values disable sampling.");
 MODULE_PARM_DESC(uvm_perf_vab_interval_ms, "VAB dump interval in ms (default 100, clamped to 5..1000).");
 MODULE_PARM_DESC(uvm_perf_vab_eviction_linear_base, "Explicit assertion of a single linear physical VAB bit mapping; unset leaves region classification unknown.");
 

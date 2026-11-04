@@ -337,23 +337,8 @@ typedef struct uvm_gpu_root_chunk_struct
 {
     uvm_gpu_chunk_t chunk;
 
-    // Decaying access-counter heat used to order user-memory eviction.
-    //
-    // Protected by the owning PMM's list_lock. The score is updated from
-    // access-counter servicing and aged by the eager eviction worker.
-    NvU64 access_heat;
-    NvU64 last_access_epoch;
-
-    // Snapshot of the logical VA-block migration history for data currently
-    // backed by this physical root. These fields are reset whenever the root
-    // is initialized for reuse.
-    NvU32 migration_score;
-    NvU64 migration_score_update_ns;
-    NvU64 resident_since_ns;
-    NvU64 protected_until_ns;
-    // Separate from optional migration scoring; invalidated for every
-    // destination population/copy and root reuse, published only after the
-    // owning managed block's tracker is complete.
+    // Invalidated for destination population/copy and root reuse. Published
+    // only after the owning managed block's tracker completes.
     NvU64 vab_generation;
     NvU64 vab_ready_generation;
     NvU64 vab_ready_ns;
@@ -437,13 +422,9 @@ typedef struct uvm_pmm_gpu_struct
 
     struct
     {
-        // Periodically ages access heat and proactively evicts cold user
-        // memory. The worker uses the existing VA-block eviction path, so VA
-        // mappings and migration bookkeeping remain unchanged.
+        // Polls residency completion and evicts through the existing VA-block
+        // path, preserving mapping and tracker synchronization.
         struct delayed_work work;
-        NvU64 epoch;
-        // Protected by list_lock. Recovery kicks do not accelerate heat decay.
-        NvU64 next_aging_ns;
         // Protected by list_lock. Prefetch admissions and worker eviction
         // batches are mutually exclusive; recovery persists down to low.
         unsigned prefetch_count;
@@ -655,21 +636,6 @@ void uvm_pmm_gpu_mark_root_chunk_unused(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chu
 
 // Mark an allocated chunk as discarded
 void uvm_pmm_gpu_mark_root_chunk_discarded(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
-
-// Add an access-counter sample to the root chunk backing chunk and request an
-// eager policy pass. chunk may be NULL when a notification did not result in
-// GPU residency.
-void uvm_pmm_gpu_mark_chunk_accessed(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, NvU32 counter_value);
-
-// Record a CPU <-> GPU move for migration-aware eviction. The VA block lock
-// must be held. History is retained in the logical {VA block, GPU} state while
-// the current score is copied to any physical roots backing an arrival.
-void uvm_pmm_gpu_record_migration(uvm_va_block_t *va_block,
-                                  uvm_processor_id_t dst_id,
-                                  uvm_processor_id_t src_id,
-                                  NvU64 address,
-                                  NvU64 bytes,
-                                  uvm_va_block_transfer_mode_t transfer_mode);
 
 // Return true when proactive user-memory growth should stop at the configured
 // high watermark, until recovery reaches low, or during an eviction batch.
