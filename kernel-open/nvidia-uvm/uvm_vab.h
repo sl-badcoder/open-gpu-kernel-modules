@@ -20,6 +20,7 @@ typedef struct {
     NvU32 granularity;
     bool valid;
     bool eviction_enabled;
+    bool lru_enabled;
 } uvm_vab_snapshot_t;
 
 static inline bool uvm_vab_sample_fresh(NvU64 now, NvU64 sampled, NvU64 max_age)

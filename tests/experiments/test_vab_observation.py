@@ -71,7 +71,7 @@ typedef unsigned UVM_ACCESS_BITS_DUMP_MODE;
 typedef struct parent {
  bool access_bits_supported;struct {bool enabled;}smc;void *rm_device;UvmGpuAccessBitsBufferAlloc vab_info;
  struct {struct mutex dump_lock;int cache_lock;struct delayed_work work;uvm_vab_snapshot_t sample;
- NvU64 samples,dump_errors,pm_skips,rising_bits,falling_bits,unchanged_samples,dump_duration_ns;
+ NvU64 last_access_ns[4096];NvU64 samples,dump_errors,pm_skips,rising_bits,falling_bits,unchanged_samples,dump_duration_ns;
  NvU32 enabled_bits,set_bits;NV_STATUS last_dump_status;bool allocated,supported,stopping,running;}vab;
 } uvm_parent_gpu_t;
 typedef struct {int dummy;}uvm_pmm_gpu_t;
@@ -147,7 +147,7 @@ int main(void){
  uvm_gpu_vab_get_snapshot(&p,&s);assert(!s.valid);
  count=dumps;unsigned scheduled=schedules;p.vab.work.fn(&p.vab.work.work);
  assert(dumps==count&&schedules==scheduled);
- uvm_perf_vab_mode=3;assert(!vab_mode());
+ uvm_perf_vab_mode=3;assert(vab_mode()==3);
  uvm_perf_vab_interval_ms=0;assert(vab_interval_ms()==5);
  uvm_perf_vab_interval_ms=2000;assert(vab_interval_ms()==1000);
  puts("VAB production observation, transitions, mode isolation, telemetry and lifecycle checks passed.");

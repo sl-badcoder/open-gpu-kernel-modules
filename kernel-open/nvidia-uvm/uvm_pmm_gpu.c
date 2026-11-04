@@ -1592,9 +1592,10 @@ static uvm_vab_region_state_t vab_root_state(uvm_gpu_root_chunk_t *root, const u
 
 static uvm_gpu_chunk_t *vab_pick_allocated(uvm_pmm_gpu_t *pmm,
                                           const uvm_vab_snapshot_t *snapshot,
-                                          bool cold_only)
+                                          bool vab_only)
 {
-    uvm_gpu_root_chunk_t *baseline = NULL, *cold = NULL, *selected;
+    uvm_gpu_root_chunk_t *baseline = NULL, *preferred = NULL, *selected;
+    NvU64 oldest_access_ns = ~(NvU64)0;
     uvm_gpu_chunk_t *entry;
     uvm_pmm_alloc_list_t list;
     NvU64 now = NV_GETTIME();
@@ -1611,20 +1612,34 @@ static uvm_gpu_chunk_t *vab_pick_allocated(uvm_pmm_gpu_t *pmm,
         if (vab_candidate_better(root, baseline, now))
             baseline = root;
         if (snapshot->eviction_enabled &&
-            (!uvm_perf_migration_aware_eviction_enable || now >= root->protected_until_ns) &&
-            vab_root_state(root, snapshot) == UVM_VAB_REGION_COLD &&
-            vab_candidate_better(root, cold, now))
-            cold = root;
+            (!uvm_perf_migration_aware_eviction_enable || now >= root->protected_until_ns)) {
+            uvm_vab_region_state_t state = vab_root_state(root, snapshot);
+            if (snapshot->lru_enabled && state != UVM_VAB_REGION_UNKNOWN) {
+                NvU64 last_access_ns;
+                if (uvm_gpu_vab_get_recency(uvm_pmm_to_gpu(pmm)->parent, snapshot,
+                                            root->chunk.address, UVM_CHUNK_SIZE_MAX,
+                                            root->vab_ready_ns, &last_access_ns) &&
+                    (!preferred || last_access_ns < oldest_access_ns ||
+                     (last_access_ns == oldest_access_ns && vab_candidate_better(root, preferred, now)))) {
+                    preferred = root;
+                    oldest_access_ns = last_access_ns;
+                }
+            }
+            else if (!snapshot->lru_enabled && state == UVM_VAB_REGION_COLD &&
+                     vab_candidate_better(root, preferred, now)) {
+                preferred = root;
+            }
+        }
     }
-    if (cold_only && !cold)
+    if (vab_only && !preferred)
         return NULL;
-    selected = snapshot->eviction_enabled && cold ? cold : baseline;
+    selected = snapshot->eviction_enabled && preferred ? preferred : baseline;
     if (!selected)
         return NULL;
     if (snapshot->eviction_enabled) {
         if (selected != baseline)
             ++pmm->vab_stats.selection_changes;
-        if (!cold)
+        if (!preferred)
             ++pmm->vab_stats.selection_fallbacks;
     }
     state = vab_root_state(selected, snapshot);
@@ -1644,7 +1659,7 @@ static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
     return vab_pick_allocated(pmm, &snapshot, false);
 }
 
-static uvm_gpu_root_chunk_t *vab_pick_root(uvm_pmm_gpu_t *pmm, const uvm_vab_snapshot_t *snapshot, bool cold_only)
+static uvm_gpu_root_chunk_t *vab_pick_root(uvm_pmm_gpu_t *pmm, const uvm_vab_snapshot_t *snapshot, bool vab_only)
 {
     uvm_gpu_chunk_t *chunk;
 
@@ -1671,7 +1686,7 @@ static uvm_gpu_root_chunk_t *vab_pick_root(uvm_pmm_gpu_t *pmm, const uvm_vab_sna
     // TODO: Bug 1765193: Move the chunks to the tail of the used list whenever
     // they get mapped.
     if (!chunk)
-        chunk = snapshot ? vab_pick_allocated(pmm, snapshot, cold_only) : get_first_allocated_chunk(pmm);
+        chunk = snapshot ? vab_pick_allocated(pmm, snapshot, vab_only) : get_first_allocated_chunk(pmm);
 
     if (chunk)
         chunk_start_eviction(pmm, chunk);
@@ -1909,14 +1924,14 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force, uvm_gpu_root_chun
     NV_STATUS status;
     uvm_gpu_root_chunk_t *root_chunk;
     uvm_vab_snapshot_t snapshot;
-    bool cold_only;
+    bool vab_only;
 
     uvm_gpu_vab_get_snapshot(uvm_pmm_to_gpu(pmm)->parent, &snapshot);
-    cold_only = !force && snapshot.eviction_enabled && snapshot.valid && snapshot.linear_base != ~0ULL;
+    vab_only = !force && snapshot.eviction_enabled && snapshot.valid && snapshot.linear_base != ~0ULL;
 
     uvm_mutex_lock(&pmm->lock);
 
-    if (!force && !cold_only) {
+    if (!force && !vab_only) {
         bool has_candidate;
 
         uvm_spin_lock(&pmm->list_lock);
@@ -1929,7 +1944,7 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, bool force, uvm_gpu_root_chun
         }
     }
 
-    root_chunk = vab_pick_root(pmm, &snapshot, cold_only);
+    root_chunk = vab_pick_root(pmm, &snapshot, vab_only);
     if (!root_chunk) {
         uvm_mutex_unlock(&pmm->lock);
         return false;

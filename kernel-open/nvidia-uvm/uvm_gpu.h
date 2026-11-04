@@ -1017,6 +1017,7 @@ struct uvm_parent_gpu_struct
         spinlock_t cache_lock;
         struct delayed_work work;
         uvm_vab_snapshot_t sample;
+        NvU64 last_access_ns[UVM_VAB_WORD_COUNT * 64];
         NvU64 samples;
         NvU64 dump_errors;
         NvU64 pm_skips;
@@ -2021,6 +2022,10 @@ void uvm_gpu_vab_stop(uvm_parent_gpu_t *parent_gpu);
 void uvm_gpu_vab_invalidate(uvm_parent_gpu_t *parent_gpu);
 void uvm_gpu_vab_get_snapshot(uvm_parent_gpu_t *parent_gpu, uvm_vab_snapshot_t *snapshot);
 bool uvm_gpu_vab_eviction_requested(uvm_parent_gpu_t *parent_gpu);
+bool uvm_gpu_vab_get_recency(uvm_parent_gpu_t *parent_gpu,
+                             const uvm_vab_snapshot_t *snapshot,
+                             NvU64 address, NvU64 size, NvU64 ready_ns,
+                             NvU64 *last_access_ns);
 void uvm_gpu_vab_kick_readiness(uvm_parent_gpu_t *parent_gpu);
 NV_STATUS uvm_gpu_vab_test_dump(uvm_parent_gpu_t *parent_gpu,
                                 UVM_ACCESS_BITS_DUMP_MODE mode,

@@ -70,6 +70,14 @@ static void uvm_gpu_vab_get_snapshot(uvm_parent_gpu_t *p,uvm_vab_snapshot_t *s) 
     (void)p; ++snapshot_calls; *s=mock_snapshot;
     s->valid=s->valid && uvm_vab_sample_fresh(mock_now,s->sampled_ns,300);
 }
+static NvU64 mock_recency[6];
+static bool mock_recency_race;
+static bool uvm_gpu_vab_get_recency(uvm_parent_gpu_t *p,const uvm_vab_snapshot_t *s,
+                                    NvU64 address,NvU64 size,NvU64 ready,NvU64 *last) {
+    (void)p; (void)size;
+    if(mock_recency_race || uvm_vab_classify(s,address,size,ready)==UVM_VAB_REGION_UNKNOWN)return false;
+    *last=max(ready,mock_recency[address/UVM_CHUNK_SIZE_MAX]); return true;
+}
 static unsigned visits, evictions, freed, mock_usage, fail_at;
 static int migration_status;
 #define list_for_each_entry(entry,head,member) for((entry)=(head)->first;(entry) && (++visits,1);(entry)=(entry)->member.next)
@@ -104,7 +112,7 @@ static void reset(void) {
     memset(&mock_snapshot,0,sizeof(mock_snapshot));snapshot_calls=0;
     for(unsigned i=0;i<6;++i){roots[i].chunk.address=(NvU64)i*UVM_CHUNK_SIZE_MAX;
         roots[i].chunk.state=UVM_PMM_GPU_CHUNK_STATE_ALLOCATED;roots[i].chunk.va_block=(void *)1;}
-    mock_now=1000;
+    mock_now=1000;memset(mock_recency,0,sizeof(mock_recency));mock_recency_race=false;
     visits=evictions=freed=fail_at=0;mock_usage=100;migration_status=0;
     uvm_perf_migration_aware_eviction_enable=true;
 }
@@ -269,6 +277,31 @@ int main(void) {
     assert(vab_root_state(&roots[0],&mock_snapshot)==UVM_VAB_REGION_UNKNOWN);
     roots[0].chunk.state=UVM_PMM_GPU_CHUNK_STATE_ALLOCATED;roots[0].chunk.va_block=NULL;
     assert(vab_root_state(&roots[0],&mock_snapshot)==UVM_VAB_REGION_UNKNOWN);
+
+    // LRU can select an older hot region instead of a recently admitted cold
+    // region. Native bit level is no longer the primary ordering in mode 3.
+    reset();add(0,2);add(1,2);observation();mock_snapshot.eviction_enabled=true;mock_snapshot.lru_enabled=true;
+    mock_snapshot.access_bits[0]=1;
+    for(unsigned i=0;i<2;++i){roots[i].vab_generation=roots[i].vab_ready_generation=1;roots[i].vab_ready_ns=800;}
+    roots[1].vab_ready_ns=950;mock_recency[0]=850;
+    roots[0].migration_score=9;
+    assert(eager_eviction_one(&p,false,&out)&&out==&roots[0]);
+    assert(p.vab_stats.selected_hot==1&&p.vab_stats.selection_changes==1);
+
+    // All-hot regions remain ordered by observed access, without decay.
+    reset();add(0,2);add(1,2);observation();mock_snapshot.eviction_enabled=true;mock_snapshot.lru_enabled=true;
+    mock_snapshot.access_bits[0]=3;
+    for(unsigned i=0;i<2;++i){roots[i].vab_generation=roots[i].vab_ready_generation=1;roots[i].vab_ready_ns=800;}
+    mock_recency[0]=950;mock_recency[1]=850;roots[1].migration_score=9;
+    assert(eager_eviction_one(&p,false,&out)&&out==&roots[1]);
+    assert(p.vab_stats.selected_hot==1&&p.vab_stats.selection_changes==1);
+
+    // A racing snapshot refuses proactive selection but pressure falls back.
+    reset();add(0,2);observation();mock_snapshot.eviction_enabled=true;mock_snapshot.lru_enabled=true;
+    roots[0].vab_generation=roots[0].vab_ready_generation=1;roots[0].vab_ready_ns=800;
+    mock_recency_race=true;
+    assert(!eager_eviction_one(&p,false,&out));
+    assert(eager_eviction_one(&p,true,&out)&&out==&roots[0]&&p.vab_stats.selection_fallbacks==1);
 
     // Exercise the unchanged allocation/PMA wrapper and its fallback path.
     reset();add(0,2);uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[0]);uvm_mutex_unlock(&p.lock);

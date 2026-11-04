@@ -9,21 +9,21 @@
 #include <linux/string.h>
 
 // Observation is enabled independently of the unverified physical mapping.
-// 0 = baseline (no dumps), 1 = observe, 2 = prefer eligible cold roots.
+// 0 = baseline (no dumps), 1 = observe, 2 = cold-first, 3 = VAB recency.
 static unsigned uvm_perf_vab_mode = 1;
 static unsigned uvm_perf_vab_interval_ms = 100;
 static unsigned long long uvm_perf_vab_eviction_linear_base = ~0ULL;
 module_param(uvm_perf_vab_mode, uint, S_IRUGO | S_IWUSR);
 module_param(uvm_perf_vab_interval_ms, uint, S_IRUGO | S_IWUSR);
 module_param(uvm_perf_vab_eviction_linear_base, ullong, S_IRUGO);
-MODULE_PARM_DESC(uvm_perf_vab_mode, "VAB mode: 0=no sampling, 1=observe (default), 2=cold-first eviction; other values disable sampling.");
+MODULE_PARM_DESC(uvm_perf_vab_mode, "VAB mode: 0=no sampling, 1=observe (default), 2=cold-first eviction, 3=VAB recency eviction; other values disable sampling.");
 MODULE_PARM_DESC(uvm_perf_vab_interval_ms, "VAB dump interval in ms (default 100, clamped to 5..1000).");
 MODULE_PARM_DESC(uvm_perf_vab_eviction_linear_base, "Explicit assertion of a single linear physical VAB bit mapping; unset leaves region classification unknown.");
 
 static unsigned vab_mode(void)
 {
     unsigned mode = READ_ONCE(uvm_perf_vab_mode);
-    return mode <= 2 ? mode : 0;
+    return mode <= 3 ? mode : 0;
 }
 
 static unsigned vab_interval_ms(void)
@@ -39,7 +39,8 @@ static void vab_snapshot_locked(uvm_parent_gpu_t *parent_gpu, uvm_vab_snapshot_t
 
     *snapshot = parent_gpu->vab.sample;
     snapshot->linear_base = uvm_perf_vab_eviction_linear_base;
-    snapshot->eviction_enabled = mode == 2;
+    snapshot->eviction_enabled = mode == 2 || mode == 3;
+    snapshot->lru_enabled = mode == 3;
     snapshot->valid = snapshot->valid && parent_gpu->vab.running &&
                       !READ_ONCE(parent_gpu->vab.stopping) && mode != 0 &&
                       uvm_vab_sample_fresh(NV_GETTIME(), snapshot->sampled_ns,
@@ -48,7 +49,7 @@ static void vab_snapshot_locked(uvm_parent_gpu_t *parent_gpu, uvm_vab_snapshot_t
 
 bool uvm_gpu_vab_eviction_requested(uvm_parent_gpu_t *parent_gpu)
 {
-    return vab_mode() == 2 && uvm_perf_vab_eviction_linear_base != ~0ULL &&
+    return (vab_mode() == 2 || vab_mode() == 3) && uvm_perf_vab_eviction_linear_base != ~0ULL &&
            READ_ONCE(parent_gpu->vab.supported) && READ_ONCE(parent_gpu->vab.running) &&
            !READ_ONCE(parent_gpu->vab.stopping);
 }
@@ -75,6 +76,7 @@ static void vab_sample(uvm_parent_gpu_t *parent_gpu)
     unsigned set = 0;
     NvU64 rising = 0;
     NvU64 falling = 0;
+    bool history_valid;
 
     if (!vab_mode()) {
         spin_lock_irqsave(&parent_gpu->vab.cache_lock, flags);
@@ -122,20 +124,57 @@ static void vab_sample(uvm_parent_gpu_t *parent_gpu)
         return;
     }
 
+    if (raw.bDirtyBits || raw.granularity > 15) {
+        parent_gpu->vab.sample.valid = false;
+        spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+        uvm_up_read(&g_uvm_global.pm.lock);
+        return;
+    }
+    history_valid = parent_gpu->vab.sample.valid &&
+                    parent_gpu->vab.sample.granularity == raw.granularity &&
+                    uvm_vab_sample_fresh(started_ns, parent_gpu->vab.sample.sampled_ns,
+                                         (NvU64)3 * vab_interval_ms() * NSEC_PER_MSEC);
+    // A gap or layout change ends the observation window. Seed currently set
+    // bits conservatively rather than carrying old recency across that gap.
+    if (!history_valid)
+        memset(parent_gpu->vab.last_access_ns, 0, sizeof(parent_gpu->vab.last_access_ns));
+
     for (i = 0; i < UVM_VAB_WORD_COUNT; ++i) {
         NvU64 mask = raw.enabledMask[i];
         NvU64 bits = raw.currentBits[i] & mask;
+        NvU64 common = parent_gpu->vab.samples ? mask & parent_gpu->vab.sample.enabled_mask[i] : 0;
+        NvU64 previous = parent_gpu->vab.samples ? parent_gpu->vab.sample.access_bits[i] : 0;
+        NvU64 removed = parent_gpu->vab.sample.enabled_mask[i] & ~mask;
 
         enabled += hweight64(mask);
         set += hweight64(bits);
         if (parent_gpu->vab.samples) {
-            NvU64 common = mask & parent_gpu->vab.sample.enabled_mask[i];
-            NvU64 previous = parent_gpu->vab.sample.access_bits[i];
             rising += hweight64(bits & ~previous & common);
             falling += hweight64(previous & ~bits & common);
         }
         parent_gpu->vab.sample.access_bits[i] = bits;
         parent_gpu->vab.sample.enabled_mask[i] = mask;
+        // Track every sampled mode so entering LRU does not lose accesses
+        // observed while eviction was disabled. Steady set bits never refresh.
+        {
+            NvU64 touched = history_valid ? bits & ~(previous & common) : bits;
+            while (removed) {
+                NvU32 bit = __builtin_ctzll(removed);
+                parent_gpu->vab.last_access_ns[i * 64 + bit] = 0;
+                removed &= removed - 1;
+            }
+            while (touched) {
+                NvU32 bit = __builtin_ctzll(touched);
+                parent_gpu->vab.last_access_ns[i * 64 + bit] = started_ns;
+                touched &= touched - 1;
+            }
+        }
+    }
+    if (!enabled) {
+        parent_gpu->vab.sample.valid = false;
+        spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+        uvm_up_read(&g_uvm_global.pm.lock);
+        return;
     }
     if (parent_gpu->vab.samples && !rising && !falling)
         ++parent_gpu->vab.unchanged_samples;
@@ -157,6 +196,45 @@ static void vab_sample(uvm_parent_gpu_t *parent_gpu)
     // Publish before releasing PM: suspend invalidates under the write lock,
     // and must not be followed by publication of a pre-suspend observation.
     uvm_up_read(&g_uvm_global.pm.lock);
+}
+
+bool uvm_gpu_vab_get_recency(uvm_parent_gpu_t *parent_gpu,
+                             const uvm_vab_snapshot_t *snapshot,
+                             NvU64 address, NvU64 size, NvU64 ready_ns,
+                             NvU64 *last_access_ns)
+{
+    NvU64 bit_size, end, first, last, bit, newest = ready_ns;
+    unsigned long flags;
+
+    if (!last_access_ns || !snapshot || !snapshot->valid || !snapshot->lru_enabled ||
+        snapshot->linear_base == ~(NvU64)0 || snapshot->granularity > 15 ||
+        !snapshot->sampled_ns || snapshot->sampled_ns < ready_ns || !size ||
+        address > ~(NvU64)0 - (size - 1) || address < snapshot->linear_base)
+        return false;
+    bit_size = ((NvU64)64 * 1024) << snapshot->granularity;
+    end = address + size - 1;
+    first = (address - snapshot->linear_base) / bit_size;
+    last = (end - snapshot->linear_base) / bit_size;
+    if (end < snapshot->linear_base || last >= UVM_VAB_WORD_COUNT * 64)
+        return false;
+    spin_lock_irqsave(&parent_gpu->vab.cache_lock, flags);
+    if (!parent_gpu->vab.sample.valid || parent_gpu->vab.sample.sampled_ns != snapshot->sampled_ns ||
+        parent_gpu->vab.sample.granularity != snapshot->granularity) {
+        spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+        return false;
+    }
+    for (bit = first; bit <= last; ++bit) {
+        NvU64 mask = (NvU64)1 << (bit % 64);
+        if (!(snapshot->enabled_mask[bit / 64] & mask)) {
+            spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+            return false;
+        }
+        if (parent_gpu->vab.last_access_ns[bit] > newest)
+            newest = parent_gpu->vab.last_access_ns[bit];
+    }
+    spin_unlock_irqrestore(&parent_gpu->vab.cache_lock, flags);
+    *last_access_ns = newest;
+    return true;
 }
 
 static void vab_sample_work(struct work_struct *work)
@@ -293,8 +371,9 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
     seq_printf(s, "mapping_configured %u\nlinear_base 0x%llx\nsample_valid %u\n",
                snapshot.linear_base != ~0ULL, snapshot.linear_base, snapshot.valid);
     seq_printf(s, "selection_active %u\nclassification_scope %s\n",
-               snapshot.eviction_enabled && snapshot.valid && snapshot.linear_base != ~0ULL,
-               snapshot.eviction_enabled ? "eligible_full_managed_root" : "physical_region_at_sample");
+               (snapshot.eviction_enabled || snapshot.lru_enabled) && snapshot.valid && snapshot.linear_base != ~0ULL,
+               snapshot.lru_enabled ? "VAB_recency_full_managed_root" :
+               (snapshot.eviction_enabled ? "eligible_full_managed_root" : "physical_region_at_sample"));
     seq_printf(s, "granularity_kib %llu\nbitmap_bits %u\nenabled_bits %u\nset_bits %u\nclear_bits %u\n",
                snapshot.granularity <= 15 ? 64ULL << snapshot.granularity : 0,
                UVM_VAB_WORD_COUNT * 64, enabled, set, enabled - min(enabled, set));
