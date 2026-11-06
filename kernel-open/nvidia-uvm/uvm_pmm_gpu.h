@@ -59,6 +59,7 @@
 #include "uvm_linux.h"
 #include "uvm_types.h"
 #include "uvm_vab.h"
+#include "uvm_prefetch_budget.h"
 #include "nv_uvm_user_types.h"
 #if UVM_IS_CONFIG_HMM() || defined(CONFIG_PCI_P2PDMA)
 #include <linux/memremap.h>
@@ -192,6 +193,19 @@ typedef struct {
     NvU64 selection_fallbacks;
     NvU64 eligible_roots;
     NvU64 readiness_pending;
+    NvU64 background_hot_skips;
+    NvU64 background_unknown_skips;
+    NvU64 prefetch_reserved_bytes;
+    NvU64 prefetch_peak_bytes;
+    NvU64 prefetch_window_bytes;
+    NvU64 prefetch_admissions;
+    NvU64 prefetch_denials;
+    NvU64 prefetch_backoffs;
+    NvU64 prefetch_quick_returns;
+    NvU64 prefetch_capacity_stops;
+    NvU64 prefetch_recoveries;
+    NvU64 prefetch_limit_bytes;
+    NvU64 prefetch_demand_reserve_bytes;
 } uvm_pmm_gpu_vab_stats_t;
 
 // Lists for allocated root chunks. When picking a root chunk to evict, lists
@@ -428,6 +442,7 @@ typedef struct uvm_pmm_gpu_struct
         // Protected by list_lock. Prefetch admissions and worker eviction
         // batches are mutually exclusive; recovery persists down to low.
         unsigned prefetch_count;
+        uvm_prefetch_budget_t budget;
         bool active;
         bool recovering_watermark;
         bool stopping;
@@ -642,10 +657,19 @@ void uvm_pmm_gpu_mark_root_chunk_discarded(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
 // A true result also kicks the background eviction worker.
 bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm);
 
-// Admit a speculative chunk migration only outside the eager eviction phase.
-// Every successful begin must be paired with end after GPU work completes.
-bool uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm);
-void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm);
+// Return a byte reservation (zero denies) outside the eager eviction phase,
+// bounded by the per-GPU adaptive cap and free capacity minus demand reserve.
+// Every nonzero begin must be paired with end after GPU work completes.
+NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm, NvU64 requested_bytes);
+void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm,
+                                            NvU64 reserved_bytes,
+                                            NvU64 transferred_bytes,
+                                            bool success);
+// Feedback from capacity failure or a prefetched block evicted and demanded
+// again within the observation window. Safe under a VA-block lock.
+void uvm_pmm_gpu_prefetch_feedback(uvm_pmm_gpu_t *pmm, bool quick_return);
+NvU64 uvm_pmm_gpu_prefetch_feedback_window_ns(void);
+bool uvm_pmm_gpu_speculative_prefetch_enabled(void);
 
 static bool uvm_gpu_chunk_same_root(uvm_gpu_chunk_t *chunk1, uvm_gpu_chunk_t *chunk2)
 {

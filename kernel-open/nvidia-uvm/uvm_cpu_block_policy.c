@@ -204,7 +204,8 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
                                 uvm_va_block_context_t *block_context,
                                 uvm_tracker_t *prefetch_tracker,
                                 NvU64 *prefetched_bytes,
-                                bool *capacity_stop)
+                                bool *capacity_stop,
+                                bool speculative_neighbor)
 {
     NV_STATUS status;
     uvm_va_block_retry_t retry;
@@ -256,8 +257,16 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
                                         UVM_MAKE_RESIDENT_CAUSE_PREFETCH);
 
     if (status == NV_OK) {
-        *prefetched_bytes +=
-            (NvU64)uvm_page_mask_weight(&block_context->make_resident.pages_changed_residency) * PAGE_SIZE;
+        NvU64 moved = (NvU64)uvm_page_mask_weight(&block_context->make_resident.pages_changed_residency) * PAGE_SIZE;
+        *prefetched_bytes += moved;
+        if (moved && speculative_neighbor) {
+            uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+            UVM_ASSERT(gpu_state);
+            // A submission timestamp is sufficient for coarse churn detection;
+            // it is never treated as hardware access/reuse evidence.
+            gpu_state->speculative_prefetch_ns = NV_GETTIME();
+            gpu_state->speculative_evicted_ns = 0;
+        }
 
         // make_resident updates physical residency but does not install a
         // destination GPU PTE. Map the prefetched pages locally now so their
@@ -310,20 +319,39 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     size_t candidate_index;
     NvU64 chunk_bytes;
     NvU64 prefetched_bytes = 0;
+    NvU64 reserved_bytes = 0;
     unsigned prefetch_chunk_mb = READ_ONCE(uvm_cpu_preferred_prefetch_chunk_mb);
     bool retry = false;
     bool capacity_stopped = false;
     bool prefetch_admitted = false;
+    bool prefetch_success = true;
     uvm_tracker_t prefetch_tracker = UVM_TRACKER_INIT();
 
     if (!managed_range ||
         prefetch_chunk_mb == 0 ||
+        !uvm_pmm_gpu_speculative_prefetch_enabled() ||
         !should_handle_gpu_signal(trigger_block, gpu)) {
         return;
     }
 
     va_space = managed_range->va_range.va_space;
     uvm_assert_rwsem_locked_read(&va_space->lock);
+
+    // Demand service has already run before this callback. A rapid return of a
+    // speculatively populated block is feedback to reduce future speculation,
+    // not a reason to delay that demand or to infer cache-hit behavior.
+    uvm_mutex_lock(&trigger_block->lock);
+    {
+        uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(trigger_block, gpu->id);
+        NvU64 now = NV_GETTIME();
+        if (gpu_state && gpu_state->speculative_evicted_ns) {
+            if (now >= gpu_state->speculative_evicted_ns &&
+                now - gpu_state->speculative_evicted_ns <= uvm_pmm_gpu_prefetch_feedback_window_ns())
+                uvm_pmm_gpu_prefetch_feedback(&gpu->pmm, true);
+            gpu_state->speculative_evicted_ns = 0;
+        }
+    }
+    uvm_mutex_unlock(&trigger_block->lock);
 
     if (uvm_processor_mask_test(&trigger_block->gpu_prefetch_started, gpu->id)) {
         if (!uvm_processor_mask_test(&trigger_block->gpu_prefetch_retry, gpu->id) ||
@@ -347,9 +375,17 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     if (uvm_processor_mask_test_and_set_atomic(&trigger_block->gpu_prefetch_started, gpu->id))
         goto out;
 
-    // Hold one admission for the whole chunk, including its final GPU wait.
-    // Per-block watermark checks still stop submission when recovery begins.
-    if (!uvm_pmm_gpu_eager_eviction_prefetch_begin(&gpu->pmm)) {
+    block_count = uvm_va_range_num_blocks(managed_range);
+    trigger_index = uvm_va_range_block_index(managed_range, trigger_block->start);
+    chunk_bytes = (NvU64)prefetch_chunk_mb * UVM_SIZE_1MB;
+    chunk_block_count = (chunk_bytes + UVM_VA_BLOCK_SIZE - 1) / UVM_VA_BLOCK_SIZE;
+    chunk_block_count = min(chunk_block_count, block_count);
+
+    // Reserve the entire bounded chunk before any speculative submission. The
+    // reservation stays live through the final GPU wait on every exit path.
+    reserved_bytes = uvm_pmm_gpu_eager_eviction_prefetch_begin(&gpu->pmm,
+                                                               (NvU64)chunk_block_count * UVM_VA_BLOCK_SIZE);
+    if (!reserved_bytes) {
         atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
         uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
         goto out;
@@ -360,12 +396,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     if (retry)
         atomic64_inc(&uvm_cpu_preferred_prefetch_retries);
 
-    block_count = uvm_va_range_num_blocks(managed_range);
-    trigger_index = uvm_va_range_block_index(managed_range, trigger_block->start);
-    chunk_bytes = (NvU64)prefetch_chunk_mb * UVM_SIZE_1MB;
-    chunk_block_count = (chunk_bytes + UVM_VA_BLOCK_SIZE - 1) / UVM_VA_BLOCK_SIZE;
-    chunk_block_count = max_t(size_t, chunk_block_count, 1);
-    chunk_block_count = min(chunk_block_count, block_count);
+    chunk_block_count = (size_t)(reserved_bytes / UVM_VA_BLOCK_SIZE);
+    UVM_ASSERT(chunk_block_count > 0 && chunk_block_count <= block_count);
 
     // Center the configurable chunk on the 2MB block which produced the
     // access-counter notification. Shift at allocation boundaries so a full
@@ -407,6 +439,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         if (uvm_pmm_gpu_eager_eviction_watermark_reached(&gpu->pmm)) {
             atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
             capacity_stopped = true;
+            prefetch_success = false;
+            uvm_pmm_gpu_prefetch_feedback(&gpu->pmm, false);
             break;
         }
 
@@ -421,14 +455,18 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                 block_context,
                                 &prefetch_tracker,
                                 &prefetched_bytes,
-                                &capacity_stop);
+                                &capacity_stop,
+                                candidate_index != trigger_index);
         if (capacity_stop) {
             atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
             capacity_stopped = true;
+            prefetch_success = false;
+            uvm_pmm_gpu_prefetch_feedback(&gpu->pmm, false);
             break;
         }
 
         if (status != NV_OK) {
+            prefetch_success = false;
             UVM_DBG_PRINT("Managed allocation prefetch stopped with %s on GPU %s\n",
                           nvstatusToString(status),
                           gpu->parent->name);
@@ -452,6 +490,7 @@ out:
     {
         NV_STATUS status = uvm_tracker_wait_deinit(&prefetch_tracker);
         if (status != NV_OK) {
+            prefetch_success = false;
             UVM_DBG_PRINT("Managed allocation prefetch completion failed with %s on GPU %s\n",
                           nvstatusToString(status),
                           gpu->parent->name);
@@ -459,14 +498,26 @@ out:
     }
 
     if (prefetch_admitted)
-        uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm);
+        uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm, reserved_bytes, prefetched_bytes, prefetch_success);
 
     uvm_va_block_context_free(block_context);
 }
 
 void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
 {
+    uvm_va_block_gpu_state_t *gpu_state;
+    NvU64 now = NV_GETTIME();
+
     uvm_assert_mutex_locked(&va_block->lock);
+
+    gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    if (gpu_state) {
+        gpu_state->speculative_evicted_ns = 0;
+        if (gpu_state->speculative_prefetch_ns && now >= gpu_state->speculative_prefetch_ns &&
+            now - gpu_state->speculative_prefetch_ns <= uvm_pmm_gpu_prefetch_feedback_window_ns())
+            gpu_state->speculative_evicted_ns = now;
+        gpu_state->speculative_prefetch_ns = 0;
+    }
 
     // A completed prefetch is one-shot only while its trigger block remains
     // GPU-resident. Once any part of that block is evicted to the CPU, a new

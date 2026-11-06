@@ -395,6 +395,15 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
                roots.selection_changes, roots.selection_fallbacks, roots.eligible_roots, roots.readiness_pending);
     seq_printf(s, "usage_percent %llu\nprefetch_inflight %llu\nrecovering_watermark %llu\nbackground_active %llu\n",
                roots.usage_percent, roots.prefetch_inflight, roots.recovering_watermark, roots.background_active);
+    seq_puts(s, "background_policy VAB_cold_only\n");
+    seq_printf(s, "background_hot_skips %llu\nbackground_unknown_skips %llu\n",
+               roots.background_hot_skips, roots.background_unknown_skips);
+    seq_printf(s, "prefetch_limit_bytes %llu\nprefetch_demand_reserve_bytes %llu\nprefetch_reserved_bytes %llu\nprefetch_peak_bytes %llu\nprefetch_window_bytes %llu\n",
+               roots.prefetch_limit_bytes, roots.prefetch_demand_reserve_bytes,
+               roots.prefetch_reserved_bytes, roots.prefetch_peak_bytes, roots.prefetch_window_bytes);
+    seq_printf(s, "prefetch_admissions %llu\nprefetch_denials %llu\nprefetch_backoffs %llu\nprefetch_quick_returns %llu\nprefetch_capacity_stops %llu\nprefetch_recoveries %llu\n",
+               roots.prefetch_admissions, roots.prefetch_denials, roots.prefetch_backoffs,
+               roots.prefetch_quick_returns, roots.prefetch_capacity_stops, roots.prefetch_recoveries);
 
     // Raw words expose hot/cold bits even without a physical range mapping.
     // Word zero is first; bit i belongs to word i/64 at position i%64.

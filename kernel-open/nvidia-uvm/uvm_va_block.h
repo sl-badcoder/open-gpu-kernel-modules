@@ -111,6 +111,11 @@ typedef struct
     // Pages that have been evicted to sysmem
     uvm_page_mask_t evicted;
 
+    // Coarse speculative churn feedback, protected by the VA-block lock.
+    // These belong to the virtual block/GPU, never to a recycled physical root.
+    NvU64 speculative_prefetch_ns;
+    NvU64 speculative_evicted_ns;
+
     // Array of naturally-aligned chunks. Each chunk has the largest possible
     // size which can fit within the block, so they are not uniform size.
     //

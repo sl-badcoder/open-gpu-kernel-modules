@@ -32,6 +32,8 @@ typedef unsigned NvU32;
 /* VAB classifier */
 typedef unsigned uvm_pmm_alloc_list_t;
 typedef int NV_STATUS;
+#define UVM_ASSERT assert
+#define UVM_SIZE_1MB (1024ULL * 1024ULL)
 #define NV_OK 0
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define FREE_ROOT_CHUNK_MODE_DEFAULT 0
@@ -52,16 +54,18 @@ typedef int NV_STATUS;
 #define NV_GETTIME() mock_now
 static NvU64 mock_now=1000;
 static unsigned uvm_perf_vab_min_residency_ms=100;
+static unsigned uvm_perf_speculative_prefetch_limit_mb=32;
+static unsigned uvm_perf_speculative_prefetch_reserve_mb=64;
 #define NSEC_PER_MSEC 1000000ULL
 struct chunk;
 struct list_head { struct chunk *first; };
 typedef struct chunk { struct { struct chunk *next; } list; bool is_zero, claimed; NvU64 address; unsigned state; void *va_block; } uvm_gpu_chunk_t;
 typedef struct { uvm_gpu_chunk_t chunk; NvU64 vab_generation,vab_ready_generation,vab_ready_ns; } uvm_gpu_root_chunk_t;
-typedef struct { NvU64 used_cold,used_hot,used_unknown,selected_hot,selected_cold,selected_unknown,background_roots_freed,background_failures,usage_percent,prefetch_inflight,recovering_watermark,background_active,selection_changes,selection_fallbacks,eligible_roots,readiness_pending; } uvm_pmm_gpu_vab_stats_t;
+typedef struct { NvU64 used_cold,used_hot,used_unknown,selected_hot,selected_cold,selected_unknown,background_roots_freed,background_failures,usage_percent,prefetch_inflight,recovering_watermark,background_active,selection_changes,selection_fallbacks,eligible_roots,readiness_pending,background_hot_skips,background_unknown_skips,prefetch_reserved_bytes,prefetch_peak_bytes,prefetch_window_bytes,prefetch_admissions,prefetch_denials,prefetch_backoffs,prefetch_quick_returns,prefetch_capacity_stops,prefetch_recoveries,prefetch_limit_bytes,prefetch_demand_reserve_bytes; } uvm_pmm_gpu_vab_stats_t;
 typedef struct { int dummy; } uvm_parent_gpu_t;
 typedef struct { uvm_parent_gpu_t *parent; } uvm_gpu_t;
 static uvm_gpu_t mock_gpu;
-typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
+typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
 static uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *p) {(void)p; return &mock_gpu;}
 static uvm_vab_snapshot_t mock_snapshot;
 static unsigned snapshot_calls;
@@ -124,52 +128,53 @@ static void add(unsigned i,unsigned list){
 }
 int main(void){
  uvm_gpu_root_chunk_t *out=NULL;
+ // Background skips all-hot roots.
  reset();add(0,2);add(1,2);mock_snapshot.access_bits[0]=3;
- mock_recency[0]=mock_now-150*NSEC_PER_MSEC;mock_recency[1]=mock_now-50*NSEC_PER_MSEC;
- // List order would choose 1. VAB picks older hot root 0, including nonforce.
- assert(eager_eviction_one(&p,false,&out)&&out==&roots[0]);
- assert(p.vab_stats.selection_changes==1&&p.vab_stats.selected_hot==1);
- // A recent admission is newer than an earlier observed bit transition.
- reset();add(0,2);add(1,2);roots[1].vab_ready_ns=mock_now-110*NSEC_PER_MSEC;
- mock_recency[0]=mock_now-150*NSEC_PER_MSEC;
- assert(eager_eviction_one(&p,false,&out)&&out==&roots[0]);
- // Fixed completion grace protects roots below high water.
- reset();add(0,2);roots[0].vab_ready_ns=mock_now-99*NSEC_PER_MSEC;
- assert(!eager_eviction_one(&p,false,&out)&&!evictions);
- assert(eager_eviction_one(&p,true,&out)&&out==&roots[0]);
- // Unknown, stale, unmapped and racing data cannot admit proactive eviction.
- reset();add(0,2);vab_root_changed(&roots[0]);assert(!eager_eviction_one(&p,false,&out));
- assert(eager_eviction_one(&p,true,&out)&&p.vab_stats.selection_fallbacks==1);
- reset();add(0,2);mock_snapshot.sampled_ns=mock_now-301;assert(!eager_eviction_one(&p,false,&out));
- reset();add(0,2);mock_snapshot.linear_base=~0ULL;assert(!eager_eviction_one(&p,false,&out));
- reset();add(0,2);mock_recency_race=true;assert(!eager_eviction_one(&p,false,&out));
- assert(eager_eviction_one(&p,true,&out)&&out==&roots[0]);
- // Modes 0/1 fall back to list order only when reclaim is necessary.
- reset();add(0,2);add(1,2);mock_snapshot.eviction_enabled=mock_snapshot.lru_enabled=false;
- assert(!eager_eviction_one(&p,false,&out));assert(eager_eviction_one(&p,true,&out)&&out==&roots[1]);
- // Existing cold-first mode 2 remains available without any heat bookkeeping.
+ assert(!eager_eviction_one(&p,&out)&&!evictions);
+ assert(p.vab_stats.background_hot_skips==2);
+ // With one hot and one cold region, background selects the cold root.
+ reset();add(0,2);add(1,2);mock_snapshot.access_bits[0]=(1ULL << 1);
+ assert(eager_eviction_one(&p,&out)&&out==&roots[0]);
+ assert(p.vab_stats.selected_cold==1);
+ // Cold-only behavior also applies in mode 2; observation-only never reclaims.
  reset();add(0,2);add(1,2);mock_snapshot.lru_enabled=false;mock_snapshot.access_bits[0]=2;
- assert(eager_eviction_one(&p,false,&out)&&out==&roots[0]&&p.vab_stats.selected_cold==1);
- // Free, unused and discarded lists keep their original priority.
- reset();add(0,2);add(1,1);add(2,0);p.free_list[0].first=&roots[3].chunk;
- assert(eager_eviction_one(&p,true,&out)&&out==&roots[3]);
- assert(eager_eviction_one(&p,true,&out)&&out==&roots[2]);
- assert(eager_eviction_one(&p,true,&out)&&out==&roots[1]);
+ assert(eager_eviction_one(&p,&out)&&out==&roots[0]);
+ reset();add(0,2);mock_snapshot.eviction_enabled=false;assert(!eager_eviction_one(&p,&out));
+ reset();add(0,2);mock_snapshot.valid=false;assert(!eager_eviction_one(&p,&out));
+ // Fixed completion grace protects roots below the residency threshold.
+ reset();add(0,2);roots[0].vab_ready_ns=mock_now-99*NSEC_PER_MSEC;
+ assert(!eager_eviction_one(&p,&out)&&!evictions);
+ // Unknown, stale, unmapped and racing data cannot admit proactive eviction.
+ reset();add(0,2);vab_root_changed(&roots[0]);assert(!eager_eviction_one(&p,&out));
+ reset();add(0,2);mock_snapshot.sampled_ns=mock_now-301;assert(!eager_eviction_one(&p,&out));
+ reset();add(0,2);mock_snapshot.linear_base=~0ULL;assert(!eager_eviction_one(&p,&out));
+ reset();add(0,2);mock_recency_race=true;assert(!eager_eviction_one(&p,&out));
+ // A valid cold snapshot permits background selection.
+ reset();add(0,2);assert(eager_eviction_one(&p,&out)&&out==&roots[0]);
+ // Background VAB selection operates on allocated roots only.
  // Split/ownerless roots remain unknown and pressure uses the fallback.
  reset();add(0,2);roots[0].chunk.state=UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT;
  assert(vab_root_state(&roots[0],&mock_snapshot)==UVM_VAB_REGION_UNKNOWN);
- assert(!eager_eviction_one(&p,false,&out));
- reset();add(0,2);roots[0].chunk.va_block=NULL;assert(!eager_eviction_one(&p,false,&out));
- // PMA/allocation wrapper uses the same ranking; successful frees and failures
- // are counted separately, and batches stop at the low target.
- reset();add(0,2);uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[0]);uvm_mutex_unlock(&p.lock);
+ assert(!eager_eviction_one(&p,&out));
+ reset();add(0,2);roots[0].chunk.va_block=NULL;assert(!eager_eviction_one(&p,&out));
+ // Mandatory PMA/allocation fallback still returns HOT and UNKNOWN roots.
+ reset();add(0,2);mock_snapshot.access_bits[0]=1;
+ uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[0]);uvm_mutex_unlock(&p.lock);
+ reset();add(0,2);vab_root_changed(&roots[0]);
+ uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[0]);uvm_mutex_unlock(&p.lock);
+ // Free, UNUSED, and DISCARD lists retain their priority for mandatory demand.
+ reset();add(0,2);add(1,1);add(2,0);p.free_list[0].first=&roots[3].chunk;
+ uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[3]);uvm_mutex_unlock(&p.lock);
+ uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[2]);uvm_mutex_unlock(&p.lock);
+ uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[1]);uvm_mutex_unlock(&p.lock);
+ // Completed frees and failures are counted separately; batches stop at low.
  reset();for(unsigned i=0;i<5;++i)add(i,2);
- assert(eager_eviction_batch(&p,true,16,98)==2&&p.vab_stats.background_roots_freed==2);
+ assert(eager_eviction_batch(&p,16,98)==2&&p.vab_stats.background_roots_freed==2);
  reset();for(unsigned i=0;i<5;++i)add(i,2);fail_at=2;
- assert(eager_eviction_batch(&p,true,16,95)==1&&p.vab_stats.background_failures==1);
+ assert(eager_eviction_batch(&p,16,95)==1&&p.vab_stats.background_failures==1);
  uvm_pmm_gpu_vab_stats_t stats;uvm_pmm_gpu_vab_stats(&p,&mock_snapshot,&stats);
  assert(stats.eligible_roots==3&&stats.used_cold==3);
- puts("Production VAB LRU-only eviction: ranking, grace, fallback, priorities, batches and telemetry passed.");
+ puts("Production VAB demand/background eviction policy and telemetry passed.");
  return 0;
 }
 '''
@@ -177,7 +182,8 @@ int main(void){
 def main():
     source=(ROOT / 'kernel-open/nvidia-uvm/uvm_pmm_gpu.c').read_text()
     header=(ROOT / 'kernel-open/nvidia-uvm/uvm_vab.h').read_text().replace('#include "nvtypes.h"','')
-    code=PRELUDE.replace('/* VAB classifier */',header)
+    budget=(ROOT / 'kernel-open/nvidia-uvm/uvm_prefetch_budget.h').read_text().replace('#include "nvtypes.h"','').replace('static inline', 'static inline __attribute__((unused))')
+    code=PRELUDE.replace('/* VAB classifier */',header+'\n#define UVM_ASSERT assert\n'+budget)
     for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):
         code+=function(source,name)
     code+=SCENARIOS
