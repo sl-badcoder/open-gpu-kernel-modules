@@ -207,7 +207,7 @@ MODULE_PARM_DESC(uvm_perf_speculative_prefetch_limit_mb, "Per-GPU speculative by
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_reserve_mb, "Free PMA capacity reserved from speculative admission, in MiB (default 64).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_quiet_ms, "Deprecated shared timing override in ms; nonzero overrides churn/backoff/recovery, zero (default) uses independent timers.");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_churn_ms, "Prefetch-to-eviction and eviction-to-return detection windows (default 250 ms; includes residency grace).");
-MODULE_PARM_DESC(uvm_perf_speculative_prefetch_backoff_ms, "Minimum interval between window reductions (default 50 ms).");
+MODULE_PARM_DESC(uvm_perf_speculative_prefetch_backoff_ms, "Minimum spacing between qualifying bad-event samples and sequential growth observation (default 50 ms).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_recovery_ms, "Quiet observation interval and OFF-state probe cooldown (default 500 ms; covers both churn windows).");
 module_param(uvm_perf_vab_min_residency_ms, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_vab_min_residency_ms, "Minimum completed residency before VAB background selection (default 100 ms).");
@@ -1866,11 +1866,14 @@ void uvm_pmm_gpu_prefetch_feedback(uvm_pmm_gpu_t *pmm, bool quick_return)
     uvm_prefetch_budget_config_t config = speculative_prefetch_config();
 
     uvm_spin_lock(&pmm->list_lock);
-    if (quick_return)
-        ++pmm->eager_eviction.budget.quick_returns;
-    else
-        ++pmm->eager_eviction.budget.capacity_stops;
-    uvm_prefetch_budget_backoff(&pmm->eager_eviction.budget, &config, NV_GETTIME());
+    uvm_prefetch_budget_feedback(&pmm->eager_eviction.budget, &config, quick_return, NV_GETTIME());
+    uvm_spin_unlock(&pmm->list_lock);
+}
+
+void uvm_pmm_gpu_prefetch_pressure_pause(uvm_pmm_gpu_t *pmm)
+{
+    uvm_spin_lock(&pmm->list_lock);
+    uvm_prefetch_budget_pressure_pause(&pmm->eager_eviction.budget);
     uvm_spin_unlock(&pmm->list_lock);
 }
 
@@ -1896,11 +1899,9 @@ NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
     }
     else {
         ++pmm->eager_eviction.budget.denials;
-        // Mutual exclusion with an active worker is not failed speculation.
-        if (pmm->eager_eviction.recovering_watermark) {
-            ++pmm->eager_eviction.budget.capacity_stops;
-            uvm_prefetch_budget_backoff(&pmm->eager_eviction.budget, &config, NV_GETTIME());
-        }
+        // Watermark recovery is an admission pause, not failed speculation.
+        if (pmm->eager_eviction.recovering_watermark)
+            uvm_prefetch_budget_pressure_pause(&pmm->eager_eviction.budget);
     }
     uvm_spin_unlock(&pmm->list_lock);
 
@@ -3578,6 +3579,9 @@ void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
     stats->prefetch_probes = pmm->eager_eviction.budget.probes;
     stats->prefetch_probe_failures = pmm->eager_eviction.budget.probe_failures;
     stats->prefetch_sequential_recoveries = pmm->eager_eviction.budget.sequential_recoveries;
+    stats->prefetch_pressure_pauses = pmm->eager_eviction.budget.pressure_pauses;
+    stats->prefetch_allocation_failures = pmm->eager_eviction.budget.allocation_failures;
+    stats->prefetch_feedback_confirmations = pmm->eager_eviction.budget.feedback_confirmations;
     stats->recovering_watermark = pmm->eager_eviction.recovering_watermark;
     stats->background_active = pmm->eager_eviction.active;
     stats->used_cold = 0;

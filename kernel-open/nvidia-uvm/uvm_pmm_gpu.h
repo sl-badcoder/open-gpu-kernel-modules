@@ -214,6 +214,9 @@ typedef struct {
     NvU64 prefetch_probes;
     NvU64 prefetch_probe_failures;
     NvU64 prefetch_sequential_recoveries;
+    NvU64 prefetch_pressure_pauses;
+    NvU64 prefetch_allocation_failures;
+    NvU64 prefetch_feedback_confirmations;
 } uvm_pmm_gpu_vab_stats_t;
 
 // Lists for allocated root chunks. When picking a root chunk to evict, lists
@@ -678,9 +681,11 @@ void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm,
                                             NvU64 transferred_bytes,
                                             NvU64 neighbor_bytes,
                                             bool success);
-// Feedback from capacity failure or a prefetched block evicted and demanded
+// Feedback only from a no-eviction allocation failure or a prefetched block evicted and demanded
 // again within the observation window. Safe under a VA-block lock.
 void uvm_pmm_gpu_prefetch_feedback(uvm_pmm_gpu_t *pmm, bool quick_return);
+// Ordinary headroom/watermark pauses do not change adaptive state.
+void uvm_pmm_gpu_prefetch_pressure_pause(uvm_pmm_gpu_t *pmm);
 void uvm_pmm_gpu_prefetch_observe(uvm_pmm_gpu_t *pmm, NvU64 owner, NvU64 address);
 NvU64 uvm_pmm_gpu_prefetch_feedback_window_ns(void);
 bool uvm_pmm_gpu_speculative_prefetch_enabled(void);

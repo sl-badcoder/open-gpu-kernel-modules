@@ -53,6 +53,7 @@ static NvU64 reservation_generation = 17;
 static bool reservation_probe = true;
 static int calls, begin_calls, end_calls, waits, capacity_at, error_at, wait_error;
 static int watermark_at, watermark_calls, feedback_quick, feedback_capacity;
+static int pressure_pauses;
 static int observations;
 static bool completed_success;
 static size_t visited[8];
@@ -73,6 +74,7 @@ static void uvm_assert_mutex_locked(int *p) {assert(*p);}
 static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get(uvm_va_block_t *b,int id) {(void)id;assert(b->lock);return &b->state;}
 static NvU64 uvm_pmm_gpu_prefetch_feedback_window_ns(void) {return 100*NSEC_PER_MSEC;}
 static void uvm_pmm_gpu_prefetch_feedback(uvm_pmm_gpu_t *p,bool quick) {(void)p;if(quick)++feedback_quick;else ++feedback_capacity;}
+static void uvm_pmm_gpu_prefetch_pressure_pause(uvm_pmm_gpu_t *p) {(void)p;++pressure_pauses;}
 static void uvm_pmm_gpu_prefetch_observe(uvm_pmm_gpu_t *p,NvU64 owner,NvU64 address) {
  (void)p;assert(owner==(NvU64)(unsigned long)&range && address==blocks[trigger_slot].start);++observations;
 }
@@ -119,7 +121,7 @@ static void reset(void) {
  for(size_t i=0;i<8;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
  enabled=supported=true;alloc_fail=trigger_resident=false;grant=4*UVM_SIZE_1MB;requested=reserved=transferred=neighbor_transferred=0;
  calls=begin_calls=end_calls=waits=capacity_at=error_at=wait_error=0;
- watermark_at=-1;watermark_calls=feedback_quick=feedback_capacity=observations=0;completed_success=false;
+ watermark_at=-1;watermark_calls=feedback_quick=feedback_capacity=observations=pressure_pauses=0;completed_success=false;
  trigger_slot=4;
  uvm_cpu_preferred_prefetch_chunk_mb=64;
  uvm_cpu_preferred_prefetch_capacity_stops=uvm_cpu_preferred_range_prefetches=0;
@@ -142,8 +144,8 @@ int main(void) {
  reset();uvm_cpu_preferred_prefetch_chunk_mb=0;run();assert(!begin_calls && !calls);
  // Every admitted failure waits before releasing the reservation.
  reset();error_at=1;run();assert(calls==1 && end_calls==1 && !completed_success && !reserved);
- reset();capacity_at=2;run();assert(calls==2 && end_calls==1 && !completed_success && feedback_capacity==1 && blocks[4].gpu_prefetch_retry);
- reset();watermark_at=0;run();assert(!calls && end_calls==1 && !completed_success && feedback_capacity==1);
+ reset();capacity_at=2;run();assert(calls==2 && end_calls==1 && !completed_success && feedback_capacity==1 && !pressure_pauses && blocks[4].gpu_prefetch_retry);
+ reset();watermark_at=0;run();assert(!calls && end_calls==1 && !completed_success && !feedback_capacity && pressure_pauses==1);
  reset();wait_error=9;run();assert(end_calls==1 && !completed_success && !reserved);
  // Context allocation failure cannot leak an admission or change retry state.
  reset();alloc_fail=true;run();assert(!begin_calls && !end_calls && !blocks[4].gpu_prefetch_started);

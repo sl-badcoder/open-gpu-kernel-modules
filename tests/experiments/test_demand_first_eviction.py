@@ -8,7 +8,7 @@ import tempfile
 ROOT = Path(__file__).parents[2]
 
 def function(source, name):
-    match = re.search(r"^(?:static [^\n]*|void )\b" + name + r"\(", source, re.M)
+    match = re.search(r"^(?:static [^\n]*|void |NvU64 )\b" + name + r"\(", source, re.M)
     if match is None:
         raise ValueError(name)
     start = match.start()

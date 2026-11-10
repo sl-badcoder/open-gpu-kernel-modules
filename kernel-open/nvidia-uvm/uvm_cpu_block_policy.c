@@ -450,7 +450,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
             atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
             capacity_stopped = true;
             prefetch_success = false;
-            uvm_pmm_gpu_prefetch_feedback(&gpu->pmm, false);
+            uvm_pmm_gpu_prefetch_pressure_pause(&gpu->pmm);
             break;
         }
 

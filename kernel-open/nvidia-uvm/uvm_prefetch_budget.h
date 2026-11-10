@@ -35,6 +35,10 @@ typedef struct {
     NvU64 sequential_address;
     NvU64 sequential_ns;
     NvU64 sequential_start_ns;
+    NvU64 feedback_first_ns;
+    NvU64 feedback_last_ns;
+    unsigned feedback_samples;
+    bool feedback_quick_return;
     unsigned sequential_blocks;
     bool sequential_reverse;
     bool initialized;
@@ -50,6 +54,9 @@ typedef struct {
     NvU64 probes;
     NvU64 probe_failures;
     NvU64 sequential_recoveries;
+    NvU64 pressure_pauses;
+    NvU64 allocation_failures;
+    NvU64 feedback_confirmations;
 } uvm_prefetch_budget_t;
 
 static inline NvU64 uvm_prefetch_budget_limit(NvU64 bytes)
@@ -99,6 +106,14 @@ static inline void uvm_prefetch_budget_observe(uvm_prefetch_budget_t *budget,
     budget->sequential_ns = now;
 }
 
+static inline void uvm_prefetch_budget_invalidate(uvm_prefetch_budget_t *budget)
+{
+    ++budget->feedback_generation;
+    budget->success_pending = false;
+    budget->sequential_blocks = 0;
+}
+
+// Apply a confirmed reduction. Admission pressure alone must not call this.
 static inline void uvm_prefetch_budget_backoff(uvm_prefetch_budget_t *budget,
                                               const uvm_prefetch_budget_config_t *config,
                                               NvU64 now)
@@ -107,9 +122,7 @@ static inline void uvm_prefetch_budget_backoff(uvm_prefetch_budget_t *budget,
     NvU64 window, probe_size;
 
     // Invalidate ALL earlier success credit, even if reduction is rate limited.
-    ++budget->feedback_generation;
-    budget->success_pending = false;
-    budget->sequential_blocks = 0;
+    uvm_prefetch_budget_invalidate(budget);
     budget->next_growth_ns = now + config->recovery_ns;
     if (!limit)
         return;
@@ -129,13 +142,63 @@ static inline void uvm_prefetch_budget_backoff(uvm_prefetch_budget_t *budget,
         window = 0;
     }
     else {
-        window = uvm_prefetch_budget_limit(window / 2);
+        NvU64 decrease = uvm_prefetch_budget_limit(window / 4);
+        if (decrease < UVM_PREFETCH_BUDGET_QUANTUM)
+            decrease = UVM_PREFETCH_BUDGET_QUANTUM;
+        window -= decrease;
         if (window < probe_size)
             window = probe_size;
     }
     budget->window_bytes = window;
     budget->last_backoff_ns = now;
     ++budget->backoffs;
+}
+
+static inline void uvm_prefetch_budget_pressure_pause(uvm_prefetch_budget_t *budget)
+{
+    ++budget->capacity_stops;
+    ++budget->pressure_pauses;
+}
+
+// Only genuine no-eviction allocation failures and consumed quick-return
+// markers belong here. A callback burst is not sustained negative evidence.
+static inline void uvm_prefetch_budget_feedback(uvm_prefetch_budget_t *budget,
+                                               const uvm_prefetch_budget_config_t *config,
+                                               bool quick_return, NvU64 now)
+{
+    NvU64 horizon = config->recovery_ns;
+    if (horizon < 2 * config->backoff_ns)
+        horizon = 2 * config->backoff_ns;
+
+    if (quick_return) {
+        ++budget->quick_returns;
+    }
+    else {
+        ++budget->capacity_stops;
+        ++budget->allocation_failures;
+    }
+
+    if (!budget->feedback_samples || budget->feedback_quick_return != quick_return ||
+        now < budget->feedback_last_ns || now - budget->feedback_first_ns > horizon) {
+        budget->feedback_samples = 1;
+        budget->feedback_first_ns = now;
+        budget->feedback_last_ns = now;
+        budget->feedback_quick_return = quick_return;
+    }
+    else if (now - budget->feedback_last_ns >= config->backoff_ns) {
+        ++budget->feedback_samples;
+        budget->feedback_last_ns = now;
+        if (budget->feedback_samples == 3) {
+            budget->feedback_samples = 0;
+            ++budget->feedback_confirmations;
+            uvm_prefetch_budget_backoff(budget, config, now);
+            return;
+        }
+    }
+
+    // Invalidate old copy credit even for an unconfirmed real failure, but
+    // do not continually push the recovery deadline into the future.
+    uvm_prefetch_budget_invalidate(budget);
 }
 
 static inline NvU64 uvm_prefetch_budget_reserve(uvm_prefetch_budget_t *budget,
@@ -182,8 +245,7 @@ static inline NvU64 uvm_prefetch_budget_reserve(uvm_prefetch_budget_t *budget,
     headroom = free_bytes > config->demand_reserve_bytes ? free_bytes - config->demand_reserve_bytes : 0;
     headroom = headroom > budget->reserved_bytes ? headroom - budget->reserved_bytes : 0;
     if (headroom < UVM_PREFETCH_BUDGET_QUANTUM) {
-        ++budget->capacity_stops;
-        uvm_prefetch_budget_backoff(budget, config, now);
+        uvm_prefetch_budget_pressure_pause(budget);
         goto denied;
     }
 
@@ -232,8 +294,7 @@ static inline NvU64 uvm_prefetch_budget_reserve(uvm_prefetch_budget_t *budget,
     grant = uvm_prefetch_budget_limit(grant);
     // Partial probes containing only the trigger provide no neighbor evidence.
     if (probe && grant < 2 * UVM_PREFETCH_BUDGET_QUANTUM) {
-        ++budget->capacity_stops;
-        uvm_prefetch_budget_backoff(budget, config, now);
+        uvm_prefetch_budget_pressure_pause(budget);
         goto denied;
     }
     if (!grant)
@@ -274,6 +335,10 @@ static inline void uvm_prefetch_budget_complete(uvm_prefetch_budget_t *budget,
     budget->reserved_bytes -= reservation->bytes;
     credit = success && neighbor_bytes &&
              reservation->feedback_generation == budget->feedback_generation;
+    // A successful neighbor attempt breaks an allocation-failure streak.
+    // Copy completion cannot disprove churn, so keep quick-return evidence.
+    if (credit && !budget->feedback_quick_return)
+        budget->feedback_samples = 0;
     if (reservation->probe) {
         UVM_ASSERT(budget->probe_inflight);
         budget->probe_inflight = false;
