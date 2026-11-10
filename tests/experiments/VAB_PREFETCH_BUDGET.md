@@ -45,14 +45,31 @@ change the hardware address mapping, or claim to measure cache hits or exact reu
    Failed, empty, trigger-only, or feedback-invalidated probes stay OFF and wait
    another cooldown. A successful probe must actually copy neighbor bytes, then
    pass another 500 ms observation interval before reopening at 4 MiB.
-7. Active windows recover by at most 2 MiB per observation interval, up to the
-   cap. Actual neighbor copies earn one pending recovery credit; further
+7. Without locality evidence, active windows recover by at most 2 MiB per 500 ms
+   observation interval, up to the cap. Actual neighbor copies earn one pending
+   recovery credit; further
    completions cannot stack credits or postpone its observation start. Every
    negative signal invalidates all earlier credits and in-flight attempts' credit,
    even when the reduction itself is rate limited. A copy followed by quiet is
    **not proof of useful reuse**; this is cautious recovery using the available
    churn feedback. An explicitly configured 2 MiB hard cap cannot probe a neighbor
    and therefore remains OFF after backoff reaches zero.
+8. Four distinct adjacent 2 MiB blocks signaled in one direction in the same
+   managed allocation within 500 ms form a spatial-run hint. Both ascending and
+   descending runs count. Duplicates do not count or refresh the hint; gaps,
+   reversals, allocation changes, timeout, and negative feedback reset the run.
+   This observes demand notifications before the one-shot prefetch gate, never
+   the speculative neighbor walk. One current stream is tracked per GPU, so
+   interleaved allocations can conservatively prevent detection.
+9. An active window with a fresh hint and copied-neighbor credit from that same
+   allocation can **double** after a 50 ms observation interval, up to the hard
+   cap. Each fast increase consumes both the run and credit; another increase
+   needs a new four-block run and new successful neighbor copies. The existing
+   post-negative 500 ms deadline still applies. OFF still requires the ordinary
+   serialized probe and full 500 ms observation before reopening at 4 MiB.
+   A prior slow recovery deadline also remains in force when a hint first appears;
+   fast increases thereafter are spaced by at least 50 ms. These times follow
+   the configured backoff/recovery timers, not separate controls.
 
 Reservations cover full 2 MiB VA blocks even when only some pages migrate; sparse
 ranges may therefore be throttled earlier than their copied payload requires.
@@ -68,6 +85,11 @@ replacement cycle, but cannot prove that the evicted data was never used. Pressu
 feedback can shrink speculation even when no return is observed. Random access
 without either pressure or a quick eviction/return signal is not detected as
 random. This controller does not measure link utilization or prefetch hit rate.
+Notifications may be sorted before this policy sees them. A spatial-run hint
+therefore indicates nearby signaled blocks, not proven temporal sequentiality;
+a dense random notification batch can also produce one. Successful copies and
+headroom checks still apply. Sparse signals caused by already effective prefetch
+or interleaved streams may fail to form adjacent runs.
 
 ## Parameters
 
@@ -134,6 +156,8 @@ did not exercise the new budget. Read these new fields:
 - `prefetch_suppressed`, `prefetch_probes`, `prefetch_probe_failures`: OFF/probe
   gating and probe outcomes. A probe failure includes no neighbor movement or
   intervening negative feedback, not only a GPU-copy error.
+- `prefetch_sequential_recoveries`: active-window doublings using same-allocation
+  spatial-run evidence, also included in `prefetch_recoveries`.
 
 Check that peak reservations never exceed the fixed cap and that reservations
 return to zero after work drains. When backoff lowers the window below already
@@ -145,6 +169,11 @@ and `prefetch_backoffs` rise and the window reaches OFF under repeated feedback.
 Verify admissions pause, apart from serialized probes after cooldown. Once
 pressure stops, check that a probe copying neighbors remains OFF for the
 observation interval, then reopens at 4 MiB; later growth occurs in 2 MiB steps.
+Switch to a sustained contiguous-access phase and check that
+`prefetch_sequential_recoveries` increases and the window can double toward the
+cap after successful neighbor copies. Without adjacent demand notifications,
+recovery continues through the slower 2 MiB path. Compare this phase change with
+a random-access phase under the same memory pressure.
 Sample faster than the old one-second interval to see these transitions. A cold streaming
 workload may instead back off via `prefetch_capacity_stops`. The existing
 `selected_hot` counter also includes mandatory demand selections; it need not be

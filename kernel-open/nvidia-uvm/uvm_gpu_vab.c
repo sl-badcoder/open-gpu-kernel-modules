@@ -409,6 +409,7 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
                roots.prefetch_probe_inflight, roots.prefetch_recovery_pending);
     seq_printf(s, "prefetch_suppressed %llu\nprefetch_probes %llu\nprefetch_probe_failures %llu\n",
                roots.prefetch_suppressed, roots.prefetch_probes, roots.prefetch_probe_failures);
+    seq_printf(s, "prefetch_sequential_recoveries %llu\n", roots.prefetch_sequential_recoveries);
 
     // Raw words expose hot/cold bits even without a physical range mapping.
     // Word zero is first; bit i belongs to word i/64 at position i%64.

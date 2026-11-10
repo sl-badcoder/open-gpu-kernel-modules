@@ -1852,6 +1852,15 @@ bool uvm_pmm_gpu_speculative_prefetch_enabled(void)
     return uvm_perf_speculative_prefetch_limit_mb >= 2;
 }
 
+void uvm_pmm_gpu_prefetch_observe(uvm_pmm_gpu_t *pmm, NvU64 owner, NvU64 address)
+{
+    uvm_prefetch_budget_config_t config = speculative_prefetch_config();
+
+    uvm_spin_lock(&pmm->list_lock);
+    uvm_prefetch_budget_observe(&pmm->eager_eviction.budget, &config, owner, address, NV_GETTIME());
+    uvm_spin_unlock(&pmm->list_lock);
+}
+
 void uvm_pmm_gpu_prefetch_feedback(uvm_pmm_gpu_t *pmm, bool quick_return)
 {
     uvm_prefetch_budget_config_t config = speculative_prefetch_config();
@@ -1866,6 +1875,7 @@ void uvm_pmm_gpu_prefetch_feedback(uvm_pmm_gpu_t *pmm, bool quick_return)
 }
 
 NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
+                                               NvU64 owner,
                                                NvU64 requested_bytes,
                                                uvm_prefetch_reservation_t *reservation)
 {
@@ -1880,7 +1890,7 @@ NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
         NvU64 free_bytes = pmm->pma_stats ?
                               READ_ONCE(pmm->pma_stats->numFreePages64k) * (NvU64)UVM_PAGE_SIZE_64K : 0;
         granted = uvm_prefetch_budget_reserve(&pmm->eager_eviction.budget, &config,
-                                               requested_bytes, free_bytes, NV_GETTIME(), reservation);
+                                               owner, requested_bytes, free_bytes, NV_GETTIME(), reservation);
         if (granted)
             ++pmm->eager_eviction.prefetch_count;
     }
@@ -3567,6 +3577,7 @@ void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
     stats->prefetch_suppressed = pmm->eager_eviction.budget.suppressed;
     stats->prefetch_probes = pmm->eager_eviction.budget.probes;
     stats->prefetch_probe_failures = pmm->eager_eviction.budget.probe_failures;
+    stats->prefetch_sequential_recoveries = pmm->eager_eviction.budget.sequential_recoveries;
     stats->recovering_watermark = pmm->eager_eviction.recovering_watermark;
     stats->background_active = pmm->eager_eviction.active;
     stats->used_cold = 0;

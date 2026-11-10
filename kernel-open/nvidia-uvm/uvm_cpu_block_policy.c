@@ -357,6 +357,10 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     }
     uvm_mutex_unlock(&trigger_block->lock);
 
+    // Count demand notifications even when the one-shot prefetch already ran.
+    // The range identity is only compared as an opaque token under PMM lock.
+    uvm_pmm_gpu_prefetch_observe(&gpu->pmm, (NvU64)(unsigned long)managed_range, trigger_block->start);
+
     if (uvm_processor_mask_test(&trigger_block->gpu_prefetch_started, gpu->id)) {
         if (!uvm_processor_mask_test(&trigger_block->gpu_prefetch_retry, gpu->id) ||
             uvm_pmm_gpu_eager_eviction_watermark_reached(&gpu->pmm)) {
@@ -388,6 +392,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     // Reserve the entire bounded chunk before any speculative submission. The
     // reservation stays live through the final GPU wait on every exit path.
     reserved_bytes = uvm_pmm_gpu_eager_eviction_prefetch_begin(&gpu->pmm,
+                                                               (NvU64)(unsigned long)managed_range,
                                                                (NvU64)chunk_block_count * UVM_VA_BLOCK_SIZE,
                                                                &reservation);
     if (!reserved_bytes) {

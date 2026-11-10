@@ -18,6 +18,7 @@ typedef struct {
 typedef struct {
     NvU64 bytes;
     NvU64 feedback_generation;
+    NvU64 owner;
     bool probe;
 } uvm_prefetch_reservation_t;
 
@@ -29,6 +30,13 @@ typedef struct {
     NvU64 next_growth_ns;
     NvU64 feedback_generation;
     NvU64 success_ns;
+    NvU64 success_owner;
+    NvU64 sequential_owner;
+    NvU64 sequential_address;
+    NvU64 sequential_ns;
+    NvU64 sequential_start_ns;
+    unsigned sequential_blocks;
+    bool sequential_reverse;
     bool initialized;
     bool probe_inflight;
     bool success_pending;
@@ -41,6 +49,7 @@ typedef struct {
     NvU64 suppressed;
     NvU64 probes;
     NvU64 probe_failures;
+    NvU64 sequential_recoveries;
 } uvm_prefetch_budget_t;
 
 static inline NvU64 uvm_prefetch_budget_limit(NvU64 bytes)
@@ -53,6 +62,43 @@ static inline NvU64 uvm_prefetch_budget_probe_size(NvU64 limit)
     return limit < 2 * UVM_PREFETCH_BUDGET_QUANTUM ? limit : 2 * UVM_PREFETCH_BUDGET_QUANTUM;
 }
 
+// Observe demand signals only, never the speculative walk. The owner is an
+// opaque range identity, not a retained pointer. One stream per GPU keeps this
+// conservative when unrelated allocations interleave. Notification sorting
+// means this detects spatial locality, not the order of GPU instructions.
+static inline void uvm_prefetch_budget_observe(uvm_prefetch_budget_t *budget,
+                                              const uvm_prefetch_budget_config_t *config,
+                                              NvU64 owner, NvU64 address, NvU64 now)
+{
+    bool reverse = address < budget->sequential_address;
+    NvU64 distance = reverse ? budget->sequential_address - address : address - budget->sequential_address;
+
+    if (budget->sequential_blocks && budget->sequential_owner == owner &&
+        now >= budget->sequential_ns && now >= budget->sequential_start_ns &&
+        now - budget->sequential_start_ns <= config->recovery_ns) {
+        // Repeated signals for one block cannot manufacture a run or refresh it.
+        if (!distance)
+            return;
+        if (distance == UVM_PREFETCH_BUDGET_QUANTUM &&
+            (budget->sequential_blocks == 1 || reverse == budget->sequential_reverse)) {
+            if (budget->sequential_blocks < 4)
+                ++budget->sequential_blocks;
+            budget->sequential_reverse = reverse;
+        }
+        else {
+            budget->sequential_blocks = 1;
+            budget->sequential_start_ns = now;
+        }
+    }
+    else {
+        budget->sequential_blocks = 1;
+        budget->sequential_start_ns = now;
+    }
+    budget->sequential_owner = owner;
+    budget->sequential_address = address;
+    budget->sequential_ns = now;
+}
+
 static inline void uvm_prefetch_budget_backoff(uvm_prefetch_budget_t *budget,
                                               const uvm_prefetch_budget_config_t *config,
                                               NvU64 now)
@@ -63,6 +109,7 @@ static inline void uvm_prefetch_budget_backoff(uvm_prefetch_budget_t *budget,
     // Invalidate ALL earlier success credit, even if reduction is rate limited.
     ++budget->feedback_generation;
     budget->success_pending = false;
+    budget->sequential_blocks = 0;
     budget->next_growth_ns = now + config->recovery_ns;
     if (!limit)
         return;
@@ -93,15 +140,17 @@ static inline void uvm_prefetch_budget_backoff(uvm_prefetch_budget_t *budget,
 
 static inline NvU64 uvm_prefetch_budget_reserve(uvm_prefetch_budget_t *budget,
                                                const uvm_prefetch_budget_config_t *config,
-                                               NvU64 requested, NvU64 free_bytes, NvU64 now,
+                                               NvU64 owner, NvU64 requested, NvU64 free_bytes, NvU64 now,
                                                uvm_prefetch_reservation_t *reservation)
 {
     NvU64 limit = uvm_prefetch_budget_limit(config->limit_bytes);
-    NvU64 grant, headroom, ceiling;
+    NvU64 grant, headroom, ceiling, observation_ns;
+    bool sequential;
     bool probe = false;
 
     reservation->bytes = 0;
     reservation->feedback_generation = 0;
+    reservation->owner = owner;
     reservation->probe = false;
     if (!limit || requested < UVM_PREFETCH_BUDGET_QUANTUM)
         goto denied;
@@ -138,21 +187,31 @@ static inline NvU64 uvm_prefetch_budget_reserve(uvm_prefetch_budget_t *budget,
         goto denied;
     }
 
+    sequential = budget->window_bytes && budget->sequential_blocks >= 4 &&
+                 budget->sequential_owner == budget->success_owner &&
+                 now >= budget->sequential_ns && now - budget->sequential_ns <= config->recovery_ns;
+    observation_ns = sequential ? config->backoff_ns : config->recovery_ns;
+
     // Apply at most one deferred growth credit. Successful copies alone do not
     // immediately grow the window; they first need a feedback-free interval.
     if (budget->success_pending && now >= budget->next_growth_ns &&
-        now >= budget->success_ns && now - budget->success_ns >= config->recovery_ns) {
+        now >= budget->success_ns && now - budget->success_ns >= observation_ns) {
         if (!budget->window_bytes) {
             budget->window_bytes = uvm_prefetch_budget_probe_size(limit);
         }
         else if (budget->window_bytes < limit) {
             NvU64 increase = limit - budget->window_bytes;
-            if (increase > UVM_PREFETCH_BUDGET_QUANTUM)
-                increase = UVM_PREFETCH_BUDGET_QUANTUM;
+            NvU64 step = sequential ? budget->window_bytes : UVM_PREFETCH_BUDGET_QUANTUM;
+            if (increase > step)
+                increase = step;
             budget->window_bytes += increase;
+            if (sequential) {
+                ++budget->sequential_recoveries;
+                budget->sequential_blocks = 0;
+            }
         }
         budget->success_pending = false;
-        budget->next_growth_ns = now + config->recovery_ns;
+        budget->next_growth_ns = now + observation_ns;
         ++budget->recoveries;
     }
 
@@ -227,6 +286,7 @@ static inline void uvm_prefetch_budget_complete(uvm_prefetch_budget_t *budget,
         !budget->success_pending) {
         budget->success_pending = true;
         budget->success_ns = now;
+        budget->success_owner = reservation->owner;
     }
 }
 

@@ -27,7 +27,7 @@ struct mm_struct { int unused; };
 typedef struct { int lock; } uvm_va_space_t;
 typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns; } uvm_va_block_gpu_state_t;
 typedef struct { int unused; } uvm_pmm_gpu_t;
-typedef struct { NvU64 bytes; NvU64 feedback_generation; bool probe; } uvm_prefetch_reservation_t;
+typedef struct { NvU64 bytes; NvU64 feedback_generation; NvU64 owner; bool probe; } uvm_prefetch_reservation_t;
 typedef struct { int id; uvm_pmm_gpu_t pmm; } uvm_gpu_t;
 typedef struct uvm_va_range_managed_struct uvm_va_range_managed_t;
 typedef struct {
@@ -53,6 +53,7 @@ static NvU64 reservation_generation = 17;
 static bool reservation_probe = true;
 static int calls, begin_calls, end_calls, waits, capacity_at, error_at, wait_error;
 static int watermark_at, watermark_calls, feedback_quick, feedback_capacity;
+static int observations;
 static bool completed_success;
 static size_t visited[8];
 static size_t trigger_slot;
@@ -72,6 +73,9 @@ static void uvm_assert_mutex_locked(int *p) {assert(*p);}
 static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get(uvm_va_block_t *b,int id) {(void)id;assert(b->lock);return &b->state;}
 static NvU64 uvm_pmm_gpu_prefetch_feedback_window_ns(void) {return 100*NSEC_PER_MSEC;}
 static void uvm_pmm_gpu_prefetch_feedback(uvm_pmm_gpu_t *p,bool quick) {(void)p;if(quick)++feedback_quick;else ++feedback_capacity;}
+static void uvm_pmm_gpu_prefetch_observe(uvm_pmm_gpu_t *p,NvU64 owner,NvU64 address) {
+ (void)p;assert(owner==(NvU64)(unsigned long)&range && address==blocks[trigger_slot].start);++observations;
+}
 static bool uvm_processor_mask_test(unsigned *p,int id) {(void)id;return *p;}
 static bool uvm_processor_mask_test_and_clear_atomic(unsigned *p,int id) {(void)id;bool old=*p;*p=0;return old;}
 static bool uvm_processor_mask_test_and_set_atomic(unsigned *p,int id) {(void)id;bool old=*p;*p=1;return old;}
@@ -83,13 +87,15 @@ static size_t uvm_va_range_num_blocks(uvm_va_range_managed_t *r) {return r->coun
 static size_t uvm_va_range_block_index(uvm_va_range_managed_t *r,NvU64 start) {(void)r;return start/UVM_VA_BLOCK_SIZE;}
 static uvm_va_block_t *uvm_va_range_block(uvm_va_range_managed_t *r,size_t index) {assert(index<r->count);return r->blocks[index];}
 static bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *p) {(void)p;return watermark_at>=0 && watermark_calls++>=watermark_at;}
-static NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *p,NvU64 bytes,uvm_prefetch_reservation_t *r) {
+static NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *p,NvU64 owner,NvU64 bytes,uvm_prefetch_reservation_t *r) {
  (void)p;++begin_calls;assert(!reserved);requested=bytes;reserved=grant;assert(grant<=bytes);
- r->bytes=grant;r->feedback_generation=reservation_generation;r->probe=reservation_probe;return grant;
+ assert(owner==(NvU64)(unsigned long)&range);
+ r->owner=owner;r->bytes=grant;r->feedback_generation=reservation_generation;r->probe=reservation_probe;return grant;
 }
 static void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *p,uvm_prefetch_reservation_t *r,NvU64 moved,NvU64 neighbor,bool success) {
  (void)p;assert(waits==1 && reserved==r->bytes && moved<=r->bytes && neighbor<=moved);
  assert(r->feedback_generation==reservation_generation && r->probe==reservation_probe);
+ assert(r->owner==(NvU64)(unsigned long)&range);
  reserved=0;transferred=moved;neighbor_transferred=neighbor;completed_success=success;++end_calls;
 }
 static NV_STATUS uvm_tracker_wait_deinit(uvm_tracker_t *p) {(void)p;++waits;return wait_error;}
@@ -113,7 +119,7 @@ static void reset(void) {
  for(size_t i=0;i<8;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
  enabled=supported=true;alloc_fail=trigger_resident=false;grant=4*UVM_SIZE_1MB;requested=reserved=transferred=neighbor_transferred=0;
  calls=begin_calls=end_calls=waits=capacity_at=error_at=wait_error=0;
- watermark_at=-1;watermark_calls=feedback_quick=feedback_capacity=0;completed_success=false;
+ watermark_at=-1;watermark_calls=feedback_quick=feedback_capacity=observations=0;completed_success=false;
  trigger_slot=4;
  uvm_cpu_preferred_prefetch_chunk_mb=64;
  uvm_cpu_preferred_prefetch_capacity_stops=uvm_cpu_preferred_range_prefetches=0;
@@ -142,7 +148,7 @@ int main(void) {
  // Context allocation failure cannot leak an admission or change retry state.
  reset();alloc_fail=true;run();assert(!begin_calls && !end_calls && !blocks[4].gpu_prefetch_started);
  // One-shot callback avoids repeat copies; capacity-retry can be claimed once.
- reset();run();run();assert(begin_calls==1 && calls==2);
+ reset();run();run();assert(begin_calls==1 && calls==2 && observations==2);
  reset();grant=0;run();grant=4*UVM_SIZE_1MB;waits=0;run();assert(end_calls==1 && calls==2 && uvm_cpu_preferred_prefetch_retries==1);
  // Actual eviction hook and actual demand callback: quick return is consumed once.
  reset();blocks[4].state.speculative_prefetch_ns=now-10;blocks[4].lock=1;
