@@ -61,7 +61,7 @@ struct chunk;
 struct list_head { struct chunk *first; };
 typedef struct chunk { struct { struct chunk *next; } list; bool is_zero, claimed; NvU64 address; unsigned state; void *va_block; } uvm_gpu_chunk_t;
 typedef struct { uvm_gpu_chunk_t chunk; NvU64 vab_generation,vab_ready_generation,vab_ready_ns; } uvm_gpu_root_chunk_t;
-typedef struct { NvU64 used_cold,used_hot,used_unknown,selected_hot,selected_cold,selected_unknown,background_roots_freed,background_failures,usage_percent,prefetch_inflight,recovering_watermark,background_active,selection_changes,selection_fallbacks,eligible_roots,readiness_pending,background_hot_skips,background_unknown_skips,prefetch_reserved_bytes,prefetch_peak_bytes,prefetch_window_bytes,prefetch_admissions,prefetch_denials,prefetch_backoffs,prefetch_quick_returns,prefetch_capacity_stops,prefetch_recoveries,prefetch_limit_bytes,prefetch_demand_reserve_bytes; } uvm_pmm_gpu_vab_stats_t;
+/* VAB stats */
 typedef struct { int dummy; } uvm_parent_gpu_t;
 typedef struct { uvm_parent_gpu_t *parent; } uvm_gpu_t;
 static uvm_gpu_t mock_gpu;
@@ -184,6 +184,10 @@ def main():
     header=(ROOT / 'kernel-open/nvidia-uvm/uvm_vab.h').read_text().replace('#include "nvtypes.h"','')
     budget=(ROOT / 'kernel-open/nvidia-uvm/uvm_prefetch_budget.h').read_text().replace('#include "nvtypes.h"','').replace('static inline', 'static inline __attribute__((unused))')
     code=PRELUDE.replace('/* VAB classifier */',header+'\n#define UVM_ASSERT assert\n'+budget)
+    pmm_header = (ROOT / 'kernel-open/nvidia-uvm/uvm_pmm_gpu.h').read_text()
+    stats_end = pmm_header.index('} uvm_pmm_gpu_vab_stats_t;') + len('} uvm_pmm_gpu_vab_stats_t;')
+    stats = pmm_header[pmm_header.rfind('typedef struct', 0, stats_end):stats_end]
+    code = code.replace('/* VAB stats */', stats)
     for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):
         code+=function(source,name)
     code+=SCENARIOS

@@ -206,6 +206,13 @@ typedef struct {
     NvU64 prefetch_recoveries;
     NvU64 prefetch_limit_bytes;
     NvU64 prefetch_demand_reserve_bytes;
+    NvU64 prefetch_initialized;
+    NvU64 prefetch_off;
+    NvU64 prefetch_probe_inflight;
+    NvU64 prefetch_recovery_pending;
+    NvU64 prefetch_suppressed;
+    NvU64 prefetch_probes;
+    NvU64 prefetch_probe_failures;
 } uvm_pmm_gpu_vab_stats_t;
 
 // Lists for allocated root chunks. When picking a root chunk to evict, lists
@@ -660,10 +667,13 @@ bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm);
 // Return a byte reservation (zero denies) outside the eager eviction phase,
 // bounded by the per-GPU adaptive cap and free capacity minus demand reserve.
 // Every nonzero begin must be paired with end after GPU work completes.
-NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm, NvU64 requested_bytes);
+NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
+                                               NvU64 requested_bytes,
+                                               uvm_prefetch_reservation_t *reservation);
 void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm,
-                                            NvU64 reserved_bytes,
+                                            const uvm_prefetch_reservation_t *reservation,
                                             NvU64 transferred_bytes,
+                                            NvU64 neighbor_bytes,
                                             bool success);
 // Feedback from capacity failure or a prefetched block evicted and demanded
 // again within the observation window. Safe under a VA-block lock.

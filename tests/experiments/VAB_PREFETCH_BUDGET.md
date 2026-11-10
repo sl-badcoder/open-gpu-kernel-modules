@@ -33,14 +33,23 @@ change the hardware address mapping, or claim to measure cache hits or exact reu
    blocks and neighbor prefetch submissions are not counted as return signals.
 5. Actual capacity failures, insufficient admission headroom, and watermark
    recovery also reduce the window. Merely colliding with an active background
-   worker or another prefetch's byte reservation does not. Reductions are limited
-   to one per feedback interval and stop at 4 MiB (or the fixed cap if smaller).
-6. After a quiet interval, a successful nonempty attempt can increase the window
-   by 2 MiB, at most once per interval, up to the fixed cap. This is a bounded
-   probationary probe, **not proof of useful reuse**. Empty or failed attempts do
-   not recover. The 4 MiB floor leaves one neighbor slot even if demand promotion
-   made the trigger a no-op. An explicitly configured 2 MiB hard cap intentionally
-   permits only the trigger block.
+   worker or another prefetch's byte reservation does not. Reductions have their
+   own 10 ms minimum spacing. With the default cap, eligible feedback reduces
+   32 → 16 → 8 → 4 → **0 MiB (OFF)**. Existing transfers drain normally.
+6. OFF persists across callbacks. After 500 ms without negative feedback and
+   after existing work drains, admit a single 4 MiB probe (trigger plus neighbor).
+   All concurrent speculative callbacks are suppressed until it completes.
+   Failed, empty, trigger-only, or feedback-invalidated probes stay OFF and wait
+   another cooldown. A successful probe must actually copy neighbor bytes, then
+   pass another 500 ms observation interval before reopening at 4 MiB.
+7. Active windows recover by at most 2 MiB per observation interval, up to the
+   cap. Actual neighbor copies earn one pending recovery credit; further
+   completions cannot stack credits or postpone its observation start. Every
+   negative signal invalidates all earlier credits and in-flight attempts' credit,
+   even when the reduction itself is rate limited. A copy followed by quiet is
+   **not proof of useful reuse**; this is cautious recovery using the available
+   churn feedback. An explicitly configured 2 MiB hard cap cannot probe a neighbor
+   and therefore remains OFF after backoff reaches zero.
 
 Reservations cover full 2 MiB VA blocks even when only some pages migrate; sparse
 ranges may therefore be throttled earlier than their copied payload requires.
@@ -53,7 +62,9 @@ The byte limit bounds outstanding speculative payload, not sustained bytes/sec.
 It also does not bound allocator batching, page-table allocations, or compulsory
 copies. Rapid eviction/return is a churn heuristic: it can identify an expensive
 replacement cycle, but cannot prove that the evicted data was never used. Pressure
-feedback can shrink speculation even when no return is observed.
+feedback can shrink speculation even when no return is observed. Random access
+without either pressure or a quick eviction/return signal is not detected as
+random. This controller does not measure link utilization or prefetch hit rate.
 
 ## Parameters
 
@@ -65,7 +76,14 @@ them):
 | --- | ---: | --- |
 | `uvm_perf_speculative_prefetch_limit_mb` | 32 | Hard per-GPU outstanding reservation ceiling in MiB; rounded down to 2 MiB. Values 0 or 1 disable this speculative path without retry churn. |
 | `uvm_perf_speculative_prefetch_reserve_mb` | 64 | PMA free capacity withheld from speculative admission, in MiB. |
-| `uvm_perf_speculative_prefetch_quiet_ms` | 1000 | Prefetch-to-eviction and eviction-to-return windows; minimum spacing between backoffs and recovery probes. Effective minimum 1 ms. |
+| `uvm_perf_speculative_prefetch_churn_ms` | 250 | Each of the prefetch-to-eviction and eviction-to-return detection windows. |
+| `uvm_perf_speculative_prefetch_backoff_ms` | 10 | Minimum spacing between reductions; negative signals still invalidate recovery during this interval. |
+| `uvm_perf_speculative_prefetch_recovery_ms` | 500 | Quiet observation interval and OFF probe cooldown; default covers both churn windows. |
+| `uvm_perf_speculative_prefetch_quiet_ms` | 0 | Legacy compatibility override: nonzero overrides all three timers. Leave zero to use independent timers. |
+
+Each effective timer has a minimum of 1 ms. If tuning the churn window, account
+for the background residency grace period; too short a window can miss churn.
+Keep recovery long enough to observe both stages of the eviction/return cycle.
 
 Keep `uvm_cpu_preferred_blocks_enable=1` and a nonzero
 `uvm_cpu_preferred_prefetch_chunk_mb` if testing the access-counter-guided chunk
@@ -76,7 +94,10 @@ run. For example, load-time experiment arguments can include:
 uvm_cpu_preferred_blocks_enable=1
 uvm_perf_speculative_prefetch_limit_mb=32
 uvm_perf_speculative_prefetch_reserve_mb=64
-uvm_perf_speculative_prefetch_quiet_ms=1000
+uvm_perf_speculative_prefetch_quiet_ms=0
+uvm_perf_speculative_prefetch_churn_ms=250
+uvm_perf_speculative_prefetch_backoff_ms=10
+uvm_perf_speculative_prefetch_recovery_ms=500
 ```
 
 VAB background selection still requires a **verified** physical range mapping
@@ -100,10 +121,16 @@ did not exercise the new budget. Read these new fields:
   proactive used-root picker, not distinct-root counts.
 - `prefetch_limit_bytes`, `prefetch_demand_reserve_bytes`: configured settings.
 - `prefetch_reserved_bytes`, `prefetch_peak_bytes`: live/peak reservations.
-- `prefetch_window_bytes`: adaptive aggregate ceiling; zero before first use.
+- `prefetch_window_bytes`: adaptive aggregate ceiling; zero before first use or
+  while OFF. A single OFF probe can have reserved bytes despite a zero window.
+- `prefetch_initialized`, `prefetch_off`, `prefetch_probe_inflight`,
+  `prefetch_recovery_pending`: distinguish startup, suppression, and recovery.
 - `prefetch_admissions`, `prefetch_denials`: admission outcomes.
 - `prefetch_backoffs`, `prefetch_quick_returns`, `prefetch_capacity_stops`,
   `prefetch_recoveries`: feedback and adjustment counters.
+- `prefetch_suppressed`, `prefetch_probes`, `prefetch_probe_failures`: OFF/probe
+  gating and probe outcomes. A probe failure includes no neighbor movement or
+  intervening negative feedback, not only a GPU-copy error.
 
 Check that peak reservations never exceed the fixed cap and that reservations
 return to zero after work drains. When backoff lowers the window below already
@@ -111,7 +138,11 @@ reserved bytes, existing transfers finish normally and new admissions wait for
 the count to drain. Immediate cancellation is neither required nor attempted.
 
 Induce a quick eviction-and-return cycle and check that `prefetch_quick_returns`
-and `prefetch_backoffs` rise and the window falls toward 4 MiB. A cold streaming
+and `prefetch_backoffs` rise and the window reaches OFF under repeated feedback.
+Verify admissions pause, apart from serialized probes after cooldown. Once
+pressure stops, check that a probe copying neighbors remains OFF for the
+observation interval, then reopens at 4 MiB; later growth occurs in 2 MiB steps.
+Sample faster than the old one-second interval to see these transitions. A cold streaming
 workload may instead back off via `prefetch_capacity_stops`. The existing
 `selected_hot` counter also includes mandatory demand selections; it need not be
 zero. Use the production cold-only picker test to validate that background

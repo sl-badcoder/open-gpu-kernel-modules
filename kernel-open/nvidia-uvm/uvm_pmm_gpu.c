@@ -192,13 +192,23 @@ static unsigned uvm_perf_eager_eviction_batch_count = 16;
 static unsigned uvm_perf_vab_min_residency_ms = 100;
 static unsigned uvm_perf_speculative_prefetch_limit_mb = 32;
 static unsigned uvm_perf_speculative_prefetch_reserve_mb = 64;
-static unsigned uvm_perf_speculative_prefetch_quiet_ms = 1000;
+// Optional legacy override. Zero enables the independent timing controls.
+static unsigned uvm_perf_speculative_prefetch_quiet_ms;
+static unsigned uvm_perf_speculative_prefetch_churn_ms = 250;
+static unsigned uvm_perf_speculative_prefetch_backoff_ms = 10;
+static unsigned uvm_perf_speculative_prefetch_recovery_ms = 500;
 module_param(uvm_perf_speculative_prefetch_limit_mb, uint, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_reserve_mb, uint, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_quiet_ms, uint, S_IRUGO);
+module_param(uvm_perf_speculative_prefetch_churn_ms, uint, S_IRUGO);
+module_param(uvm_perf_speculative_prefetch_backoff_ms, uint, S_IRUGO);
+module_param(uvm_perf_speculative_prefetch_recovery_ms, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_limit_mb, "Per-GPU speculative bytes in flight, in MiB (default 32, rounded down to 2MiB; values below 2 disable speculation).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_reserve_mb, "Free PMA capacity reserved from speculative admission, in MiB (default 64).");
-MODULE_PARM_DESC(uvm_perf_speculative_prefetch_quiet_ms, "Quick-return feedback window and minimum interval between adaptive adjustments (default 1000 ms).");
+MODULE_PARM_DESC(uvm_perf_speculative_prefetch_quiet_ms, "Deprecated shared timing override in ms; nonzero overrides churn/backoff/recovery, zero (default) uses independent timers.");
+MODULE_PARM_DESC(uvm_perf_speculative_prefetch_churn_ms, "Prefetch-to-eviction and eviction-to-return detection windows (default 250 ms; includes residency grace).");
+MODULE_PARM_DESC(uvm_perf_speculative_prefetch_backoff_ms, "Minimum interval between window reductions (default 10 ms).");
+MODULE_PARM_DESC(uvm_perf_speculative_prefetch_recovery_ms, "Quiet observation interval and OFF-state probe cooldown (default 500 ms; covers both churn windows).");
 module_param(uvm_perf_vab_min_residency_ms, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_vab_min_residency_ms, "Minimum completed residency before VAB background selection (default 100 ms).");
 
@@ -1816,9 +1826,25 @@ bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm)
     return blocked;
 }
 
+static NvU64 speculative_prefetch_interval_ns(unsigned interval_ms)
+{
+    unsigned legacy = READ_ONCE(uvm_perf_speculative_prefetch_quiet_ms);
+    return (NvU64)max(legacy ? legacy : interval_ms, 1U) * NSEC_PER_MSEC;
+}
+
+static uvm_prefetch_budget_config_t speculative_prefetch_config(void)
+{
+    uvm_prefetch_budget_config_t config;
+    config.limit_bytes = (NvU64)uvm_perf_speculative_prefetch_limit_mb * UVM_SIZE_1MB;
+    config.demand_reserve_bytes = (NvU64)uvm_perf_speculative_prefetch_reserve_mb * UVM_SIZE_1MB;
+    config.backoff_ns = speculative_prefetch_interval_ns(uvm_perf_speculative_prefetch_backoff_ms);
+    config.recovery_ns = speculative_prefetch_interval_ns(uvm_perf_speculative_prefetch_recovery_ms);
+    return config;
+}
+
 NvU64 uvm_pmm_gpu_prefetch_feedback_window_ns(void)
 {
-    return (NvU64)max(READ_ONCE(uvm_perf_speculative_prefetch_quiet_ms), 1U) * NSEC_PER_MSEC;
+    return speculative_prefetch_interval_ns(uvm_perf_speculative_prefetch_churn_ms);
 }
 
 bool uvm_pmm_gpu_speculative_prefetch_enabled(void)
@@ -1828,32 +1854,33 @@ bool uvm_pmm_gpu_speculative_prefetch_enabled(void)
 
 void uvm_pmm_gpu_prefetch_feedback(uvm_pmm_gpu_t *pmm, bool quick_return)
 {
+    uvm_prefetch_budget_config_t config = speculative_prefetch_config();
+
     uvm_spin_lock(&pmm->list_lock);
     if (quick_return)
         ++pmm->eager_eviction.budget.quick_returns;
     else
         ++pmm->eager_eviction.budget.capacity_stops;
-    uvm_prefetch_budget_backoff(&pmm->eager_eviction.budget,
-                                 (NvU64)uvm_perf_speculative_prefetch_limit_mb * UVM_SIZE_1MB,
-                                 NV_GETTIME(), uvm_pmm_gpu_prefetch_feedback_window_ns());
+    uvm_prefetch_budget_backoff(&pmm->eager_eviction.budget, &config, NV_GETTIME());
     uvm_spin_unlock(&pmm->list_lock);
 }
 
-NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm, NvU64 requested_bytes)
+NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
+                                               NvU64 requested_bytes,
+                                               uvm_prefetch_reservation_t *reservation)
 {
+    uvm_prefetch_budget_config_t config = speculative_prefetch_config();
     bool blocked;
     NvU64 granted = 0;
 
+    memset(reservation, 0, sizeof(*reservation));
     uvm_spin_lock(&pmm->list_lock);
     blocked = eager_eviction_supported(pmm) && eager_eviction_prefetch_blocked_locked(pmm);
     if (!blocked) {
         NvU64 free_bytes = pmm->pma_stats ?
                               READ_ONCE(pmm->pma_stats->numFreePages64k) * (NvU64)UVM_PAGE_SIZE_64K : 0;
-        granted = uvm_prefetch_budget_reserve(&pmm->eager_eviction.budget,
-                                               requested_bytes, free_bytes,
-                                               (NvU64)uvm_perf_speculative_prefetch_limit_mb * UVM_SIZE_1MB,
-                                               (NvU64)uvm_perf_speculative_prefetch_reserve_mb * UVM_SIZE_1MB,
-                                               NV_GETTIME(), uvm_pmm_gpu_prefetch_feedback_window_ns());
+        granted = uvm_prefetch_budget_reserve(&pmm->eager_eviction.budget, &config,
+                                               requested_bytes, free_bytes, NV_GETTIME(), reservation);
         if (granted)
             ++pmm->eager_eviction.prefetch_count;
     }
@@ -1862,9 +1889,7 @@ NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm, NvU64 reques
         // Mutual exclusion with an active worker is not failed speculation.
         if (pmm->eager_eviction.recovering_watermark) {
             ++pmm->eager_eviction.budget.capacity_stops;
-            uvm_prefetch_budget_backoff(&pmm->eager_eviction.budget,
-                                         (NvU64)uvm_perf_speculative_prefetch_limit_mb * UVM_SIZE_1MB,
-                                         NV_GETTIME(), uvm_pmm_gpu_prefetch_feedback_window_ns());
+            uvm_prefetch_budget_backoff(&pmm->eager_eviction.budget, &config, NV_GETTIME());
         }
     }
     uvm_spin_unlock(&pmm->list_lock);
@@ -1876,17 +1901,18 @@ NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm, NvU64 reques
 }
 
 void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm,
-                                            NvU64 reserved_bytes,
+                                            const uvm_prefetch_reservation_t *reservation,
                                             NvU64 transferred_bytes,
+                                            NvU64 neighbor_bytes,
                                             bool success)
 {
+    uvm_prefetch_budget_config_t config = speculative_prefetch_config();
     bool resume_recovery;
 
     uvm_spin_lock(&pmm->list_lock);
     UVM_ASSERT(pmm->eager_eviction.prefetch_count > 0);
-    uvm_prefetch_budget_complete(&pmm->eager_eviction.budget, reserved_bytes, transferred_bytes,
-                                  (NvU64)uvm_perf_speculative_prefetch_limit_mb * UVM_SIZE_1MB,
-                                  NV_GETTIME(), uvm_pmm_gpu_prefetch_feedback_window_ns(), success);
+    uvm_prefetch_budget_complete(&pmm->eager_eviction.budget, &config, reservation,
+                                  transferred_bytes, neighbor_bytes, NV_GETTIME(), success);
     --pmm->eager_eviction.prefetch_count;
     resume_recovery = !pmm->eager_eviction.prefetch_count && pmm->eager_eviction.recovering_watermark;
     uvm_spin_unlock(&pmm->list_lock);
@@ -3534,6 +3560,13 @@ void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
     stats->prefetch_recoveries = pmm->eager_eviction.budget.recoveries;
     stats->prefetch_limit_bytes = (NvU64)uvm_perf_speculative_prefetch_limit_mb * UVM_SIZE_1MB;
     stats->prefetch_demand_reserve_bytes = (NvU64)uvm_perf_speculative_prefetch_reserve_mb * UVM_SIZE_1MB;
+    stats->prefetch_initialized = pmm->eager_eviction.budget.initialized;
+    stats->prefetch_off = pmm->eager_eviction.budget.initialized && !pmm->eager_eviction.budget.window_bytes;
+    stats->prefetch_probe_inflight = pmm->eager_eviction.budget.probe_inflight;
+    stats->prefetch_recovery_pending = pmm->eager_eviction.budget.success_pending;
+    stats->prefetch_suppressed = pmm->eager_eviction.budget.suppressed;
+    stats->prefetch_probes = pmm->eager_eviction.budget.probes;
+    stats->prefetch_probe_failures = pmm->eager_eviction.budget.probe_failures;
     stats->recovering_watermark = pmm->eager_eviction.recovering_watermark;
     stats->background_active = pmm->eager_eviction.active;
     stats->used_cold = 0;

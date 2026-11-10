@@ -27,6 +27,7 @@ struct mm_struct { int unused; };
 typedef struct { int lock; } uvm_va_space_t;
 typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns; } uvm_va_block_gpu_state_t;
 typedef struct { int unused; } uvm_pmm_gpu_t;
+typedef struct { NvU64 bytes; NvU64 feedback_generation; bool probe; } uvm_prefetch_reservation_t;
 typedef struct { int id; uvm_pmm_gpu_t pmm; } uvm_gpu_t;
 typedef struct uvm_va_range_managed_struct uvm_va_range_managed_t;
 typedef struct {
@@ -47,7 +48,9 @@ static long long uvm_cpu_preferred_prefetch_retries, uvm_cpu_preferred_prefetche
 static void atomic64_inc(long long *p) {++*p;}
 static void atomic64_add(NvU64 n,long long *p) {*p+=(long long)n;}
 static bool enabled, supported, alloc_fail, trigger_resident;
-static NvU64 grant, requested, reserved, transferred;
+static NvU64 grant, requested, reserved, transferred, neighbor_transferred;
+static NvU64 reservation_generation = 17;
+static bool reservation_probe = true;
 static int calls, begin_calls, end_calls, waits, capacity_at, error_at, wait_error;
 static int watermark_at, watermark_calls, feedback_quick, feedback_capacity;
 static bool completed_success;
@@ -80,21 +83,25 @@ static size_t uvm_va_range_num_blocks(uvm_va_range_managed_t *r) {return r->coun
 static size_t uvm_va_range_block_index(uvm_va_range_managed_t *r,NvU64 start) {(void)r;return start/UVM_VA_BLOCK_SIZE;}
 static uvm_va_block_t *uvm_va_range_block(uvm_va_range_managed_t *r,size_t index) {assert(index<r->count);return r->blocks[index];}
 static bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *p) {(void)p;return watermark_at>=0 && watermark_calls++>=watermark_at;}
-static NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *p,NvU64 bytes) {
- (void)p;++begin_calls;assert(!reserved);requested=bytes;reserved=grant;assert(grant<=bytes);return grant;
+static NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *p,NvU64 bytes,uvm_prefetch_reservation_t *r) {
+ (void)p;++begin_calls;assert(!reserved);requested=bytes;reserved=grant;assert(grant<=bytes);
+ r->bytes=grant;r->feedback_generation=reservation_generation;r->probe=reservation_probe;return grant;
 }
-static void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *p,NvU64 bytes,NvU64 moved,bool success) {
- (void)p;assert(waits==1 && reserved==bytes && moved<=bytes);reserved=0;transferred=moved;completed_success=success;++end_calls;
+static void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *p,uvm_prefetch_reservation_t *r,NvU64 moved,NvU64 neighbor,bool success) {
+ (void)p;assert(waits==1 && reserved==r->bytes && moved<=r->bytes && neighbor<=moved);
+ assert(r->feedback_generation==reservation_generation && r->probe==reservation_probe);
+ reserved=0;transferred=moved;neighbor_transferred=neighbor;completed_success=success;++end_calls;
 }
 static NV_STATUS uvm_tracker_wait_deinit(uvm_tracker_t *p) {(void)p;++waits;return wait_error;}
 static NV_STATUS prefetch_block(uvm_va_block_t *b,uvm_gpu_t *g,struct mm_struct *m,
- uvm_va_block_context_t *ctx,uvm_tracker_t *tracker,NvU64 *moved,bool *capacity,bool neighbor) {
+ uvm_va_block_context_t *ctx,uvm_tracker_t *tracker,NvU64 *moved,NvU64 *neighbor_moved,bool *capacity,bool neighbor) {
  (void)g;(void)m;(void)ctx;(void)tracker;assert(!b->lock && reserved && calls<8);
  visited[calls]=(size_t)(b-blocks);assert(neighbor == (b!=&blocks[trigger_slot]));
  ++calls;*capacity=(calls==capacity_at);
  if(*capacity)return 7;
  if(trigger_resident && !neighbor)return NV_OK;
- *moved+=UVM_VA_BLOCK_SIZE;assert(*moved<=reserved);
+ *moved+=UVM_VA_BLOCK_SIZE;if(neighbor)*neighbor_moved+=UVM_VA_BLOCK_SIZE;
+ assert(*moved<=reserved && *neighbor_moved<=*moved);
  return calls==error_at ? 8 : NV_OK;
 }
 '''
@@ -104,7 +111,7 @@ static void reset(void) {
  memset(blocks,0,sizeof(blocks));memset(&range,0,sizeof(range));
  space.lock=1;range.va_range.va_space=&space;range.count=8;
  for(size_t i=0;i<8;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
- enabled=supported=true;alloc_fail=trigger_resident=false;grant=4*UVM_SIZE_1MB;requested=reserved=transferred=0;
+ enabled=supported=true;alloc_fail=trigger_resident=false;grant=4*UVM_SIZE_1MB;requested=reserved=transferred=neighbor_transferred=0;
  calls=begin_calls=end_calls=waits=capacity_at=error_at=wait_error=0;
  watermark_at=-1;watermark_calls=feedback_quick=feedback_capacity=0;completed_success=false;
  trigger_slot=4;
@@ -116,7 +123,7 @@ static void run(void){uvm_cpu_block_policy_prefetch_on_signal(&blocks[trigger_sl
 int main(void) {
  // Actual production loop: range clamps request; grant truncates it; trigger is first.
  reset();run();assert(requested==16*UVM_SIZE_1MB && calls==2 && visited[0]==4 && visited[1]==3);
- assert(end_calls==1 && completed_success && transferred==grant && !reserved);
+ assert(end_calls==1 && completed_success && transferred==grant && neighbor_transferred==grant-UVM_VA_BLOCK_SIZE && !reserved);
  reset();grant=8*UVM_SIZE_1MB;run();assert(calls==4 && visited[0]==4 && visited[1]==2 && visited[2]==3 && visited[3]==5);
  reset();grant=8*UVM_SIZE_1MB;trigger_slot=7;run();assert(calls==4 && visited[0]==7 && visited[1]==4 && visited[2]==5 && visited[3]==6);
  // At the adaptive floor, a promoted/no-op trigger still leaves a neighbor probe.

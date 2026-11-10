@@ -204,6 +204,7 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
                                 uvm_va_block_context_t *block_context,
                                 uvm_tracker_t *prefetch_tracker,
                                 NvU64 *prefetched_bytes,
+                                NvU64 *neighbor_bytes,
                                 bool *capacity_stop,
                                 bool speculative_neighbor)
 {
@@ -261,6 +262,7 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
         *prefetched_bytes += moved;
         if (moved && speculative_neighbor) {
             uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+            *neighbor_bytes += moved;
             UVM_ASSERT(gpu_state);
             // A submission timestamp is sufficient for coarse churn detection;
             // it is never treated as hardware access/reuse evidence.
@@ -319,7 +321,9 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     size_t candidate_index;
     NvU64 chunk_bytes;
     NvU64 prefetched_bytes = 0;
+    NvU64 neighbor_bytes = 0;
     NvU64 reserved_bytes = 0;
+    uvm_prefetch_reservation_t reservation = {0};
     unsigned prefetch_chunk_mb = READ_ONCE(uvm_cpu_preferred_prefetch_chunk_mb);
     bool retry = false;
     bool capacity_stopped = false;
@@ -384,7 +388,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     // Reserve the entire bounded chunk before any speculative submission. The
     // reservation stays live through the final GPU wait on every exit path.
     reserved_bytes = uvm_pmm_gpu_eager_eviction_prefetch_begin(&gpu->pmm,
-                                                               (NvU64)chunk_block_count * UVM_VA_BLOCK_SIZE);
+                                                               (NvU64)chunk_block_count * UVM_VA_BLOCK_SIZE,
+                                                               &reservation);
     if (!reserved_bytes) {
         atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
         uvm_processor_mask_set_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
@@ -455,6 +460,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                 block_context,
                                 &prefetch_tracker,
                                 &prefetched_bytes,
+                                &neighbor_bytes,
                                 &capacity_stop,
                                 candidate_index != trigger_index);
         if (capacity_stop) {
@@ -498,7 +504,8 @@ out:
     }
 
     if (prefetch_admitted)
-        uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm, reserved_bytes, prefetched_bytes, prefetch_success);
+        uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm, &reservation,
+                                                prefetched_bytes, neighbor_bytes, prefetch_success);
 
     uvm_va_block_context_free(block_context);
 }

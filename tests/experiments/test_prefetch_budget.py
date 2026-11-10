@@ -1,133 +1,212 @@
 #!/usr/bin/env python3
-"""Behavioral tests for the production speculative-prefetch byte budget."""
+"""Execute the actual budget controller under deterministic concurrent schedules."""
 from pathlib import Path
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).parents[2]
-
 PRELUDE = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <limits.h>
 typedef uint64_t NvU64;
 #define UVM_ASSERT assert
 '''
 
-SCENARIOS = r'''
-static const NvU64 Q = UVM_PREFETCH_BUDGET_QUANTUM;
-static void fresh(uvm_prefetch_budget_t *b) { memset(b, 0, sizeof(*b)); }
+CASES = r'''
+#define Q UVM_PREFETCH_BUDGET_QUANTUM
+// Abstract clock ticks: reduction spacing 10, recovery/cooldown 100.
+static uvm_prefetch_budget_config_t config = {16 * Q, 0, 10, 100};
+static void off(uvm_prefetch_budget_t *b)
+{
+    memset(b, 0, sizeof(*b));
+    uvm_prefetch_budget_backoff(b, &config, 0);
+    assert(b->window_bytes == 8 * Q);
+    uvm_prefetch_budget_backoff(b, &config, 10);
+    assert(b->window_bytes == 4 * Q);
+    uvm_prefetch_budget_backoff(b, &config, 20);
+    assert(b->window_bytes == 2 * Q);
+    uvm_prefetch_budget_backoff(b, &config, 30);
+    assert(b->initialized && !b->window_bytes && b->next_growth_ns == 130);
+}
+
+static void caps_and_capacity(void)
+{
+    uvm_prefetch_budget_t b = {0};
+    uvm_prefetch_reservation_t a, c, denied;
+    uvm_prefetch_budget_config_t cfg = {5 * Q + 1, Q, 10, 100};
+    assert(uvm_prefetch_budget_reserve(&b, &cfg, 3 * Q + Q / 2, 16 * Q, 0, &a) == 3 * Q);
+    assert(uvm_prefetch_budget_reserve(&b, &cfg, 3 * Q, 16 * Q, 1, &c) == 2 * Q);
+    assert(b.reserved_bytes == 5 * Q && b.peak_bytes == 5 * Q);
+    assert(!uvm_prefetch_budget_reserve(&b, &cfg, Q, 16 * Q, 2, &denied));
+    assert(!denied.bytes && !b.backoffs && !b.capacity_stops);
+    uvm_prefetch_budget_complete(&b, &cfg, &a, a.bytes, Q, 3, true);
+    uvm_prefetch_budget_complete(&b, &cfg, &c, 0, 0, 4, false);
+    assert(!b.reserved_bytes && !b.success_pending); // Already at hard cap.
+
+    memset(&b, 0, sizeof(b));
+    cfg = config;
+    cfg.demand_reserve_bytes = 2 * Q;
+    assert(!uvm_prefetch_budget_reserve(&b, &cfg, Q, 2 * Q, 0, &a));
+    assert(b.capacity_stops == 1 && b.backoffs == 1 && !b.reserved_bytes);
+    memset(&b, 0, sizeof(b));
+    assert(!uvm_prefetch_budget_reserve(&b, &config, Q, 0, 0, &a));
+    assert(b.capacity_stops == 1);
+    for (unsigned i = 0; i < 2; ++i) {
+        memset(&b, 0, sizeof(b));
+        cfg = config;
+        cfg.limit_bytes = i ? Q / 2 : 0;
+        assert(!uvm_prefetch_budget_reserve(&b, &cfg, 4 * Q, 64 * Q, 0, &a));
+        assert(!b.reserved_bytes && !b.initialized);
+    }
+}
+
+static void drain_then_single_probe_and_reopen(void)
+{
+    uvm_prefetch_budget_t b = {0};
+    uvm_prefetch_reservation_t old, probe, denied, reopened;
+    assert(uvm_prefetch_budget_reserve(&b, &config, 4 * Q, 64 * Q, 0, &old) == 4 * Q);
+    for (unsigned t = 1; t <= 31; t += 10)
+        uvm_prefetch_budget_backoff(&b, &config, t);
+    assert(!b.window_bytes && b.reserved_bytes == 4 * Q);
+    assert(!uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 131, &denied));
+    uvm_prefetch_budget_complete(&b, &config, &old, 4 * Q, Q, 132, true);
+    assert(!b.success_pending); // Old generation cannot revive OFF.
+    assert(uvm_prefetch_budget_reserve(&b, &config, 8 * Q, 64 * Q, 133, &probe) == 2 * Q);
+    assert(probe.probe && b.probe_inflight && !b.window_bytes);
+    NvU64 generation = b.feedback_generation;
+    assert(!uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 134, &denied));
+    assert(b.probes == 1 && b.feedback_generation == generation);
+    uvm_prefetch_budget_complete(&b, &config, &probe, 2 * Q, Q, 140, true);
+    assert(!b.probe_inflight && !b.window_bytes && b.success_pending);
+    assert(!uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 239, &denied));
+    assert(!b.recoveries);
+    assert(uvm_prefetch_budget_reserve(&b, &config, 8 * Q, 64 * Q, 240, &reopened) == 2 * Q);
+    assert(!reopened.probe && b.window_bytes == 2 * Q && b.recoveries == 1);
+    uvm_prefetch_budget_complete(&b, &config, &reopened, 0, 0, 241, false);
+    assert(!b.reserved_bytes);
+}
+
+static void rejected_probes_have_cooldown(void)
+{
+    for (unsigned outcome = 0; outcome < 4; ++outcome) {
+        uvm_prefetch_budget_t b;
+        uvm_prefetch_reservation_t probe, denied;
+        off(&b);
+        assert(!uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 129, &denied));
+        assert(uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 130, &probe) == 2 * Q);
+        if (outcome == 3)
+            uvm_prefetch_budget_backoff(&b, &config, 135);
+        // failure, empty success, trigger-only success, and invalidated success.
+        NvU64 moved = outcome == 1 ? 0 : 2 * Q;
+        NvU64 neighbors = outcome >= 3 ? Q : 0;
+        uvm_prefetch_budget_complete(&b, &config, &probe, moved, neighbors, 140, outcome != 0);
+        assert(!b.window_bytes && !b.success_pending && b.probe_failures == 1);
+        assert(!uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 239, &denied));
+        assert(uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 240, &probe) == 2 * Q);
+        assert(probe.probe && b.probes == 2);
+        uvm_prefetch_budget_complete(&b, &config, &probe, 0, 0, 241, false);
+    }
+}
+
+static void feedback_cancels_passed_probe(void)
+{
+    uvm_prefetch_budget_t b;
+    uvm_prefetch_reservation_t probe, denied;
+    off(&b);
+    assert(uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 130, &probe) == 2 * Q);
+    uvm_prefetch_budget_complete(&b, &config, &probe, 2 * Q, Q, 140, true);
+    uvm_prefetch_budget_backoff(&b, &config, 150);
+    assert(!b.success_pending && !b.window_bytes);
+    assert(!uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 249, &denied));
+    assert(uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 250, &probe) == 2 * Q);
+    assert(probe.probe && !b.recoveries);
+    uvm_prefetch_budget_complete(&b, &config, &probe, 0, 0, 251, false);
+}
+
+static void regular_growth_needs_observation(void)
+{
+    uvm_prefetch_budget_t b = {0};
+    uvm_prefetch_reservation_t a, c, d;
+    uvm_prefetch_budget_backoff(&b, &config, 0);
+    assert(uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 1, &a) == 2 * Q);
+    assert(uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 2, &c) == 2 * Q);
+    uvm_prefetch_budget_complete(&b, &config, &a, 2 * Q, Q, 10, true);
+    uvm_prefetch_budget_complete(&b, &config, &c, 2 * Q, Q, 50, true);
+    assert(b.success_pending && b.success_ns == 10 && !b.recoveries);
+    assert(uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 109, &d) == 2 * Q);
+    assert(b.window_bytes == 8 * Q && !b.recoveries);
+    uvm_prefetch_budget_complete(&b, &config, &d, 0, 0, 109, false);
+    assert(uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 110, &d) == 2 * Q);
+    assert(b.window_bytes == 9 * Q && b.recoveries == 1 && !b.success_pending);
+    uvm_prefetch_budget_complete(&b, &config, &d, 0, 0, 111, false);
+}
+
+static void rate_limited_feedback_invalidates_old_work(void)
+{
+    uvm_prefetch_budget_t b = {0};
+    uvm_prefetch_reservation_t a, c;
+    assert(uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 0, &a) == 2 * Q);
+    uvm_prefetch_budget_backoff(&b, &config, 5);
+    assert(b.window_bytes == 8 * Q);
+    uvm_prefetch_budget_complete(&b, &config, &a, 2 * Q, Q, 6, true);
+    assert(!b.success_pending);
+    assert(uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 7, &c) == 2 * Q);
+    uvm_prefetch_budget_complete(&b, &config, &c, 2 * Q, Q, 8, true);
+    assert(b.success_pending);
+    uvm_prefetch_budget_backoff(&b, &config, 10); // Too soon to halve again.
+    assert(b.window_bytes == 8 * Q && b.backoffs == 1 && !b.success_pending);
+    assert(b.feedback_generation == 2 && b.next_growth_ns == 110);
+    assert(uvm_prefetch_budget_reserve(&b, &config, 2 * Q, 64 * Q, 111, &c) == 2 * Q);
+    assert(!b.recoveries);
+    uvm_prefetch_budget_complete(&b, &config, &c, 0, 0, 112, false);
+}
+
+static void no_illegal_or_partial_probe(void)
+{
+    uvm_prefetch_budget_t b;
+    uvm_prefetch_reservation_t ticket;
+    uvm_prefetch_budget_config_t cfg = config;
+    memset(&b, 0, sizeof(b));
+    cfg.limit_bytes = Q;
+    uvm_prefetch_budget_backoff(&b, &cfg, 0);
+    assert(!uvm_prefetch_budget_reserve(&b, &cfg, Q, 64 * Q, 1000, &ticket));
+    assert(!b.probes && !b.window_bytes);
+    off(&b);
+    assert(!uvm_prefetch_budget_reserve(&b, &config, Q, 64 * Q, 130, &ticket));
+    assert(!b.probes);
+    assert(!uvm_prefetch_budget_reserve(&b, &config, 2 * Q, Q, 131, &ticket));
+    assert(!b.probes && b.capacity_stops == 1 && b.next_growth_ns == 231);
+}
+
 int main(void)
 {
-    uvm_prefetch_budget_t b, c;
-    NvU64 grant;
-
-    /* Disabled/sub-block budgets, absent free capacity, and concurrent cap exhaustion. */
-    fresh(&b);
-    assert(!uvm_prefetch_budget_reserve(&b, Q, 8 * Q, 0, 0, 10, 100));
-    assert(!uvm_prefetch_budget_reserve(&b, Q, 8 * Q, Q / 2, 0, 10, 100));
-    assert(!uvm_prefetch_budget_reserve(&b, Q - 1, 8 * Q, Q, 0, 10, 100));
-    assert(!uvm_prefetch_budget_reserve(&b, Q, 0, Q, 0, 10, 100));
-    fresh(&b);
-    for (unsigned i = 0; i < 6; ++i) {
-        grant = uvm_prefetch_budget_reserve(&b, Q, 16 * Q, 4 * Q, 0, 10, 100);
-        assert(grant == (i < 4 ? Q : 0));
-        assert(b.reserved_bytes <= 4 * Q);
-    }
-    uvm_prefetch_budget_complete(&b, 4 * Q, 4 * Q, 4 * Q, 10, 100, false);
-    assert(!b.reserved_bytes);
-
-    /* Limit and request sizes are rounded down to full VA-block quanta. */
-    assert(uvm_prefetch_budget_limit(Q + 1) == Q);
-    fresh(&b);
-    grant = uvm_prefetch_budget_reserve(&b, 3 * Q + Q / 2, 8 * Q, 5 * Q,
-                                        Q, 100, 10);
-    assert(grant == 3 * Q && b.reserved_bytes == grant);
-    assert(uvm_prefetch_budget_reserve(&b, Q, 8 * Q, 5 * Q, Q, 101, 10) == Q);
-    assert(b.reserved_bytes == 4 * Q && b.peak_bytes == 4 * Q);
-
-    /* Demand reserve, no free capacity, and a full cap deny admission. */
-    assert(uvm_prefetch_budget_reserve(&b, Q, 2 * Q, 5 * Q, 2 * Q, 102, 10) == 0);
-    assert(b.capacity_stops == 1 && b.denials == 1);
-    /* Backoff applies to aggregate outstanding reservations; drain before retrying. */
-    assert(uvm_prefetch_budget_reserve(&b, Q, 8 * Q, 5 * Q, Q, 103, 10) == 0);
-    uvm_prefetch_budget_complete(&b, 4 * Q, 0, 5 * Q, 104, 10, false);
-    assert(uvm_prefetch_budget_reserve(&b, Q, 8 * Q, 5 * Q, Q, 105, 10) == Q);
-
-    /* Interleaved reservations cannot exceed the cap, and completion is safe after errors. */
-    fresh(&b); fresh(&c);
-    assert(uvm_prefetch_budget_reserve(&b, 2 * Q, 8 * Q, 4 * Q, 0, 10, 100) == 2 * Q);
-    assert(uvm_prefetch_budget_reserve(&c, 3 * Q, 8 * Q, 4 * Q, 0, 11, 100) == 3 * Q);
-    assert(b.reserved_bytes == 2 * Q && c.reserved_bytes == 3 * Q);
-    uvm_prefetch_budget_complete(&b, 2 * Q, 0, 4 * Q, 12, 100, false);
-    assert(b.reserved_bytes == 0 && b.recoveries == 0);
-    uvm_prefetch_budget_complete(&c, 3 * Q, Q, 4 * Q, 13, 100, true);
-    assert(c.reserved_bytes == 0 && c.recoveries == 0);
-
-    /* Backoff halves the window, is rate limited, and retains a neighbor probe. */
-    fresh(&b);
-    assert(uvm_prefetch_budget_reserve(&b, 4 * Q, 8 * Q, 8 * Q, 0, 20, 100) == 4 * Q);
-    uvm_prefetch_budget_backoff(&b, 8 * Q, 30, 100);
-    assert(b.window_bytes == 4 * Q && b.backoffs == 1);
-    uvm_prefetch_budget_backoff(&b, 8 * Q, 50, 100);
-    assert(b.window_bytes == 4 * Q && b.backoffs == 1);
-    uvm_prefetch_budget_backoff(&b, 8 * Q, 131, 100);
-    assert(b.window_bytes == 2 * Q && b.backoffs == 2);
-    uvm_prefetch_budget_backoff(&b, 8 * Q, 232, 100);
-    assert(b.window_bytes == 2 * Q && b.backoffs == 3);
-    fresh(&c);
-    uvm_prefetch_budget_backoff(&c, Q, 100, 50);
-    assert(c.window_bytes == Q); /* A smaller hard cap is always respected. */
-
-    /* Only successful non-empty transfers after quiet time recover one quantum. */
-    fresh(&b);
-    uvm_prefetch_budget_backoff(&b, 4 * Q, 100, 50);
-    assert(b.window_bytes == 2 * Q);
-    uvm_prefetch_budget_complete(&b, 0, 0, 4 * Q, 151, 50, true);
-    assert(b.window_bytes == 2 * Q && b.recoveries == 0);
-    grant = uvm_prefetch_budget_reserve(&b, Q, 4 * Q, 4 * Q, 0, 152, 50);
-    assert(grant == Q);
-    uvm_prefetch_budget_complete(&b, Q, Q, 4 * Q, 152, 50, false);
-    assert(b.window_bytes == 2 * Q && b.recoveries == 0);
-    grant = uvm_prefetch_budget_reserve(&b, Q, 4 * Q, 4 * Q, 0, 153, 50);
-    assert(grant == Q);
-    uvm_prefetch_budget_complete(&b, Q, Q, 4 * Q, 153, 50, true);
-    assert(b.window_bytes == 3 * Q && b.recoveries == 1);
-
-    /* Rate-limited bad feedback still postpones recovery until truly quiet. */
-    fresh(&b);
-    uvm_prefetch_budget_backoff(&b, 4 * Q, 100, 50);
-    uvm_prefetch_budget_backoff(&b, 4 * Q, 140, 50);
-    assert(b.backoffs == 1 && b.next_growth_ns == 190);
-    grant = uvm_prefetch_budget_reserve(&b, Q, 8 * Q, 4 * Q, 0, 151, 50);
-    uvm_prefetch_budget_complete(&b, grant, grant, 4 * Q, 151, 50, true);
-    assert(b.window_bytes == 2 * Q && !b.recoveries);
-    grant = uvm_prefetch_budget_reserve(&b, Q, 8 * Q, 4 * Q, 0, 190, 50);
-    uvm_prefetch_budget_complete(&b, grant, grant, 4 * Q, 190, 50, true);
-    assert(b.window_bytes == 3 * Q && b.recoveries == 1);
-    grant = uvm_prefetch_budget_reserve(&b, Q, 4 * Q, 4 * Q, 0, 191, 50);
-    assert(grant == Q);
-    uvm_prefetch_budget_complete(&b, Q, Q, 4 * Q, 191, 50, true);
-    assert(b.window_bytes == 3 * Q && b.recoveries == 1);
-
-    puts("Prefetch budget cap, rounding, reservations, backoff, quiet rate limit and recovery passed.");
+    caps_and_capacity();
+    drain_then_single_probe_and_reopen();
+    rejected_probes_have_cooldown();
+    feedback_cancels_passed_probe();
+    regular_growth_needs_observation();
+    rate_limited_feedback_invalidates_old_work();
+    no_illegal_or_partial_probe();
+    puts("Production budget: OFF, single probes, deferred recovery, epochs, cooldowns and aggregate caps passed.");
     return 0;
 }
 '''
 
+
 def main():
-    header = (ROOT / "kernel-open/nvidia-uvm/uvm_prefetch_budget.h").read_text()
-    code = PRELUDE + header.replace('#include "nvtypes.h"', '') + SCENARIOS
-    with tempfile.TemporaryDirectory(prefix="prefetch-budget-") as directory:
-        c = Path(directory) / "test.c"
-        binary = Path(directory) / "test"
+    header = (ROOT / 'kernel-open/nvidia-uvm/uvm_prefetch_budget.h').read_text()
+    code = PRELUDE + header.replace('#include "nvtypes.h"', '') + CASES
+    with tempfile.TemporaryDirectory(prefix='prefetch-budget-') as directory:
+        c = Path(directory) / 'test.c'
+        binary = Path(directory) / 'test'
         c.write_text(code)
-        subprocess.run(["cc", "-std=gnu11", "-O1", "-Wall", "-Wextra", "-Werror",
-                        "-fsanitize=address,undefined", "-g", str(c), "-o", str(binary)], check=True)
+        subprocess.run(['cc', '-std=c11', '-O1', '-Wall', '-Wextra', '-Werror',
+                        '-fsanitize=address,undefined', '-g', str(c), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
