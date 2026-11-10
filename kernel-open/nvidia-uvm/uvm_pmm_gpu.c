@@ -195,7 +195,7 @@ static unsigned uvm_perf_speculative_prefetch_reserve_mb = 64;
 // Optional legacy override. Zero enables the independent timing controls.
 static unsigned uvm_perf_speculative_prefetch_quiet_ms;
 static unsigned uvm_perf_speculative_prefetch_churn_ms = 250;
-static unsigned uvm_perf_speculative_prefetch_backoff_ms = 10;
+static unsigned uvm_perf_speculative_prefetch_backoff_ms = 50;
 static unsigned uvm_perf_speculative_prefetch_recovery_ms = 500;
 module_param(uvm_perf_speculative_prefetch_limit_mb, uint, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_reserve_mb, uint, S_IRUGO);
@@ -207,7 +207,7 @@ MODULE_PARM_DESC(uvm_perf_speculative_prefetch_limit_mb, "Per-GPU speculative by
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_reserve_mb, "Free PMA capacity reserved from speculative admission, in MiB (default 64).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_quiet_ms, "Deprecated shared timing override in ms; nonzero overrides churn/backoff/recovery, zero (default) uses independent timers.");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_churn_ms, "Prefetch-to-eviction and eviction-to-return detection windows (default 250 ms; includes residency grace).");
-MODULE_PARM_DESC(uvm_perf_speculative_prefetch_backoff_ms, "Minimum interval between window reductions (default 10 ms).");
+MODULE_PARM_DESC(uvm_perf_speculative_prefetch_backoff_ms, "Minimum interval between window reductions (default 50 ms).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_recovery_ms, "Quiet observation interval and OFF-state probe cooldown (default 500 ms; covers both churn windows).");
 module_param(uvm_perf_vab_min_residency_ms, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_vab_min_residency_ms, "Minimum completed residency before VAB background selection (default 100 ms).");

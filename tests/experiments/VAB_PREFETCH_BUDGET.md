@@ -34,8 +34,11 @@ change the hardware address mapping, or claim to measure cache hits or exact reu
 5. Actual capacity failures, insufficient admission headroom, and watermark
    recovery also reduce the window. Merely colliding with an active background
    worker or another prefetch's byte reservation does not. Reductions have their
-   own 10 ms minimum spacing. With the default cap, eligible feedback reduces
+   own 50 ms minimum spacing. With the default cap, eligible feedback reduces
    32 → 16 → 8 → 4 → **0 MiB (OFF)**. Existing transfers drain normally.
+   Four eligible signals can reach OFF over at least 150 ms from the first
+   reduction, rather than the previous 30 ms. Signals inside the spacing interval
+   still cancel recovery credit, but do not reduce the window again.
 6. OFF persists across callbacks. After 500 ms without negative feedback and
    after existing work drains, admit a single 4 MiB probe (trigger plus neighbor).
    All concurrent speculative callbacks are suppressed until it completes.
@@ -77,7 +80,7 @@ them):
 | `uvm_perf_speculative_prefetch_limit_mb` | 32 | Hard per-GPU outstanding reservation ceiling in MiB; rounded down to 2 MiB. Values 0 or 1 disable this speculative path without retry churn. |
 | `uvm_perf_speculative_prefetch_reserve_mb` | 64 | PMA free capacity withheld from speculative admission, in MiB. |
 | `uvm_perf_speculative_prefetch_churn_ms` | 250 | Each of the prefetch-to-eviction and eviction-to-return detection windows. |
-| `uvm_perf_speculative_prefetch_backoff_ms` | 10 | Minimum spacing between reductions; negative signals still invalidate recovery during this interval. |
+| `uvm_perf_speculative_prefetch_backoff_ms` | 50 | Minimum spacing between reductions; negative signals still invalidate recovery during this interval. |
 | `uvm_perf_speculative_prefetch_recovery_ms` | 500 | Quiet observation interval and OFF probe cooldown; default covers both churn windows. |
 | `uvm_perf_speculative_prefetch_quiet_ms` | 0 | Legacy compatibility override: nonzero overrides all three timers. Leave zero to use independent timers. |
 
@@ -96,7 +99,7 @@ uvm_perf_speculative_prefetch_limit_mb=32
 uvm_perf_speculative_prefetch_reserve_mb=64
 uvm_perf_speculative_prefetch_quiet_ms=0
 uvm_perf_speculative_prefetch_churn_ms=250
-uvm_perf_speculative_prefetch_backoff_ms=10
+uvm_perf_speculative_prefetch_backoff_ms=50
 uvm_perf_speculative_prefetch_recovery_ms=500
 ```
 

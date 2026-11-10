@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Execute the actual budget controller under deterministic concurrent schedules."""
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -19,6 +20,30 @@ CASES = r'''
 #define Q UVM_PREFETCH_BUDGET_QUANTUM
 // Abstract clock ticks: reduction spacing 10, recovery/cooldown 100.
 static uvm_prefetch_budget_config_t config = {16 * Q, 0, 10, 100};
+static void default_backoff_tolerates_short_bursts(void)
+{
+    // Use the actual module defaults, with clock units in milliseconds.
+    uvm_prefetch_budget_config_t cfg = {DEFAULT_LIMIT_MB * Q / 2, 0,
+                                         DEFAULT_BACKOFF_MS, DEFAULT_RECOVERY_MS};
+    uvm_prefetch_budget_t b = {0};
+    assert(cfg.backoff_ns == 50);
+    uvm_prefetch_budget_backoff(&b, &cfg, 0);
+    assert(b.window_bytes == 8 * Q);
+    for (unsigned t = 1; t < 150; ++t) {
+        uvm_prefetch_budget_backoff(&b, &cfg, t);
+        if (t < 50)
+            assert(b.window_bytes == 8 * Q);
+        else if (t < 100)
+            assert(b.window_bytes == 4 * Q);
+        else
+            assert(b.window_bytes == 2 * Q);
+    }
+    assert(b.backoffs == 3 && b.feedback_generation == 150);
+    uvm_prefetch_budget_backoff(&b, &cfg, 150);
+    assert(!b.window_bytes && b.backoffs == 4);
+    assert(b.next_growth_ns == 150 + DEFAULT_RECOVERY_MS);
+}
+
 static void off(uvm_prefetch_budget_t *b)
 {
     memset(b, 0, sizeof(*b));
@@ -183,6 +208,7 @@ static void no_illegal_or_partial_probe(void)
 
 int main(void)
 {
+    default_backoff_tolerates_short_bursts();
     caps_and_capacity();
     drain_then_single_probe_and_reopen();
     rejected_probes_have_cooldown();
@@ -198,7 +224,14 @@ int main(void)
 
 def main():
     header = (ROOT / 'kernel-open/nvidia-uvm/uvm_prefetch_budget.h').read_text()
-    code = PRELUDE + header.replace('#include "nvtypes.h"', '') + CASES
+    pmm = (ROOT / 'kernel-open/nvidia-uvm/uvm_pmm_gpu.c').read_text()
+    defaults = ''
+    for macro, parameter in [('LIMIT_MB', 'limit_mb'), ('BACKOFF_MS', 'backoff_ms'),
+                             ('RECOVERY_MS', 'recovery_ms')]:
+        value = re.search(r'static unsigned uvm_perf_speculative_prefetch_' + parameter
+                          + r' = (\d+);', pmm).group(1)
+        defaults += f'#define DEFAULT_{macro} {value}U\n'
+    code = PRELUDE + defaults + header.replace('#include "nvtypes.h"', '') + CASES
     with tempfile.TemporaryDirectory(prefix='prefetch-budget-') as directory:
         c = Path(directory) / 'test.c'
         binary = Path(directory) / 'test'
