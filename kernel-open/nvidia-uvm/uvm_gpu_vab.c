@@ -401,17 +401,35 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
     seq_printf(s, "prefetch_limit_bytes %llu\nprefetch_demand_reserve_bytes %llu\nprefetch_reserved_bytes %llu\nprefetch_peak_bytes %llu\nprefetch_window_bytes %llu\n",
                roots.prefetch_limit_bytes, roots.prefetch_demand_reserve_bytes,
                roots.prefetch_reserved_bytes, roots.prefetch_peak_bytes, roots.prefetch_window_bytes);
-    seq_printf(s, "prefetch_admissions %llu\nprefetch_denials %llu\nprefetch_backoffs %llu\nprefetch_quick_returns %llu\nprefetch_capacity_stops %llu\nprefetch_recoveries %llu\n",
-               roots.prefetch_admissions, roots.prefetch_denials, roots.prefetch_backoffs,
-               roots.prefetch_quick_returns, roots.prefetch_capacity_stops, roots.prefetch_recoveries);
-    seq_printf(s, "prefetch_initialized %llu\nprefetch_off %llu\nprefetch_probe_inflight %llu\nprefetch_recovery_pending %llu\n",
-               roots.prefetch_initialized, roots.prefetch_off,
-               roots.prefetch_probe_inflight, roots.prefetch_recovery_pending);
-    seq_printf(s, "prefetch_suppressed %llu\nprefetch_probes %llu\nprefetch_probe_failures %llu\n",
-               roots.prefetch_suppressed, roots.prefetch_probes, roots.prefetch_probe_failures);
-    seq_printf(s, "prefetch_sequential_recoveries %llu\n", roots.prefetch_sequential_recoveries);
-    seq_printf(s, "prefetch_pressure_pauses %llu\nprefetch_allocation_failures %llu\nprefetch_feedback_confirmations %llu\n",
-               roots.prefetch_pressure_pauses, roots.prefetch_allocation_failures, roots.prefetch_feedback_confirmations);
+    seq_printf(s, "prefetch_admissions %llu\n", roots.prefetch_admissions);
+    seq_printf(s, "prefetch_denials %llu\n", roots.prefetch_denials);
+    seq_printf(s, "prefetch_backoffs %llu\n", roots.prefetch_backoffs);
+    seq_printf(s, "prefetch_quick_returns %llu\n", roots.prefetch_quick_returns);
+    seq_printf(s, "prefetch_capacity_stops %llu\n", roots.prefetch_capacity_stops);
+    seq_printf(s, "prefetch_initialized %llu\n", roots.prefetch_initialized);
+    seq_printf(s, "prefetch_off %llu\n", roots.prefetch_off);
+    seq_printf(s, "prefetch_pressure_pauses %llu\n", roots.prefetch_pressure_pauses);
+    seq_printf(s, "prefetch_allocation_failures %llu\n", roots.prefetch_allocation_failures);
+    seq_printf(s, "prefetch_prefetched_blocks %llu\n", roots.prefetch_prefetched_blocks);
+    seq_printf(s, "prefetch_mature_blocks %llu\n", roots.prefetch_mature_blocks);
+    seq_printf(s, "prefetch_mature_returns %llu\n", roots.prefetch_mature_returns);
+    seq_printf(s, "prefetch_pending_blocks %llu\n", roots.prefetch_pending_blocks);
+    seq_printf(s, "prefetch_pending_returns %llu\n", roots.prefetch_pending_returns);
+    seq_printf(s, "prefetch_last_blocks %llu\n", roots.prefetch_last_blocks);
+    seq_printf(s, "prefetch_last_returns %llu\n", roots.prefetch_last_returns);
+    seq_printf(s, "prefetch_ratio_evaluations %llu\n", roots.prefetch_ratio_evaluations);
+
+    seq_printf(s, "prefetch_discarded_blocks %llu\n", roots.prefetch_discarded_blocks);
+    seq_printf(s, "prefetch_discarded_returns %llu\n", roots.prefetch_discarded_returns);
+    seq_printf(s, "prefetch_dropped_records %llu\n", roots.prefetch_dropped_records);
+    seq_printf(s, "prefetch_dropped_returns %llu\n", roots.prefetch_dropped_returns);
+    seq_printf(s, "prefetch_unretired_blocks %llu\n", roots.prefetch_unretired_blocks);
+    seq_printf(s, "prefetch_unretired_returns %llu\n", roots.prefetch_unretired_returns);
+    seq_printf(s, "prefetch_ready_blocks %llu\n", roots.prefetch_ready_blocks);
+    seq_printf(s, "prefetch_ready_returns %llu\n", roots.prefetch_ready_returns);
+    seq_puts(s, "prefetch_policy rapid_return_ratio_no_recovery\n");
+    seq_printf(s, "prefetch_observation_ns %llu\nprefetch_return_percent %llu\nprefetch_min_blocks %llu\n",
+               roots.prefetch_observation_ns, roots.prefetch_return_percent, roots.prefetch_min_blocks);
 
     // Raw words expose hot/cold bits even without a physical range mapping.
     // Word zero is first; bit i belongs to word i/64 at position i%64.

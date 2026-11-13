@@ -51,6 +51,7 @@ typedef int NV_STATUS;
 #define U64_MAX UINT64_MAX
 #define UVM_ASSERT assert
 #define max(a,b) ((a)>(b)?(a):(b))
+#define min(a,b) ((a)<(b)?(a):(b))
 #define NV_GETTIME() mock_now
 static NvU64 mock_now=1000;
 static unsigned uvm_perf_vab_min_residency_ms=100;
@@ -174,6 +175,16 @@ int main(void){
  assert(eager_eviction_batch(&p,16,95)==1&&p.vab_stats.background_failures==1);
  uvm_pmm_gpu_vab_stats_t stats;uvm_pmm_gpu_vab_stats(&p,&mock_snapshot,&stats);
  assert(stats.eligible_roots==3&&stats.used_cold==3);
+ // Statistics expose idle, mature-but-unretired cohorts without changing policy.
+ reset();
+ p.eager_eviction.budget.cohorts[0]=(uvm_prefetch_cohort_t){.id=1,.tick=1,.blocks=32,.returns=16};
+ p.eager_eviction.budget.cohorts[1]=(uvm_prefetch_cohort_t){.id=2,.tick=5,.blocks=4,.returns=1};
+ mock_now=100*NSEC_PER_MSEC; // T=20ms: tick1 ready; tick5 still young.
+ uvm_prefetch_budget_t before=p.eager_eviction.budget;
+ uvm_pmm_gpu_vab_stats(&p,&mock_snapshot,&stats);
+ assert(stats.prefetch_unretired_blocks==36 && stats.prefetch_unretired_returns==17);
+ assert(stats.prefetch_ready_blocks==32 && stats.prefetch_ready_returns==16);
+ assert(!memcmp(&before,&p.eager_eviction.budget,sizeof(before)));
  puts("Production VAB demand/background eviction policy and telemetry passed.");
  return 0;
 }
@@ -188,6 +199,10 @@ def main():
     stats_end = pmm_header.index('} uvm_pmm_gpu_vab_stats_t;') + len('} uvm_pmm_gpu_vab_stats_t;')
     stats = pmm_header[pmm_header.rfind('typedef struct', 0, stats_end):stats_end]
     code = code.replace('/* VAB stats */', stats)
+    for parameter in ('churn_ms', 'return_percent', 'min_blocks'):
+        code += re.search(r'static unsigned uvm_perf_speculative_prefetch_' + parameter + r' = \d+;', source).group(0) + '\n'
+    code += function(source, 'uvm_pmm_gpu_prefetch_feedback_window_ns')
+    code += function(source, 'speculative_prefetch_config')
     for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):
         code+=function(source,name)
     code+=SCENARIOS

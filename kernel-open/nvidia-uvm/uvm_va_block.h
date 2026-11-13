@@ -115,6 +115,7 @@ typedef struct
     // These belong to the virtual block/GPU, never to a recycled physical root.
     NvU64 speculative_prefetch_ns;
     NvU64 speculative_evicted_ns;
+    NvU64 speculative_cohort;
 
     // Array of naturally-aligned chunks. Each chunk has the largest possible
     // size which can fit within the block, so they are not uniform size.
