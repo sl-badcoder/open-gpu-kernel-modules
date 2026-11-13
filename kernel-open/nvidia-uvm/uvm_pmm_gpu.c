@@ -166,6 +166,7 @@
 #include "uvm_api.h"
 #include "uvm_gpu.h"
 #include "uvm_pmm_gpu.h"
+#include "uvm_cpu_block_policy.h"
 #include "uvm_mem.h"
 #include "uvm_mmu.h"
 #include "uvm_global.h"
@@ -368,7 +369,8 @@ static bool eager_eviction_supported(uvm_pmm_gpu_t *pmm)
 {
     uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
 
-    return uvm_perf_eager_eviction_enable &&
+    return !uvm_cpu_block_policy_region_migration_enabled() &&
+           uvm_perf_eager_eviction_enable &&
            pmm->pma_stats &&
            gpu->parent->access_counters_supported &&
            !gpu->parent->is_integrated_gpu;
@@ -1570,6 +1572,7 @@ static uvm_gpu_chunk_t *vab_pick_allocated(uvm_pmm_gpu_t *pmm,
 {
     uvm_gpu_root_chunk_t *baseline = NULL, *preferred = NULL, *selected;
     NvU64 oldest_access_ns = ~(NvU64)0;
+    bool preferred_cold = false;
     uvm_gpu_chunk_t *entry;
     uvm_pmm_alloc_list_t list;
     NvU64 now = NV_GETTIME();
@@ -1587,7 +1590,8 @@ static uvm_gpu_chunk_t *vab_pick_allocated(uvm_pmm_gpu_t *pmm,
             baseline = root;
         if (snapshot->eviction_enabled &&
             root->vab_ready_ns && now >= root->vab_ready_ns &&
-            now - root->vab_ready_ns >= (NvU64)uvm_perf_vab_min_residency_ms * NSEC_PER_MSEC) {
+            ((!vab_only && uvm_cpu_block_policy_region_migration_enabled()) ||
+             now - root->vab_ready_ns >= (NvU64)uvm_perf_vab_min_residency_ms * NSEC_PER_MSEC)) {
             uvm_vab_region_state_t state = vab_root_state(root, snapshot);
             // Proactive replacement must never displace a known hot root.
             // Demand/PMA callers pass vab_only=false and retain their fallback.
@@ -1603,9 +1607,12 @@ static uvm_gpu_chunk_t *vab_pick_allocated(uvm_pmm_gpu_t *pmm,
                 if (uvm_gpu_vab_get_recency(uvm_pmm_to_gpu(pmm)->parent, snapshot,
                                             root->chunk.address, UVM_CHUNK_SIZE_MAX,
                                             root->vab_ready_ns, &last_access_ns) &&
-                    (!preferred || last_access_ns < oldest_access_ns)) {
+                    (!preferred || last_access_ns < oldest_access_ns ||
+                     (uvm_cpu_block_policy_region_migration_enabled() && last_access_ns == oldest_access_ns &&
+                      state == UVM_VAB_REGION_COLD && !preferred_cold))) {
                     preferred = root;
                     oldest_access_ns = last_access_ns;
+                    preferred_cold = state == UVM_VAB_REGION_COLD;
                 }
             }
             else if (!snapshot->lru_enabled && state == UVM_VAB_REGION_COLD && !preferred) {

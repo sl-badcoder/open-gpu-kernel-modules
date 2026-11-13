@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Native-granularity VAB observation alongside the demand-first policy.
+#include "uvm_cpu_block_policy.h"
 #include "uvm_api.h"
 #include "uvm_gpu.h"
 #include "uvm_global.h"
@@ -155,9 +156,11 @@ static void vab_sample(uvm_parent_gpu_t *parent_gpu)
         parent_gpu->vab.sample.access_bits[i] = bits;
         parent_gpu->vab.sample.enabled_mask[i] = mask;
         // Track every sampled mode so entering LRU does not lose accesses
-        // observed while eviction was disabled. Steady set bits never refresh.
+        // observed while eviction was disabled. The region experiment refreshes
+        // all set bits as recently observed; legacy mode keeps edge-only aging.
         {
-            NvU64 touched = history_valid ? bits & ~(previous & common) : bits;
+            NvU64 touched = uvm_cpu_block_policy_region_migration_enabled() ? bits :
+                              (history_valid ? bits & ~(previous & common) : bits);
             while (removed) {
                 NvU32 bit = __builtin_ctzll(removed);
                 parent_gpu->vab.last_access_ns[i * 64 + bit] = 0;
@@ -395,7 +398,9 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
                roots.selection_changes, roots.selection_fallbacks, roots.eligible_roots, roots.readiness_pending);
     seq_printf(s, "usage_percent %llu\nprefetch_inflight %llu\nrecovering_watermark %llu\nbackground_active %llu\n",
                roots.usage_percent, roots.prefetch_inflight, roots.recovering_watermark, roots.background_active);
-    seq_puts(s, "background_policy VAB_cold_only\n");
+    seq_printf(s, "migration_policy %s\nbackground_policy %s\n",
+               uvm_cpu_block_policy_region_migration_enabled() ? "threshold_4MiB_VA_regions" : "legacy",
+               uvm_cpu_block_policy_region_migration_enabled() ? "allocation_driven_VAB_LRU" : "VAB_cold_only");
     seq_printf(s, "background_hot_skips %llu\nbackground_unknown_skips %llu\n",
                roots.background_hot_skips, roots.background_unknown_skips);
     seq_printf(s, "prefetch_limit_bytes %llu\nprefetch_demand_reserve_bytes %llu\nprefetch_reserved_bytes %llu\nprefetch_peak_bytes %llu\nprefetch_window_bytes %llu\n",

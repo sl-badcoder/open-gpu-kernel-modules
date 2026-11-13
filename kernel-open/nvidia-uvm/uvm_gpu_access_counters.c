@@ -1516,6 +1516,7 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     NV_STATUS flags_status;
     bool did_migrate = false;
     bool has_accessed_pages;
+    bool region_policy;
     NvU64 end;
     uvm_gpu_t *gpu = gpu_va_space->gpu;
     uvm_va_space_t *va_space = gpu_va_space->va_space;
@@ -1576,12 +1577,18 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     batch_context->block_service_context.access_counters_buffer_index = access_counters->index;
 
     has_accessed_pages = !uvm_page_mask_empty(accessed_pages);
-    status = service_notification_va_block_helper(mm, va_block, gpu, batch_context, &did_migrate);
+    region_policy = uvm_cpu_block_policy_should_migrate_region(va_block, gpu);
+    if (!region_policy)
+        status = service_notification_va_block_helper(mm, va_block, gpu, batch_context, &did_migrate);
 
     uvm_mutex_unlock(&va_block->lock);
 
     if (is_hmm)
         uvm_hmm_migrate_finish(va_block);
+
+    if (region_policy && has_accessed_pages)
+        status = uvm_cpu_block_policy_migrate_region_on_signal(va_block, gpu, mm,
+                                                                access_counters->index, &did_migrate);
 
     if (status == NV_OK && (!is_hmm || !has_accessed_pages || did_migrate))
         flags |= UVM_ACCESS_COUNTER_ACTION_BATCH_CLEAR;
@@ -1598,7 +1605,7 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     if ((status == NV_OK) && (flags_status != NV_OK))
         status = flags_status;
 
-    if (status == NV_OK && prefetch_queue)
+    if (status == NV_OK && prefetch_queue && !region_policy)
         demand_first_prefetch_queue_push(prefetch_queue, va_block, gpu, mm);
 
     return status;

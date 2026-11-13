@@ -118,6 +118,10 @@ typedef struct entry_struct { uvm_va_space_t *va_space; uvm_gpu_t *gpu; NvU64 ad
 typedef struct batch_struct { uvm_access_counter_buffer_entry_t *notifications[4]; NvU32 num_notifications; uvm_page_mask_t accessed_pages; uvm_service_block_context_t block_service_context; } uvm_access_counter_service_batch_context_t;
 typedef struct access_struct { int index; uvm_access_counter_service_batch_context_t batch_service_context; } uvm_access_counter_buffer_t;
 static int demand_status, flags_status, queue_count, prefetch_ids[4];
+static bool region_mode, region_did_migrate;
+static NV_STATUS region_status;
+static int region_calls, region_lock_state, legacy_calls;
+static NvU32 last_flags;
 #define READ_ONCE(x) (x)
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define PAGES_PER_UVM_VA_BLOCK 4
@@ -132,10 +136,12 @@ static void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *b, uvm_gpu_t
 static void uvm_page_mask_zero(uvm_page_mask_t *m) { *m = 0; }
 static void uvm_assert_rwsem_locked(void *l) { (void)l; }
 static void uvm_va_block_context_init(uvm_va_block_context_t *c, struct mm_struct *m) { (void)c; (void)m; }
-static void uvm_mutex_lock(void *m) { (void)m; } static void uvm_mutex_unlock(void *m) { (void)m; }
+static void uvm_mutex_lock(void *m) { (void)m; region_lock_state=1; } static void uvm_mutex_unlock(void *m) { (void)m; region_lock_state=0; }
 static void expand_notification_block(uvm_gpu_va_space_t *g, struct mm_struct *m, uvm_va_block_t *b, uvm_access_counter_buffer_t *a, uvm_va_block_context_t *c, uvm_page_mask_t *p, uvm_access_counter_buffer_entry_t *e) { (void)g;(void)m;(void)b;(void)a;(void)c; *p = e->counter_value; }
-static NV_STATUS service_notification_va_block_helper(struct mm_struct *m, uvm_va_block_t *b, uvm_gpu_t *g, uvm_access_counter_service_batch_context_t *c, bool *did_migrate) { (void)m;(void)b;(void)g;(void)c; *did_migrate = demand_status == NV_OK; return demand_status; }
-static NV_STATUS notify_tools_and_process_flags(uvm_va_space_t *v, uvm_gpu_t *g, uvm_access_counter_buffer_t *a, NvU64 x, uvm_access_counter_buffer_entry_t **e, NvU32 n, NvU32 f, void *m) { (void)v;(void)g;(void)a;(void)x;(void)e;(void)n;(void)f;(void)m; return flags_status; }
+static NV_STATUS service_notification_va_block_helper(struct mm_struct *m, uvm_va_block_t *b, uvm_gpu_t *g, uvm_access_counter_service_batch_context_t *c, bool *did_migrate) { (void)m;(void)b;(void)g;(void)c; ++legacy_calls; *did_migrate = demand_status == NV_OK; return demand_status; }
+static bool uvm_cpu_block_policy_should_migrate_region(uvm_va_block_t *b, uvm_gpu_t *g) { (void)b; (void)g; return region_mode; }
+static NV_STATUS uvm_cpu_block_policy_migrate_region_on_signal(uvm_va_block_t *b, uvm_gpu_t *g, struct mm_struct *m, NvU32 index, bool *did_migrate) { (void)b;(void)g;(void)m;assert(index==4);assert(!region_lock_state); ++region_calls; *did_migrate=region_did_migrate; return region_status; }
+static NV_STATUS notify_tools_and_process_flags(uvm_va_space_t *v, uvm_gpu_t *g, uvm_access_counter_buffer_t *a, NvU64 x, uvm_access_counter_buffer_entry_t **e, NvU32 n, NvU32 f, void *m) { (void)v;(void)g;(void)a;(void)x;(void)e;(void)n;(void)m;assert(!region_lock_state);last_flags=f;return flags_status; }
 '''
     block_queue = text[text.index("#define UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY"):text.index("// Each page in a tracked physical range")]
     block_function = extract_function(text, "static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t")
@@ -151,6 +157,15 @@ int main(void) {
     entry.counter_value=1; queue_count=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==NV_OK); demand_first_prefetch_queue_flush(&queue); assert(queue_count==1 && prefetch_ids[0]==7);
     entry.counter_value=1; queue_count=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==NV_OK); demand_first_prefetch_queue_flush(&queue); assert(queue_count==1 && prefetch_ids[0]==7);
     entry.counter_value=4; queue_count=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==NV_OK); demand_first_prefetch_queue_flush(&queue); assert(queue_count==1 && prefetch_ids[0]==7);
+    /* Region mode bypasses the per-page helper and callback runs after unlock. */
+    int legacy_before=legacy_calls;region_mode=true; region_status=NV_OK; region_did_migrate=true; region_calls=0; region_lock_state=0; queue_count=0; entry.counter_value=1;
+    assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==NV_OK); assert(region_calls==1 && queue.count==0 && queue_count==0 && legacy_calls==legacy_before);
+    assert(last_flags==UVM_ACCESS_COUNTER_ACTION_BATCH_CLEAR);
+    /* Empty/stale notifications do not trigger region migration. */
+    region_calls=0; entry.counter_value=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==NV_OK); assert(region_calls==0 && queue.count==0);
+    /* Errors are not acknowledged; successful no-op/stale events are cleared to rearm hardware. */
+    entry.counter_value=1; region_status=9; assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==9); assert(region_calls==1 && queue.count==0 && last_flags==0 && legacy_calls==legacy_before);
+    region_status=NV_OK; region_did_migrate=false; assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==NV_OK); assert(region_calls==2 && queue.count==0 && last_flags==UVM_ACCESS_COUNTER_ACTION_BATCH_CLEAR && legacy_calls==legacy_before);
     return 0;
 }
 '''

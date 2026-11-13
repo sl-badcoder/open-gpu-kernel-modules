@@ -27,6 +27,13 @@
 #include "uvm_forward_decl.h"
 
 bool uvm_cpu_block_policy_enabled(void);
+bool uvm_cpu_block_policy_region_migration_enabled(void);
+bool uvm_cpu_block_policy_should_migrate_region(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
+NV_STATUS uvm_cpu_block_policy_migrate_region_on_signal(uvm_va_block_t *trigger_block,
+                                                        uvm_gpu_t *gpu,
+                                                        struct mm_struct *mm,
+                                                        NvU32 buffer_index,
+                                                        bool *did_migrate);
 void uvm_cpu_block_policy_init_range(uvm_va_range_managed_t *managed_range);
 bool uvm_cpu_block_policy_should_add_accessed_by(uvm_va_range_managed_t *managed_range,
                                                 uvm_gpu_t *gpu);

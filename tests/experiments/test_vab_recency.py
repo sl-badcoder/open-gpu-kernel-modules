@@ -55,7 +55,14 @@ CASES = r'''
  assert(q.vab.last_access_ns[1]==reseed);
  uvm_gpu_vab_get_snapshot(&q,&s);s.lru_enabled=false;
  assert(!uvm_gpu_vab_get_recency(&q,&s,0,1,0,&recency));
- uvm_gpu_vab_stop(&q);
+ // Region mode treats every set bit as recently observed, never first-set age.
+ region_mode=true;dump_bits=2;NvU64 observed_now=now;vab_sample(&q);
+ assert(q.vab.last_access_ns[1]==observed_now);
+ observed_now=now;vab_sample(&q);assert(q.vab.last_access_ns[1]==observed_now);
+ assert(observed_now>reseed);
+ dump_bits=0;observed_now=q.vab.last_access_ns[1];vab_sample(&q);
+ assert(q.vab.last_access_ns[1]==observed_now); // Clear bits age.
+ region_mode=false;uvm_gpu_vab_stop(&q);
 '''
 
 def main():

@@ -29,9 +29,14 @@
 #include "uvm_va_range.h"
 #include "uvm_va_space.h"
 
-static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
+static unsigned uvm_cpu_preferred_blocks_enable __read_mostly = 1;
+static bool uvm_cpu_preferred_region_migration_enable __read_mostly = true;
 static unsigned uvm_cpu_preferred_block_promotion_enable __read_mostly = 1;
 static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly = 64;
+#define UVM_CPU_REGION_SIZE (2ULL * UVM_VA_BLOCK_SIZE)
+static atomic64_t uvm_cpu_preferred_region_promotions = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_region_migrated_bytes = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_region_failures = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_retries = ATOMIC64_INIT(0);
@@ -67,6 +72,11 @@ static const struct kernel_param_ops atomic64_count_ops = {
  * Introduced module params + description
  * Define new module params here
  */
+module_param(uvm_cpu_preferred_region_migration_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_region_migration_enable, "4MiB threshold-triggered managed-region migration with allocation-driven VAB reclaim; disables speculative prefetch and fault promotion (default true on this experiment branch).");
+module_param_cb(uvm_cpu_preferred_region_promotions, &atomic64_count_ops, &uvm_cpu_preferred_region_promotions, S_IRUGO);
+module_param_cb(uvm_cpu_preferred_region_migrated_bytes, &atomic64_count_ops, &uvm_cpu_preferred_region_migrated_bytes, S_IRUGO);
+module_param_cb(uvm_cpu_preferred_region_failures, &atomic64_count_ops, &uvm_cpu_preferred_region_failures, S_IRUGO);
 module_param(uvm_cpu_preferred_blocks_enable, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_blocks_enable, "Keep managed allocations CPU-preferred and enable access-counter-guided migration policy.");
 module_param(uvm_cpu_preferred_block_promotion_enable, uint, S_IRUGO | S_IWUSR);
@@ -89,6 +99,11 @@ MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_capacity_stops, "Number of managed a
 bool uvm_cpu_block_policy_enabled(void)
 {
     return uvm_cpu_preferred_blocks_enable != 0;
+}
+
+bool uvm_cpu_block_policy_region_migration_enabled(void)
+{
+    return uvm_cpu_block_policy_enabled() && uvm_cpu_preferred_region_migration_enable;
 }
 
 // check if gpu is supported
@@ -163,7 +178,8 @@ bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *va_block, uvm_gpu_t *gp
 {
     uvm_va_range_managed_t *managed_range;
 
-    if (!READ_ONCE(uvm_cpu_preferred_block_promotion_enable) ||
+    if (uvm_cpu_block_policy_region_migration_enabled() ||
+        !READ_ONCE(uvm_cpu_preferred_block_promotion_enable) ||
         !gpu ||
         uvm_va_block_is_hmm(va_block)) {
         return false;
@@ -194,8 +210,162 @@ static bool should_handle_gpu_signal(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
 
 bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
 {
-    return READ_ONCE(uvm_cpu_preferred_block_promotion_enable) &&
+    return !uvm_cpu_block_policy_region_migration_enabled() &&
+           READ_ONCE(uvm_cpu_preferred_block_promotion_enable) &&
            should_handle_gpu_signal(va_block, gpu);
+}
+
+bool uvm_cpu_block_policy_should_migrate_region(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+{
+    return uvm_cpu_block_policy_region_migration_enabled() && should_handle_gpu_signal(va_block, gpu);
+}
+
+// The page mask persists across allocation and mapping retries: make_resident
+// can have populated pages before map asks to retry. Never recompute this mask
+// from CPU residency after a partial successful transition.
+static NV_STATUS migrate_region_block_locked(uvm_va_block_t *va_block,
+                                             uvm_gpu_t *gpu,
+                                             uvm_va_block_retry_t *retry,
+                                             uvm_va_block_context_t *context,
+                                             const uvm_page_mask_t *pages,
+                                             uvm_tracker_t *tracker,
+                                             NvU64 *moved_bytes,
+                                             bool require_mapping,
+                                             bool *started,
+                                             bool *stale)
+{
+    NV_STATUS status, tracker_status;
+    uvm_assert_mutex_locked(&va_block->lock);
+    // Reject old notifications before taking ownership of the transition.
+    // make_resident itself unmaps remote GPU PTEs before allocating/copying;
+    // after that, a cleared mapped bit is expected on allocation/map retries.
+    if (require_mapping && !*started && !uvm_processor_mask_test(&va_block->mapped, gpu->id)) {
+        *stale = true;
+        return NV_OK;
+    }
+    *started = true;
+    // This is threshold-triggered migration, not speculative allocation.
+    retry->allow_eviction = true;
+    uvm_page_mask_zero(&context->make_resident.pages_changed_residency);
+    uvm_processor_mask_zero(&context->make_resident.all_involved_processors);
+    status = uvm_va_block_make_resident(va_block, retry, context, gpu->id,
+                                        uvm_va_block_region_from_block(va_block), pages, NULL,
+                                        UVM_MAKE_RESIDENT_CAUSE_ACCESS_COUNTER);
+    *moved_bytes += (NvU64)uvm_page_mask_weight(&context->make_resident.pages_changed_residency) * PAGE_SIZE;
+    if (status == NV_OK)
+        status = uvm_va_block_map(va_block, context, gpu->id,
+                                  uvm_va_block_region_from_block(va_block), pages,
+                                  UVM_PROT_READ_WRITE_ATOMIC, UvmEventMapRemoteCauseInvalid,
+                                  &va_block->tracker);
+    // Preserve dependencies from successful and partial submissions on errors.
+    tracker_status = uvm_tracker_add_tracker_safe(tracker, &va_block->tracker);
+    if ((status == NV_OK || status == NV_ERR_MORE_PROCESSING_REQUIRED) && tracker_status != NV_OK)
+        status = tracker_status;
+    return status;
+}
+
+NV_STATUS uvm_cpu_block_policy_migrate_region_on_signal(uvm_va_block_t *trigger_block,
+                                                        uvm_gpu_t *gpu,
+                                                        struct mm_struct *mm,
+                                                        NvU32 buffer_index,
+                                                        bool *did_migrate)
+{
+    uvm_va_range_managed_t *range = trigger_block->managed_range;
+    uvm_va_block_context_t *context;
+    uvm_tracker_t tracker = UVM_TRACKER_INIT();
+    NvU64 base, first, last, moved_bytes = 0;
+    size_t first_index, last_index, trigger_index, index, pass;
+    NV_STATUS status = NV_OK, wait_status;
+    bool stale = false;
+
+    *did_migrate = false;
+    if (!uvm_cpu_block_policy_should_migrate_region(trigger_block, gpu))
+        return NV_OK;
+    uvm_assert_rwsem_locked_read(&range->va_range.va_space->lock);
+
+    // Absolute 4MiB VA alignment; never cross a managed allocation boundary.
+    // PMM still assigns independent 2MiB physical roots to these virtual blocks.
+    base = trigger_block->start & ~(UVM_CPU_REGION_SIZE - 1);
+    first = max(base, range->va_range.node.start);
+    last = min(base + UVM_CPU_REGION_SIZE - 1, range->va_range.node.end);
+    first_index = uvm_va_range_block_index(range, first);
+    last_index = uvm_va_range_block_index(range, last);
+    trigger_index = uvm_va_range_block_index(range, trigger_block->start);
+    UVM_ASSERT(last_index >= first_index && last_index - first_index < 2);
+    // Match native access-counter service: a notification is stale once the
+    // triggering GPU mapping has gone away. Check under its block lock again
+    // after notification aggregation, before touching either region half.
+    uvm_mutex_lock(&trigger_block->lock);
+    if (!uvm_processor_mask_test(&trigger_block->mapped, gpu->id)) {
+        uvm_mutex_unlock(&trigger_block->lock);
+        return NV_OK;
+    }
+    uvm_mutex_unlock(&trigger_block->lock);
+    context = uvm_va_block_context_alloc(mm);
+    if (!context) {
+        atomic64_inc(&uvm_cpu_preferred_region_failures);
+        return NV_ERR_NO_MEMORY;
+    }
+
+    // Service the triggering half first. Hold only one VA-block lock at a time.
+    for (pass = 0; pass <= last_index - first_index; ++pass) {
+        uvm_va_block_t *block;
+        uvm_va_block_retry_t retry;
+        bool started = false;
+        uvm_page_mask_t pages;
+        const uvm_page_mask_t *cpu_resident, *gpu_resident, *thrashing;
+        index = pass == 0 ? trigger_index : (trigger_index == first_index ? last_index : first_index);
+        if (index != trigger_index) {
+            uvm_mutex_lock(&trigger_block->lock);
+            stale = !uvm_processor_mask_test(&trigger_block->mapped, gpu->id);
+            uvm_mutex_unlock(&trigger_block->lock);
+            if (stale)
+                break;
+        }
+        block = index == trigger_index ? trigger_block : uvm_va_range_block(range, index);
+        // Do not manufacture backing for untouched or unpopulated neighbors.
+        if (!block)
+            continue;
+        uvm_mutex_lock(&block->lock);
+        if (block == trigger_block && !uvm_processor_mask_test(&block->mapped, gpu->id)) {
+            uvm_mutex_unlock(&block->lock);
+            break;
+        }
+        cpu_resident = uvm_va_block_resident_mask_get(block, UVM_ID_CPU, NUMA_NO_NODE);
+        if (!cpu_resident) {
+            uvm_mutex_unlock(&block->lock);
+            continue;
+        }
+        uvm_page_mask_copy(&pages, cpu_resident);
+        gpu_resident = uvm_va_block_resident_mask_get(block, gpu->id, NUMA_NO_NODE);
+        if (gpu_resident)
+            uvm_page_mask_andnot(&pages, &pages, gpu_resident);
+        thrashing = uvm_perf_thrashing_get_thrashing_pages(block);
+        if (thrashing)
+            uvm_page_mask_andnot(&pages, &pages, thrashing);
+        if (!uvm_page_mask_empty(&pages)) {
+            uvm_va_block_context_init(context, mm);
+            context->make_resident.access_counters_buffer_index = buffer_index;
+            status = UVM_VA_BLOCK_RETRY_LOCKED(block, &retry,
+                         migrate_region_block_locked(block, gpu, &retry, context, &pages, &tracker, &moved_bytes,
+                                                       block == trigger_block, &started, &stale));
+        }
+        uvm_mutex_unlock(&block->lock);
+        if (status != NV_OK || stale)
+            break;
+    }
+    // Drain both halves before acknowledging/clearing the threshold notification.
+    wait_status = uvm_tracker_wait_deinit(&tracker);
+    if (status == NV_OK)
+        status = wait_status;
+    *did_migrate = moved_bytes != 0;
+    atomic64_add(moved_bytes, &uvm_cpu_preferred_region_migrated_bytes);
+    if (status != NV_OK)
+        atomic64_inc(&uvm_cpu_preferred_region_failures);
+    else if (moved_bytes)
+        atomic64_inc(&uvm_cpu_preferred_region_promotions);
+    uvm_va_block_context_free(context);
+    return status;
 }
 
 static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
@@ -332,7 +502,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     bool prefetch_success = true;
     uvm_tracker_t prefetch_tracker = UVM_TRACKER_INIT();
 
-    if (!managed_range ||
+    if (uvm_cpu_block_policy_region_migration_enabled() ||
+        !managed_range ||
         prefetch_chunk_mb == 0 ||
         !uvm_pmm_gpu_speculative_prefetch_enabled() ||
         !should_handle_gpu_signal(trigger_block, gpu)) {

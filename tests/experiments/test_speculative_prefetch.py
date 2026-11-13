@@ -48,6 +48,7 @@ static long long uvm_cpu_preferred_prefetch_retries, uvm_cpu_preferred_prefetche
 static void atomic64_inc(long long *p) {++*p;}
 static void atomic64_add(NvU64 n,long long *p) {*p+=(long long)n;}
 static bool enabled, supported, alloc_fail, trigger_resident;
+static bool region_mode;
 static NvU64 grant, requested, reserved, transferred;
 static bool completed_success;
 static NvU64 reservation_generation = 17;
@@ -64,6 +65,7 @@ static struct mm_struct mm;
 static uvm_va_block_context_t context;
 static NvU64 NV_GETTIME(void) {return now;}
 static bool uvm_pmm_gpu_speculative_prefetch_enabled(void) {return enabled;}
+static bool uvm_cpu_block_policy_region_migration_enabled(void) {return region_mode;}
 static bool should_handle_gpu_signal(uvm_va_block_t *b,uvm_gpu_t *g) {(void)b;(void)g;return supported;}
 static void uvm_assert_rwsem_locked_read(int *p) {assert(*p);}
 static void uvm_mutex_lock(int *p) {assert(!*p);*p=1;}
@@ -113,7 +115,7 @@ static void reset(void) {
  memset(blocks,0,sizeof(blocks));memset(&range,0,sizeof(range));
  space.lock=1;range.va_range.va_space=&space;range.count=8;
  for(size_t i=0;i<8;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
- enabled=supported=true;alloc_fail=trigger_resident=false;grant=4*UVM_SIZE_1MB;requested=reserved=transferred=0;
+ enabled=supported=true;region_mode=false;alloc_fail=trigger_resident=false;grant=4*UVM_SIZE_1MB;requested=reserved=transferred=0;
  calls=begin_calls=end_calls=waits=capacity_at=error_at=wait_error=0;
  watermark_at=-1;watermark_calls=feedback_quick=feedback_capacity=pressure_pauses=0;
  trigger_slot=4;
@@ -135,6 +137,7 @@ int main(void) {
  // Transient denial retries, permanent disable never admits or sets retry.
  reset();grant=0;run();assert(!calls && !end_calls && blocks[4].gpu_prefetch_retry);
  reset();enabled=false;run();assert(!begin_calls && !calls && !waits && !blocks[4].gpu_prefetch_retry);
+ reset();region_mode=true;run();assert(!begin_calls && !calls && !waits && !blocks[4].gpu_prefetch_retry);
  reset();uvm_cpu_preferred_prefetch_chunk_mb=0;run();assert(!begin_calls && !calls);
  // Every admitted failure waits before releasing the reservation.
  reset();error_at=1;run();assert(calls==1 && end_calls==1 && !completed_success && !reserved);

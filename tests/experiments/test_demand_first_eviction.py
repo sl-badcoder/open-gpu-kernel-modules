@@ -8,7 +8,7 @@ import tempfile
 ROOT = Path(__file__).parents[2]
 
 def function(source, name):
-    match = re.search(r"^(?:static [^\n]*|void |NvU64 )\b" + name + r"\(", source, re.M)
+    match = re.search(r"^(?:static [^\n]*|void |NvU64 |bool |NV_STATUS )\b" + name + r"\(", source, re.M)
     if match is None:
         raise ValueError(name)
     start = match.start()
@@ -63,10 +63,14 @@ struct list_head { struct chunk *first; };
 typedef struct chunk { struct { struct chunk *next; } list; bool is_zero, claimed; NvU64 address; unsigned state; void *va_block; } uvm_gpu_chunk_t;
 typedef struct { uvm_gpu_chunk_t chunk; NvU64 vab_generation,vab_ready_generation,vab_ready_ns; } uvm_gpu_root_chunk_t;
 /* VAB stats */
-typedef struct { int dummy; } uvm_parent_gpu_t;
+typedef struct { bool access_counters_supported, is_integrated_gpu; } uvm_parent_gpu_t;
+static bool region_mode;
+static bool uvm_perf_eager_eviction_enable=true;
+static bool uvm_cpu_block_policy_region_migration_enabled(void) { return region_mode; }
+static uvm_parent_gpu_t mock_parent;
 typedef struct { uvm_parent_gpu_t *parent; } uvm_gpu_t;
 static uvm_gpu_t mock_gpu;
-typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
+typedef struct { int lock,list_lock; void *pma_stats; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
 static uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *p) {(void)p; return &mock_gpu;}
 static uvm_vab_snapshot_t mock_snapshot;
 static unsigned snapshot_calls;
@@ -112,6 +116,7 @@ static uvm_pmm_gpu_t p;
 static uvm_gpu_root_chunk_t roots[6];
 static void reset(void){
  memset(&p,0,sizeof(p));memset(roots,0,sizeof(roots));memset(&mock_snapshot,0,sizeof(mock_snapshot));
+ region_mode=false;mock_parent=(uvm_parent_gpu_t){true,false};mock_gpu.parent=&mock_parent;p.pma_stats=(void *)1;
  mock_now=1000000000ULL;uvm_perf_vab_min_residency_ms=100;
  visits=evictions=freed=fail_at=0;mock_usage=100;migration_status=0;snapshot_calls=0;
  memset(mock_recency,0,sizeof(mock_recency));mock_recency_race=false;
@@ -129,6 +134,25 @@ static void add(unsigned i,unsigned list){
 }
 int main(void){
  uvm_gpu_root_chunk_t *out=NULL;
+ // Region mode disables proactive eviction even if the old enable parameter is set.
+ reset();assert(eager_eviction_supported(&p));region_mode=true;assert(!eager_eviction_supported(&p));
+ // Mandatory 4MiB-mode reclaim ranks valid young roots by VAB recency without
+ // applying the background 100ms grace; baseline list order would choose root1.
+ reset();region_mode=true;add(0,2);add(1,2);mock_snapshot.access_bits[0]=3;
+ roots[0].vab_ready_ns=mock_now-10*NSEC_PER_MSEC;
+ roots[1].vab_ready_ns=mock_now-5*NSEC_PER_MSEC;
+ mock_recency[0]=mock_now-8*NSEC_PER_MSEC;mock_recency[1]=mock_now-2*NSEC_PER_MSEC;
+ uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[0]);uvm_mutex_unlock(&p.lock);
+ assert(p.vab_stats.selected_hot==1 && p.vab_stats.selection_changes==1 && !p.vab_stats.selection_fallbacks);
+ // A tie between a known clear and set region favors clear in region mode.
+ reset();region_mode=true;add(0,2);add(1,2);mock_snapshot.access_bits[0]=2;
+ mock_recency[0]=mock_recency[1]=mock_now;
+ uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[0]);uvm_mutex_unlock(&p.lock);
+ assert(p.vab_stats.selected_cold==1);
+ // Unavailable physical mapping still uses a counted, progress-preserving fallback.
+ reset();region_mode=true;add(0,2);mock_snapshot.linear_base=~0ULL;
+ uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[0]);uvm_mutex_unlock(&p.lock);
+ assert(p.vab_stats.selection_fallbacks==1);
  // Background skips all-hot roots.
  reset();add(0,2);add(1,2);mock_snapshot.access_bits[0]=3;
  assert(!eager_eviction_one(&p,&out)&&!evictions);
@@ -206,6 +230,7 @@ def main():
         code += re.search(r'static bool uvm_perf_speculative_prefetch_' + parameter + r' = (?:true|false);', source).group(0) + '\n'
     code += function(source, 'uvm_pmm_gpu_prefetch_feedback_window_ns')
     code += function(source, 'speculative_prefetch_config')
+    code += function(source,'eager_eviction_supported')
     for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):
         code+=function(source,name)
     code+=SCENARIOS
