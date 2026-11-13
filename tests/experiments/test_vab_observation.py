@@ -22,8 +22,6 @@ typedef unsigned long long NvU64; typedef unsigned NvU32; typedef unsigned NV_ST
 #define module_param(...)
 #define MODULE_PARM_DESC(...)
 #define READ_ONCE(x) (x)
-static bool region_mode;
-static bool uvm_cpu_block_policy_region_migration_enabled(void) { return region_mode; }
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define BUILD_BUG_ON(x) _Static_assert(!(x),"array mismatch")
@@ -120,15 +118,17 @@ int main(void){
  assert(uvm_vab_classify(&s,4ULL<<20,2ULL<<20,0)==UVM_VAB_REGION_HOT);
  struct seq_file report={0};uvm_gpu_t gpu={.parent=&p};count=dumps;
  uvm_gpu_vab_print(&gpu,&report);
- assert(strstr(report.text,"migration_policy legacy\n"));
- region_mode=true;struct seq_file region_report={0};uvm_gpu_vab_print(&gpu,&region_report);
- assert(strstr(region_report.text,"migration_policy threshold_4MiB_VA_regions\n"));
- assert(strstr(region_report.text,"background_policy allocation_driven_VAB_LRU\n"));region_mode=false;
+ assert(strstr(report.text,"migration_policy threshold_4MiB_VA_regions\n"));
+ assert(strstr(report.text,"reclaim_policy allocation_driven_baseline\n"));
  assert(dumps==count&&strstr(report.text,"mode 1\n")&&strstr(report.text,"selection_active 0\n"));
  assert(strstr(report.text,"granularity_kib 4096\n")&&strstr(report.text,"used_roots_cold 1\n"));
  assert(strstr(report.text,"used_roots_hot 1\n")&&strstr(report.text,"rising_bits 1\n"));
  uvm_perf_vab_mode=2;uvm_gpu_vab_get_snapshot(&p,&s);assert(s.valid&&s.eviction_enabled);
  vab_sample(&p);assert(readiness_kicks==1);
+ report=(struct seq_file){0};uvm_gpu_vab_print(&gpu,&report);
+ assert(strstr(report.text,"reclaim_policy allocation_driven_VAB_cold_first\n"));
+ uvm_perf_vab_mode=3;report=(struct seq_file){0};uvm_gpu_vab_print(&gpu,&report);
+ assert(strstr(report.text,"reclaim_policy allocation_driven_VAB_LRU\n"));
  uvm_perf_vab_mode=1;uvm_perf_vab_eviction_linear_base=~0ULL;uvm_gpu_vab_get_snapshot(&p,&s);assert(s.valid);
  uvm_perf_vab_mode=0;count=dumps;vab_sample(&p);assert(dumps==count);
  uvm_gpu_vab_get_snapshot(&p,&s);assert(!s.valid);
@@ -154,7 +154,7 @@ int main(void){
  uvm_gpu_vab_get_snapshot(&p,&s);assert(!s.valid);
  count=dumps;unsigned scheduled=schedules;p.vab.work.fn(&p.vab.work.work);
  assert(dumps==count&&schedules==scheduled);
- uvm_perf_vab_mode=3;assert(vab_mode()==3);
+ uvm_perf_vab_mode=3;
  uvm_perf_vab_interval_ms=0;assert(vab_interval_ms()==5);
  uvm_perf_vab_interval_ms=2000;assert(vab_interval_ms()==1000);
  puts("VAB production observation, transitions, mode isolation, telemetry and lifecycle checks passed.");

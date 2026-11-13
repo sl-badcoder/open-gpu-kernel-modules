@@ -59,7 +59,6 @@
 #include "uvm_linux.h"
 #include "uvm_types.h"
 #include "uvm_vab.h"
-#include "uvm_prefetch_budget.h"
 #include "nv_uvm_user_types.h"
 #if UVM_IS_CONFIG_HMM() || defined(CONFIG_PCI_P2PDMA)
 #include <linux/memremap.h>
@@ -183,57 +182,11 @@ typedef struct {
     NvU64 selected_hot;
     NvU64 selected_cold;
     NvU64 selected_unknown;
-    NvU64 background_roots_freed;
-    NvU64 background_failures;
     NvU64 usage_percent;
-    NvU64 prefetch_inflight;
-    NvU64 recovering_watermark;
-    NvU64 background_active;
     NvU64 selection_changes;
     NvU64 selection_fallbacks;
     NvU64 eligible_roots;
     NvU64 readiness_pending;
-    NvU64 background_hot_skips;
-    NvU64 background_unknown_skips;
-    NvU64 prefetch_reserved_bytes;
-    NvU64 prefetch_peak_bytes;
-    NvU64 prefetch_window_bytes;
-    NvU64 prefetch_admissions;
-    NvU64 prefetch_denials;
-    NvU64 prefetch_backoffs;
-    NvU64 prefetch_quick_returns;
-    NvU64 prefetch_capacity_stops;
-    NvU64 prefetch_limit_bytes;
-    NvU64 prefetch_demand_reserve_bytes;
-    NvU64 prefetch_initialized;
-    NvU64 prefetch_off;
-    NvU64 prefetch_pressure_pauses;
-    NvU64 prefetch_allocation_failures;
-    NvU64 prefetch_prefetched_blocks;
-    NvU64 prefetch_mature_blocks;
-    NvU64 prefetch_mature_returns;
-    NvU64 prefetch_pending_blocks;
-    NvU64 prefetch_pending_returns;
-    NvU64 prefetch_last_blocks;
-    NvU64 prefetch_last_returns;
-    NvU64 prefetch_ratio_evaluations;
-    NvU64 prefetch_discarded_blocks;
-    NvU64 prefetch_discarded_returns;
-    NvU64 prefetch_dropped_records;
-    NvU64 prefetch_dropped_returns;
-    NvU64 prefetch_observation_ns;
-    NvU64 prefetch_return_percent;
-    NvU64 prefetch_min_blocks;
-    NvU64 prefetch_backoff_enabled;
-    NvU64 prefetch_recovery_enabled;
-    NvU64 prefetch_recoveries;
-    NvU64 prefetch_probes;
-    NvU64 prefetch_probe_inflight;
-    NvU64 prefetch_next_probe_ns;
-    NvU64 prefetch_unretired_blocks;
-    NvU64 prefetch_unretired_returns;
-    NvU64 prefetch_ready_blocks;
-    NvU64 prefetch_ready_returns;
 } uvm_pmm_gpu_vab_stats_t;
 
 // Lists for allocated root chunks. When picking a root chunk to evict, lists
@@ -462,19 +415,12 @@ typedef struct uvm_pmm_gpu_struct
     // to be injected.
     NvU32 inject_pma_evict_error_after_num_chunks;
 
+    // Periodic VAB ownership/readiness validation; never submits eviction.
     struct
     {
-        // Polls residency completion and evicts through the existing VA-block
-        // path, preserving mapping and tracker synchronization.
         struct delayed_work work;
-        // Protected by list_lock. Prefetch admissions and worker eviction
-        // batches are mutually exclusive; recovery persists down to low.
-        unsigned prefetch_count;
-        uvm_prefetch_budget_t budget;
-        bool active;
-        bool recovering_watermark;
         bool stopping;
-    } eager_eviction;
+    } vab_readiness;
 
     // The mask of the initialized chunk sizes
     DECLARE_BITMAP(chunk_split_cache_initialized, UVM_PMM_CHUNK_SPLIT_CACHE_SIZES);
@@ -679,31 +625,6 @@ void uvm_pmm_gpu_mark_root_chunk_unused(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chu
 
 // Mark an allocated chunk as discarded
 void uvm_pmm_gpu_mark_root_chunk_discarded(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk);
-
-// Return true when proactive user-memory growth should stop at the configured
-// high watermark, until recovery reaches low, or during an eviction batch.
-// A true result also kicks the background eviction worker.
-bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm);
-
-// Return a byte reservation (zero denies) outside the eager eviction phase,
-// bounded by the per-GPU adaptive cap and free capacity minus demand reserve.
-// Every nonzero begin must be paired with end after GPU work completes.
-NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
-                                               NvU64 requested_bytes,
-                                               uvm_prefetch_reservation_t *reservation);
-void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm,
-                                            const uvm_prefetch_reservation_t *reservation,
-                                            NvU64 transferred_bytes,
-                                            bool success);
-// Event accounting, safe under VA-block lock. Cohort tokens are consumed once.
-NvU64 uvm_pmm_gpu_prefetch_record(uvm_pmm_gpu_t *pmm, NvU64 now,
-                                 uvm_prefetch_reservation_t *reservation);
-void uvm_pmm_gpu_prefetch_return(uvm_pmm_gpu_t *pmm, NvU64 cohort, NvU64 now);
-// Allocation failures are diagnostics only and never reduce the window.
-void uvm_pmm_gpu_prefetch_allocation_failure(uvm_pmm_gpu_t *pmm);
-void uvm_pmm_gpu_prefetch_pressure_pause(uvm_pmm_gpu_t *pmm);
-NvU64 uvm_pmm_gpu_prefetch_feedback_window_ns(void);
-bool uvm_pmm_gpu_speculative_prefetch_enabled(void);
 
 static bool uvm_gpu_chunk_same_root(uvm_gpu_chunk_t *chunk1, uvm_gpu_chunk_t *chunk2)
 {

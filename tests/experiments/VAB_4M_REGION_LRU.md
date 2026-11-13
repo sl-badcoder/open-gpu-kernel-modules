@@ -1,7 +1,7 @@
 # Threshold-triggered 4 MiB regions with VAB-ranked reclaim
 
-Branch: `615.71.09/experiment/vab-4m-region-lru`, based on the rapid-return-ratio
-branch at `9d148c9e`. This is a separate kernel-only placement experiment.
+Branch: `615.71.09/experiment/vab-4m-region-lru`. This is a dedicated kernel-only
+placement experiment.
 
 ## Policy
 
@@ -20,14 +20,11 @@ branch at `9d148c9e`. This is a separate kernel-only placement experiment.
 - Migration may allocate with eviction enabled. When free GPU capacity is
   insufficient, PMM's mandatory allocation/PMA reclaim path selects physical
   roots using VAB recency, mode 3. Free/unused/discarded roots keep priority.
-- The region mode disables proactive eager eviction, even if an old load command
-  includes `uvm_perf_eager_eviction_enable=1`. The worker still prepares VAB
-  ownership/readiness metadata. The 100 ms *background* minimum-residency grace
-  does not exclude otherwise valid VAB candidates from mandatory region reclaim.
-- No speculative neighborhood prefetch, adaptive budget, backoff, recovery, probe,
-  or notification-independent 2 MiB promotion is run in region mode. Its branch
-  remains available as the previous experiment; the source is retained for
-  regression testing and for explicitly disabling the new mode.
+- A readiness worker validates VAB ownership and migration completion. It never
+  evicts data. Mandatory allocation/PMA reclaim performs eviction when needed.
+- This branch contains no speculative neighborhood prefetch, adaptive budget,
+  backoff, recovery, probe, or runtime mode selector. Access-counter notifications
+  directly drive 4 MiB region migration.
 
 The native hardware access counter is still configured at **2 MiB granularity**.
 A notification on either half triggers software migration of its 4 MiB VA pair;
@@ -80,8 +77,7 @@ Mandatory reclaim ranks ownership-ready full physical roots by the existing
 score is selected, even if that root is currently HOT; capacity reclaim must make
 progress. VAB mode 2 is cold-first rather than LRU, so use mode 3 for this test.
 
-This is approximate sampled recency. **In region mode, every sampled set bit
-refreshes its timestamp**, so a continuously set region does not become the
+This is approximate sampled recency. **Every sampled set bit refreshes its timestamp**, so a continuously set region does not become the
 oldest merely because its first observed rise was long ago. Clear bits retain
 their older timestamp; equal scores favor a clear candidate over a set candidate.
 Two roots sharing a 4 MiB bit share its observed score.
@@ -90,8 +86,7 @@ The CURRENT dump does not document a hardware-bit reset. A sticky set bit can
 therefore look recently observed even after the program stops using its data.
 When all bits stay set, this policy cannot distinguish their real access order
 and ties fall back to PMM list order. It is **not exact access-time LRU** and does
-not manufacture access events from the samples. The older edge-only recency
-behavior remains when region mode is disabled. This experiment introduces no
+not manufacture access events from the samples. This experiment introduces no
 hardware reset assumptions or logging reconfiguration.
 
 Missing/stale samples, unset/incorrect coverage, incomplete ownership, split
@@ -109,23 +104,22 @@ load command is:
 ```sh
 sudo insmod kernel-open/nvidia-uvm.ko \
     uvm_cpu_preferred_blocks_enable=1 \
-    uvm_cpu_preferred_region_migration_enable=1 \
-    uvm_cpu_preferred_block_promotion_enable=0 \
-    uvm_cpu_preferred_prefetch_chunk_mb=0 \
     uvm_perf_access_counter_migration_enable=1 \
     uvm_perf_access_counter_threshold=256 \
-    uvm_perf_eager_eviction_enable=0 \
     uvm_global_oversubscription=1 \
     uvm_perf_vab_mode=3 \
     uvm_perf_vab_eviction_linear_base=0
 ```
 
-Keep any other device-specific driver options you actually need. The region-mode
-and CPU-preferred switches default on in this experiment branch. Region mode is
-read-only after module load and ignores the legacy promotion/prefetch flags;
-explicit zeros above make the experiment intention clear. Setting region mode to
-zero restores the prior policy paths and old parameters, while disabling
-`uvm_cpu_preferred_blocks_enable` opts out of both CPU-preferred policies.
+Keep any other device-specific driver options you actually need. CPU-preferred
+placement is enabled by `uvm_cpu_preferred_blocks_enable`; there is no separate
+runtime region-mode selector or legacy prefetch path on this branch.
+
+Remove the old promotion, prefetch chunk, speculative budget/backoff/recovery,
+eager-eviction, minimum-residency, and region-mode options from existing load
+scripts. Their module parameters have been deleted; passing them to `insmod`
+will fail with an unknown-parameter error. The command above contains the
+configuration needed for this experiment.
 
 The original VAB sample interval remains 100 ms. You can separately test
 `uvm_perf_vab_interval_ms=20` to increase observation frequency; record it as an
@@ -136,7 +130,6 @@ independent experimental variable and measure its overhead.
 Load-time configuration and global migration counters are exposed in:
 
 ```sh
-cat /sys/module/nvidia_uvm/parameters/uvm_cpu_preferred_region_migration_enable
 cat /sys/module/nvidia_uvm/parameters/uvm_cpu_preferred_region_promotions
 cat /sys/module/nvidia_uvm/parameters/uvm_cpu_preferred_region_migrated_bytes
 cat /sys/module/nvidia_uvm/parameters/uvm_cpu_preferred_region_failures
@@ -154,10 +147,8 @@ ignored stale/no-op notifications are cleared to rearm hardware; failed operatio
 are not acknowledged as successful migration.
 
 The VAB report identifies `migration_policy threshold_4MiB_VA_regions` and
-`background_policy allocation_driven_VAB_LRU`. The prefetch counters remain for
-legacy diagnostics but should receive no new admissions or copied bytes in this
-mode; backoff/recovery configuration there is inactive. Region counters are global
-across GPUs/VA spaces; PMM VAB selection counters are per GPU.
+`reclaim_policy allocation_driven_VAB_LRU`. Region counters are global across
+GPUs/VA spaces; PMM VAB selection counters are per GPU.
 
 For a controlled hardware test, first CPU-initialize a populated, 4 MiB-aligned
 managed range. Access one half repeatedly on the GPU. After the hardware threshold
@@ -181,9 +172,6 @@ python3 tests/experiments/test_region_migration.py
 python3 tests/experiments/test_demand_first_notifications.py
 python3 tests/experiments/test_demand_first_eviction.py
 python3 tests/experiments/test_legacy_policy_port.py
-python3 tests/experiments/test_speculative_prefetch.py
-python3 tests/experiments/test_prefetch_budget.py
-python3 tests/experiments/test_rapid_return_population.py
 python3 tests/experiments/test_vab_classifier.py
 python3 tests/experiments/test_vab_observation.py
 python3 tests/experiments/test_vab_readiness.py
@@ -191,7 +179,7 @@ python3 tests/experiments/test_vab_recency.py
 ```
 
 Software checks include the new `test_region_migration.py`, notification routing,
-CPU-preferred/fault-promotion gates, VAB mandatory LRU ranking, and the existing
-legacy/budget/VAB regressions. They compile extracted production C with mocked
+CPU-preferred placement and region eligibility, VAB mandatory LRU ranking, and VAB classifier
+and sampling checks. They compile extracted production C with mocked
 kernel/RM dependencies and sanitizers. They do not build a complete Linux module
 or prove real hardware mapping, cache-hit logging, or throughput on this machine.

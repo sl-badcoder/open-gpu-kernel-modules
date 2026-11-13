@@ -24,6 +24,7 @@ PRELUDE=r'''
 typedef uint64_t NvU64;
 #define NV_OK 0
 #define NSEC_PER_MSEC 1000000ULL
+#define UVM_VAB_READINESS_INTERVAL_MS 25
 #define UVM_CHUNK_SIZE_MAX (2ULL<<20)
 #define UVM_PMM_GPU_CHUNK_STATE_ALLOCATED 1
 #define min_t(t,a,b) ((a)<(b)?(a):(b))

@@ -34,7 +34,7 @@ typedef uint64_t NvU64; typedef uint32_t NvU32; typedef int NV_STATUS;
 typedef struct { NvU64 bits[8]; } uvm_page_mask_t;
 typedef struct { int unused; } uvm_tracker_t;
 #define UVM_TRACKER_INIT() {0}
-typedef struct { bool allow_eviction; } uvm_va_block_retry_t;
+typedef struct { int unused; } uvm_va_block_retry_t;
 typedef struct { struct { uvm_page_mask_t pages_changed_residency; unsigned all_involved_processors; unsigned access_counters_buffer_index; } make_resident; } uvm_va_block_context_t;
 struct mm_struct { int unused; };
 typedef struct { bool access_counters_supported,is_integrated_gpu; } parent_t;
@@ -47,7 +47,7 @@ static uvm_va_range_managed_t range;
 static parent_t parent;
 static uvm_gpu_t gpu;
 static space_t space;
-static bool migration_enabled,alloc_failure,map_retry,make_retry,unmap_during_alloc,unmap_on_retry,unmap_after_trigger;
+static bool alloc_failure,map_retry,make_retry,unmap_during_alloc,unmap_on_retry,unmap_after_trigger;
 static NV_STATUS make_error,map_error,dep_error,wait_error;
 static unsigned held,make_calls,map_calls,wait_calls,dep_calls,frees,retry_deinits;
 static NvU64 visited[16];
@@ -55,7 +55,6 @@ static unsigned request_pages[16],mapped_pages[16];
 static NvU64 uvm_cpu_preferred_region_failures,uvm_cpu_preferred_region_migrated_bytes,uvm_cpu_preferred_region_promotions;
 #define atomic64_inc(p) (++*(p))
 #define atomic64_add(n,p) (*(p)+=(n))
-static bool uvm_cpu_block_policy_region_migration_enabled(void) {return migration_enabled;}
 static bool uvm_va_block_is_hmm(uvm_va_block_t *b) {(void)b;return false;}
 static bool gpu_supported(space_t *s,uvm_gpu_t *g) {return s && g && g->parent->access_counters_supported && !g->parent->is_integrated_gpu;}
 static void uvm_assert_rwsem_locked_read(int *l) {assert(*l);}
@@ -84,7 +83,7 @@ static int uvm_va_block_region_from_block(uvm_va_block_t *b) {assert(b->lock);re
 static NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *b,uvm_va_block_retry_t *r,uvm_va_block_context_t *c,
  int id,int region,const uvm_page_mask_t *pages,void *unused,int cause)
 {
- assert(b->lock && held==1 && r->allow_eviction && id==1 && !region && !unused && cause==7);
+ (void)r; assert(b->lock && held==1 && id==1 && !region && !unused && cause==7);
  assert(c->make_resident.access_counters_buffer_index==5 && make_calls<16);
  visited[make_calls]=b->start;request_pages[make_calls]=uvm_page_mask_weight(pages);++make_calls;
  b->mapped=0; // make_resident removes the old remote GPU mappings before population.
@@ -128,7 +127,7 @@ static void reset(NvU64 start,NvU64 end)
   unsigned pages=(b->end-b->start+1)/PAGE_SIZE;
   for(unsigned j=0;j<pages;++j)b->cpu.bits[j/64]|=1ULL<<(j%64);
  }
- migration_enabled=true;alloc_failure=map_retry=make_retry=unmap_during_alloc=unmap_on_retry=unmap_after_trigger=false;make_error=map_error=dep_error=wait_error=0;
+ alloc_failure=map_retry=make_retry=unmap_during_alloc=unmap_on_retry=unmap_after_trigger=false;make_error=map_error=dep_error=wait_error=0;
  held=make_calls=map_calls=wait_calls=dep_calls=frees=retry_deinits=0;
  memset(visited,0,sizeof(visited));memset(request_pages,0,sizeof(request_pages));memset(mapped_pages,0,sizeof(mapped_pages));
  uvm_cpu_preferred_region_failures=uvm_cpu_preferred_region_migrated_bytes=uvm_cpu_preferred_region_promotions=0;
@@ -178,10 +177,11 @@ int main(void)
  assert(store[0].mapped==2 && store[1].mapped==2);
  reset(0,4*UVM_VA_BLOCK_SIZE-1);unmap_after_trigger=true;
  assert(run(0,&did)==0 && did && make_calls==1 && map_calls==1 && wait_calls==1);
- for(unsigned which=0;which<4;++which) {
+ for(unsigned which=0;which<3;++which) {
   reset(0,4*UVM_VA_BLOCK_SIZE-1);
-  if(which==0)migration_enabled=false;if(which==1)parent.access_counters_supported=false;
-  if(which==2)parent.is_integrated_gpu=true;if(which==3)range.policy.preferred_location=1;
+  if(which==0)parent.access_counters_supported=false;
+  if(which==1)parent.is_integrated_gpu=true;
+  if(which==2)range.policy.preferred_location=1;
   assert(run(0,&did)==0 && !did && !make_calls && !wait_calls);
  }
  puts("4MiB regions: exact populated bytes, VA alignment/boundaries, single locks, retries, mapping, waits and failures passed.");

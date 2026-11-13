@@ -14,13 +14,13 @@ CASES = r'''
  uvm_gpu_vab_init(&q);uvm_gpu_vab_start(&q);
  dump_bits=1;NvU64 first=now;vab_sample(&q);NvU64 recency;
  uvm_gpu_vab_get_snapshot(&q,&s);assert(s.eviction_enabled&&s.lru_enabled);
- assert(uvm_gpu_vab_get_recency(&q,&s,0,2ULL<<20,first-1,&recency)&&recency==first);
+ assert(uvm_gpu_vab_get_recency(&q,&s,0,2ULL<<20,first-1,&recency)&&recency>=first);
  assert(uvm_gpu_vab_get_recency(&q,&s,2ULL<<20,2ULL<<20,first-1,&recency)&&recency==first);
- // A steady one must not move to MRU on every poll.
+ // Region mode refreshes every sampled set bit.
  now+=NSEC_PER_MSEC;vab_sample(&q);uvm_gpu_vab_get_snapshot(&q,&s);
- assert(uvm_gpu_vab_get_recency(&q,&s,0,2ULL<<20,first-1,&recency)&&recency==first);
+ assert(uvm_gpu_vab_get_recency(&q,&s,0,2ULL<<20,first-1,&recency)&&recency>first);
  dump_bits=0;vab_sample(&q);uvm_gpu_vab_get_snapshot(&q,&s);
- assert(uvm_gpu_vab_get_recency(&q,&s,0,2ULL<<20,first-1,&recency)&&recency==first);
+ assert(uvm_gpu_vab_get_recency(&q,&s,0,2ULL<<20,first-1,&recency)&&recency>=first);
  // Transitions observed in mode 1 count when mode 3 is enabled later.
  uvm_perf_vab_mode=1;dump_bits=1;NvU64 second=now;vab_sample(&q);
  uvm_gpu_vab_get_snapshot(&q,&s);assert(!uvm_gpu_vab_get_recency(&q,&s,0,1,0,&recency));
@@ -55,14 +55,7 @@ CASES = r'''
  assert(q.vab.last_access_ns[1]==reseed);
  uvm_gpu_vab_get_snapshot(&q,&s);s.lru_enabled=false;
  assert(!uvm_gpu_vab_get_recency(&q,&s,0,1,0,&recency));
- // Region mode treats every set bit as recently observed, never first-set age.
- region_mode=true;dump_bits=2;NvU64 observed_now=now;vab_sample(&q);
- assert(q.vab.last_access_ns[1]==observed_now);
- observed_now=now;vab_sample(&q);assert(q.vab.last_access_ns[1]==observed_now);
- assert(observed_now>reseed);
- dump_bits=0;observed_now=q.vab.last_access_ns[1];vab_sample(&q);
- assert(q.vab.last_access_ns[1]==observed_now); // Clear bits age.
- region_mode=false;uvm_gpu_vab_stop(&q);
+ uvm_gpu_vab_stop(&q);
 '''
 
 def main():

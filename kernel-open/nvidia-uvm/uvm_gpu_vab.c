@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
 // Native-granularity VAB observation alongside the demand-first policy.
-#include "uvm_cpu_block_policy.h"
 #include "uvm_api.h"
 #include "uvm_gpu.h"
 #include "uvm_global.h"
@@ -155,12 +154,10 @@ static void vab_sample(uvm_parent_gpu_t *parent_gpu)
         }
         parent_gpu->vab.sample.access_bits[i] = bits;
         parent_gpu->vab.sample.enabled_mask[i] = mask;
-        // Track every sampled mode so entering LRU does not lose accesses
-        // observed while eviction was disabled. The region experiment refreshes
-        // all set bits as recently observed; legacy mode keeps edge-only aging.
+        // Refresh all set bits as recently observed. Clear bits retain their
+        // previous score; this is sampled activity, not exact per-access LRU.
         {
-            NvU64 touched = uvm_cpu_block_policy_region_migration_enabled() ? bits :
-                              (history_valid ? bits & ~(previous & common) : bits);
+            NvU64 touched = bits;
             while (removed) {
                 NvU32 bit = __builtin_ctzll(removed);
                 parent_gpu->vab.last_access_ns[i * 64 + bit] = 0;
@@ -392,55 +389,12 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
                roots.used_hot, roots.used_cold, roots.used_unknown);
     seq_printf(s, "selected_hot %llu\nselected_cold %llu\nselected_unknown %llu\n",
                roots.selected_hot, roots.selected_cold, roots.selected_unknown);
-    seq_printf(s, "background_roots_freed %llu\nbackground_failures %llu\n",
-               roots.background_roots_freed, roots.background_failures);
     seq_printf(s, "selection_changes %llu\nselection_fallbacks %llu\neligible_roots %llu\nreadiness_pending %llu\n",
                roots.selection_changes, roots.selection_fallbacks, roots.eligible_roots, roots.readiness_pending);
-    seq_printf(s, "usage_percent %llu\nprefetch_inflight %llu\nrecovering_watermark %llu\nbackground_active %llu\n",
-               roots.usage_percent, roots.prefetch_inflight, roots.recovering_watermark, roots.background_active);
-    seq_printf(s, "migration_policy %s\nbackground_policy %s\n",
-               uvm_cpu_block_policy_region_migration_enabled() ? "threshold_4MiB_VA_regions" : "legacy",
-               uvm_cpu_block_policy_region_migration_enabled() ? "allocation_driven_VAB_LRU" : "VAB_cold_only");
-    seq_printf(s, "background_hot_skips %llu\nbackground_unknown_skips %llu\n",
-               roots.background_hot_skips, roots.background_unknown_skips);
-    seq_printf(s, "prefetch_limit_bytes %llu\nprefetch_demand_reserve_bytes %llu\nprefetch_reserved_bytes %llu\nprefetch_peak_bytes %llu\nprefetch_window_bytes %llu\n",
-               roots.prefetch_limit_bytes, roots.prefetch_demand_reserve_bytes,
-               roots.prefetch_reserved_bytes, roots.prefetch_peak_bytes, roots.prefetch_window_bytes);
-    seq_printf(s, "prefetch_admissions %llu\n", roots.prefetch_admissions);
-    seq_printf(s, "prefetch_denials %llu\n", roots.prefetch_denials);
-    seq_printf(s, "prefetch_backoffs %llu\n", roots.prefetch_backoffs);
-    seq_printf(s, "prefetch_quick_returns %llu\n", roots.prefetch_quick_returns);
-    seq_printf(s, "prefetch_capacity_stops %llu\n", roots.prefetch_capacity_stops);
-    seq_printf(s, "prefetch_initialized %llu\n", roots.prefetch_initialized);
-    seq_printf(s, "prefetch_off %llu\n", roots.prefetch_off);
-    seq_printf(s, "prefetch_pressure_pauses %llu\n", roots.prefetch_pressure_pauses);
-    seq_printf(s, "prefetch_allocation_failures %llu\n", roots.prefetch_allocation_failures);
-    seq_printf(s, "prefetch_prefetched_blocks %llu\n", roots.prefetch_prefetched_blocks);
-    seq_printf(s, "prefetch_mature_blocks %llu\n", roots.prefetch_mature_blocks);
-    seq_printf(s, "prefetch_mature_returns %llu\n", roots.prefetch_mature_returns);
-    seq_printf(s, "prefetch_pending_blocks %llu\n", roots.prefetch_pending_blocks);
-    seq_printf(s, "prefetch_pending_returns %llu\n", roots.prefetch_pending_returns);
-    seq_printf(s, "prefetch_last_blocks %llu\n", roots.prefetch_last_blocks);
-    seq_printf(s, "prefetch_last_returns %llu\n", roots.prefetch_last_returns);
-    seq_printf(s, "prefetch_ratio_evaluations %llu\n", roots.prefetch_ratio_evaluations);
-
-    seq_printf(s, "prefetch_discarded_blocks %llu\n", roots.prefetch_discarded_blocks);
-    seq_printf(s, "prefetch_discarded_returns %llu\n", roots.prefetch_discarded_returns);
-    seq_printf(s, "prefetch_dropped_records %llu\n", roots.prefetch_dropped_records);
-    seq_printf(s, "prefetch_dropped_returns %llu\n", roots.prefetch_dropped_returns);
-    seq_printf(s, "prefetch_unretired_blocks %llu\n", roots.prefetch_unretired_blocks);
-    seq_printf(s, "prefetch_unretired_returns %llu\n", roots.prefetch_unretired_returns);
-    seq_printf(s, "prefetch_ready_blocks %llu\n", roots.prefetch_ready_blocks);
-    seq_printf(s, "prefetch_ready_returns %llu\n", roots.prefetch_ready_returns);
-    seq_puts(s, "prefetch_policy rapid_return_ratio\n");
-    seq_printf(s, "prefetch_backoff_enabled %llu\n", roots.prefetch_backoff_enabled);
-    seq_printf(s, "prefetch_recovery_enabled %llu\n", roots.prefetch_recovery_enabled);
-    seq_printf(s, "prefetch_recoveries %llu\n", roots.prefetch_recoveries);
-    seq_printf(s, "prefetch_probes %llu\n", roots.prefetch_probes);
-    seq_printf(s, "prefetch_probe_inflight %llu\n", roots.prefetch_probe_inflight);
-    seq_printf(s, "prefetch_next_probe_ns %llu\n", roots.prefetch_next_probe_ns);
-    seq_printf(s, "prefetch_observation_ns %llu\nprefetch_return_percent %llu\nprefetch_min_blocks %llu\n",
-               roots.prefetch_observation_ns, roots.prefetch_return_percent, roots.prefetch_min_blocks);
+    seq_printf(s, "usage_percent %llu\n", roots.usage_percent);
+    seq_printf(s, "migration_policy threshold_4MiB_VA_regions\nreclaim_policy %s\n",
+               snapshot.lru_enabled ? "allocation_driven_VAB_LRU" :
+               (snapshot.eviction_enabled ? "allocation_driven_VAB_cold_first" : "allocation_driven_baseline"));
 
     // Raw words expose hot/cold bits even without a physical range mapping.
     // Word zero is first; bit i belongs to word i/64 at position i%64.
