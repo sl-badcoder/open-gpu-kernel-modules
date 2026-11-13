@@ -49,6 +49,7 @@ static void atomic64_inc(long long *p) {++*p;}
 static void atomic64_add(NvU64 n,long long *p) {*p+=(long long)n;}
 static bool enabled, supported, alloc_fail, trigger_resident;
 static NvU64 grant, requested, reserved, transferred;
+static bool completed_success;
 static NvU64 reservation_generation = 17;
 static int calls, begin_calls, end_calls, waits, capacity_at, error_at, wait_error;
 static int watermark_at, watermark_calls, feedback_quick, feedback_capacity;
@@ -88,14 +89,14 @@ static NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *p,NvU64 by
  (void)p;++begin_calls;assert(!reserved);requested=bytes;reserved=grant;assert(grant<=bytes);
  r->bytes=grant;r->generation=reservation_generation;return grant;
 }
-static void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *p,uvm_prefetch_reservation_t *r,NvU64 moved) {
+static void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *p,uvm_prefetch_reservation_t *r,NvU64 moved,bool success) {
  (void)p;assert(waits==1 && reserved==r->bytes && moved<=r->bytes);
- assert(r->generation==reservation_generation);reserved=0;transferred=moved;++end_calls;
+ assert(r->generation==reservation_generation);completed_success=success;reserved=0;transferred=moved;++end_calls;
 }
 static NV_STATUS uvm_tracker_wait_deinit(uvm_tracker_t *p) {(void)p;++waits;return wait_error;}
 static NV_STATUS prefetch_block(uvm_va_block_t *b,uvm_gpu_t *g,struct mm_struct *m,
- uvm_va_block_context_t *ctx,uvm_tracker_t *tracker,NvU64 *moved,NvU64 generation,bool *capacity,bool neighbor) {
- assert(generation==reservation_generation);
+ uvm_va_block_context_t *ctx,uvm_tracker_t *tracker,NvU64 *moved,uvm_prefetch_reservation_t *reservation,bool *capacity,bool neighbor) {
+ assert(reservation->generation==reservation_generation);
  (void)g;(void)m;(void)ctx;(void)tracker;assert(!b->lock && reserved && calls<8);
  visited[calls]=(size_t)(b-blocks);assert(neighbor == (b!=&blocks[trigger_slot]));
  ++calls;*capacity=(calls==capacity_at);
@@ -108,7 +109,7 @@ static NV_STATUS prefetch_block(uvm_va_block_t *b,uvm_gpu_t *g,struct mm_struct 
 
 CASES = r'''
 static void reset(void) {
- now=1000000000ULL;
+ now=1000000000ULL;completed_success=false;
  memset(blocks,0,sizeof(blocks));memset(&range,0,sizeof(range));
  space.lock=1;range.va_range.va_space=&space;range.count=8;
  for(size_t i=0;i<8;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
@@ -124,7 +125,7 @@ static void run(void){uvm_cpu_block_policy_prefetch_on_signal(&blocks[trigger_sl
 int main(void) {
  // Actual production loop: range clamps request; grant truncates it; trigger is first.
  reset();run();assert(requested==16*UVM_SIZE_1MB && calls==2 && visited[0]==4 && visited[1]==3);
- assert(end_calls==1 && transferred==grant && !reserved);
+ assert(end_calls==1 && completed_success && transferred==grant && !reserved);
  reset();grant=8*UVM_SIZE_1MB;run();assert(calls==4 && visited[0]==4 && visited[1]==2 && visited[2]==3 && visited[3]==5);
  reset();grant=8*UVM_SIZE_1MB;trigger_slot=7;run();assert(calls==4 && visited[0]==7 && visited[1]==4 && visited[2]==5 && visited[3]==6);
  // A resident triggering block does not prevent neighboring transfers.
@@ -136,10 +137,10 @@ int main(void) {
  reset();enabled=false;run();assert(!begin_calls && !calls && !waits && !blocks[4].gpu_prefetch_retry);
  reset();uvm_cpu_preferred_prefetch_chunk_mb=0;run();assert(!begin_calls && !calls);
  // Every admitted failure waits before releasing the reservation.
- reset();error_at=1;run();assert(calls==1 && end_calls==1 && !reserved);
- reset();capacity_at=2;run();assert(calls==2 && end_calls==1 && feedback_capacity==1 && !pressure_pauses && blocks[4].gpu_prefetch_retry);
- reset();watermark_at=0;run();assert(!calls && end_calls==1 && !feedback_capacity && pressure_pauses==1);
- reset();wait_error=9;run();assert(end_calls==1 && !reserved);
+ reset();error_at=1;run();assert(calls==1 && end_calls==1 && !completed_success && !reserved);
+ reset();capacity_at=2;run();assert(calls==2 && end_calls==1 && feedback_capacity==1 && !completed_success && !pressure_pauses && blocks[4].gpu_prefetch_retry);
+ reset();watermark_at=0;run();assert(!calls && end_calls==1 && completed_success && !feedback_capacity && pressure_pauses==1);
+ reset();wait_error=9;run();assert(end_calls==1 && !completed_success && !reserved);
  // Context allocation failure cannot leak an admission or change retry state.
  reset();alloc_fail=true;run();assert(!begin_calls && !end_calls && !blocks[4].gpu_prefetch_started);
  // One-shot callback avoids repeat copies; capacity-retry can be claimed once.

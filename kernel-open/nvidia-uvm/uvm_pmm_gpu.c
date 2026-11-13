@@ -193,18 +193,21 @@ static unsigned uvm_perf_vab_min_residency_ms = 100;
 static unsigned uvm_perf_speculative_prefetch_limit_mb = 32;
 static unsigned uvm_perf_speculative_prefetch_reserve_mb = 64;
 static bool uvm_perf_speculative_prefetch_backoff_enable = true;
+static bool uvm_perf_speculative_prefetch_recovery_enable = true;
 static unsigned uvm_perf_speculative_prefetch_churn_ms = 20;
 static unsigned uvm_perf_speculative_prefetch_return_percent = 50;
 static unsigned uvm_perf_speculative_prefetch_min_blocks = 32;
 module_param(uvm_perf_speculative_prefetch_limit_mb, uint, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_reserve_mb, uint, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_backoff_enable, bool, S_IRUGO);
+module_param(uvm_perf_speculative_prefetch_recovery_enable, bool, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_churn_ms, uint, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_return_percent, uint, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_min_blocks, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_limit_mb, "Per-GPU speculative bytes in flight, in MiB (default 32, rounded down to 2MiB; values below 2 disable speculation).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_reserve_mb, "Free PMA capacity reserved from speculative admission, in MiB (default 64).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_backoff_enable, "Enable rapid-return adaptive backoff (default true). False keeps the fixed cap, headroom checks and ratio accounting without reducing the window.");
+MODULE_PARM_DESC(uvm_perf_speculative_prefetch_recovery_enable, "Recover by 2MiB per mature batch below the return threshold, with bounded OFF probes (default true). Requires backoff_enable.");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_churn_ms, "Each rapid-return observation interval, not a polling timer (default 20 ms; minimum 1).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_return_percent, "Mature speculative block rapid-return percentage triggering backoff (default 50; clamped to 1..100).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_min_blocks, "Minimum mature speculative blocks per ratio decision (default 32; minimum 1).");
@@ -1839,6 +1842,7 @@ static uvm_prefetch_budget_config_t speculative_prefetch_config(void)
     config.return_percent = min(max(uvm_perf_speculative_prefetch_return_percent, 1U), 100U);
     config.min_blocks = max(uvm_perf_speculative_prefetch_min_blocks, 1U);
     config.backoff_enabled = uvm_perf_speculative_prefetch_backoff_enable;
+    config.recovery_enabled = uvm_perf_speculative_prefetch_recovery_enable;
     return config;
 }
 
@@ -1847,12 +1851,13 @@ bool uvm_pmm_gpu_speculative_prefetch_enabled(void)
     return uvm_perf_speculative_prefetch_limit_mb >= 2;
 }
 
-NvU64 uvm_pmm_gpu_prefetch_record(uvm_pmm_gpu_t *pmm, NvU64 now, NvU64 generation)
+NvU64 uvm_pmm_gpu_prefetch_record(uvm_pmm_gpu_t *pmm, NvU64 now,
+                                 uvm_prefetch_reservation_t *reservation)
 {
     uvm_prefetch_budget_config_t config = speculative_prefetch_config();
     NvU64 cohort;
     uvm_spin_lock(&pmm->list_lock);
-    cohort = uvm_prefetch_budget_record(&pmm->eager_eviction.budget, &config, now, generation);
+    cohort = uvm_prefetch_budget_record(&pmm->eager_eviction.budget, &config, now, reservation);
     uvm_spin_unlock(&pmm->list_lock);
     return cohort;
 }
@@ -1915,13 +1920,16 @@ NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
 
 void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm,
                                             const uvm_prefetch_reservation_t *reservation,
-                                            NvU64 transferred_bytes)
+                                            NvU64 transferred_bytes,
+                                            bool success)
 {
     bool resume_recovery;
+    uvm_prefetch_budget_config_t config = speculative_prefetch_config();
 
     uvm_spin_lock(&pmm->list_lock);
     UVM_ASSERT(pmm->eager_eviction.prefetch_count > 0);
-    uvm_prefetch_budget_complete(&pmm->eager_eviction.budget, reservation, transferred_bytes);
+    uvm_prefetch_budget_complete(&pmm->eager_eviction.budget, &config, reservation,
+                                 transferred_bytes, success, NV_GETTIME());
     --pmm->eager_eviction.prefetch_count;
     resume_recovery = !pmm->eager_eviction.prefetch_count && pmm->eager_eviction.recovering_watermark;
     uvm_spin_unlock(&pmm->list_lock);
@@ -3592,6 +3600,11 @@ void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
     stats->prefetch_return_percent = config.return_percent;
     stats->prefetch_min_blocks = config.min_blocks;
     stats->prefetch_backoff_enabled = config.backoff_enabled;
+    stats->prefetch_recovery_enabled = config.backoff_enabled && config.recovery_enabled;
+    stats->prefetch_recoveries = pmm->eager_eviction.budget.recoveries;
+    stats->prefetch_probes = pmm->eager_eviction.budget.probes;
+    stats->prefetch_probe_inflight = pmm->eager_eviction.budget.probe_inflight;
+    stats->prefetch_next_probe_ns = pmm->eager_eviction.budget.next_probe_ns;
     stats->prefetch_unretired_blocks = 0;
     stats->prefetch_unretired_returns = 0;
     stats->prefetch_ready_blocks = 0;
@@ -3603,7 +3616,7 @@ void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
             continue;
         stats->prefetch_unretired_blocks += cohort->blocks;
         stats->prefetch_unretired_returns += cohort->returns;
-        if (tick >= cohort->tick && tick - cohort->tick >= 3) {
+        if (!cohort->inflight_blocks && tick >= cohort->tick && tick - cohort->tick >= 3) {
             stats->prefetch_ready_blocks += cohort->blocks;
             stats->prefetch_ready_returns += cohort->returns;
         }

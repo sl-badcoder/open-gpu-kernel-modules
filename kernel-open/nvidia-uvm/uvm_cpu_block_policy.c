@@ -204,7 +204,7 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
                                 uvm_va_block_context_t *block_context,
                                 uvm_tracker_t *prefetch_tracker,
                                 NvU64 *prefetched_bytes,
-                                NvU64 generation,
+                                uvm_prefetch_reservation_t *reservation,
                                 bool *capacity_stop,
                                 bool speculative_neighbor)
 {
@@ -269,7 +269,7 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
             gpu_state->speculative_evicted_ns = 0;
             gpu_state->speculative_cohort = uvm_pmm_gpu_prefetch_record(&gpu->pmm,
                                                                        gpu_state->speculative_prefetch_ns,
-                                                                       generation);
+                                                                       reservation);
         }
 
         // make_resident updates physical residency but does not install a
@@ -329,6 +329,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     bool retry = false;
     bool capacity_stopped = false;
     bool prefetch_admitted = false;
+    bool prefetch_success = true;
     uvm_tracker_t prefetch_tracker = UVM_TRACKER_INIT();
 
     if (!managed_range ||
@@ -460,17 +461,19 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                 block_context,
                                 &prefetch_tracker,
                                 &prefetched_bytes,
-                                reservation.generation,
+                                &reservation,
                                 &capacity_stop,
                                 candidate_index != trigger_index);
         if (capacity_stop) {
             atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
             capacity_stopped = true;
+            prefetch_success = false;
             uvm_pmm_gpu_prefetch_allocation_failure(&gpu->pmm);
             break;
         }
 
         if (status != NV_OK) {
+            prefetch_success = false;
             UVM_DBG_PRINT("Managed allocation prefetch stopped with %s on GPU %s\n",
                           nvstatusToString(status),
                           gpu->parent->name);
@@ -494,6 +497,7 @@ out:
     {
         NV_STATUS status = uvm_tracker_wait_deinit(&prefetch_tracker);
         if (status != NV_OK) {
+            prefetch_success = false;
             UVM_DBG_PRINT("Managed allocation prefetch completion failed with %s on GPU %s\n",
                           nvstatusToString(status),
                           gpu->parent->name);
@@ -502,7 +506,7 @@ out:
 
     if (prefetch_admitted)
         uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm, &reservation,
-                                                prefetched_bytes);
+                                                prefetched_bytes, prefetch_success);
 
     uvm_va_block_context_free(block_context);
 }

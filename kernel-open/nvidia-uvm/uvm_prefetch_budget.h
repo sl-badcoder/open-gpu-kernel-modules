@@ -15,11 +15,15 @@ typedef struct {
     unsigned return_percent;
     unsigned min_blocks;
     bool backoff_enabled;
+    bool recovery_enabled;
 } uvm_prefetch_budget_config_t;
 
 typedef struct {
     NvU64 bytes;
     NvU64 generation;
+    bool probe;
+    NvU64 cohort_ids[UVM_PREFETCH_COHORT_COUNT];
+    NvU64 cohort_blocks[UVM_PREFETCH_COHORT_COUNT];
 } uvm_prefetch_reservation_t;
 
 typedef struct {
@@ -27,6 +31,7 @@ typedef struct {
     NvU64 tick;
     NvU64 blocks;
     NvU64 returns;
+    NvU64 inflight_blocks;
 } uvm_prefetch_cohort_t;
 
 typedef struct {
@@ -34,6 +39,10 @@ typedef struct {
     NvU64 peak_bytes;
     NvU64 window_bytes;
     bool initialized;
+    bool probe_inflight;
+    NvU64 next_probe_ns;
+    NvU64 probes;
+    NvU64 recoveries;
     NvU64 admissions;
     NvU64 denials;
     NvU64 backoffs;
@@ -63,12 +72,29 @@ static inline NvU64 uvm_prefetch_budget_limit(NvU64 bytes)
     return bytes - bytes % UVM_PREFETCH_BUDGET_QUANTUM;
 }
 
+// A changed size needs fresh measurements, in either direction.
+static inline void uvm_prefetch_budget_changed(uvm_prefetch_budget_t *budget)
+{
+    unsigned i;
+    ++budget->generation;
+    // IDs are never reused, including when a new cohort starts in the same tick.
+    for (i = 0; i < UVM_PREFETCH_COHORT_COUNT; ++i) {
+        uvm_prefetch_cohort_t *cohort = &budget->cohorts[i];
+        budget->discarded_blocks += cohort->blocks;
+        budget->discarded_returns += cohort->returns;
+        cohort->id = 0;
+        cohort->blocks = 0;
+        cohort->returns = 0;
+        cohort->inflight_blocks = 0;
+    }
+}
+
 static inline void uvm_prefetch_budget_backoff(uvm_prefetch_budget_t *budget,
-                                              const uvm_prefetch_budget_config_t *config)
+                                              const uvm_prefetch_budget_config_t *config,
+                                              NvU64 now)
 {
     NvU64 limit = uvm_prefetch_budget_limit(config->limit_bytes);
     NvU64 decrease;
-    unsigned i;
     if (!config->backoff_enabled)
         return;
     if (!budget->initialized) {
@@ -79,6 +105,7 @@ static inline void uvm_prefetch_budget_backoff(uvm_prefetch_budget_t *budget,
         return;
     if (budget->window_bytes <= 2 * UVM_PREFETCH_BUDGET_QUANTUM) {
         budget->window_bytes = 0;
+        budget->next_probe_ns = now + 3 * config->observation_ns;
     }
     else {
         decrease = uvm_prefetch_budget_limit(budget->window_bytes / 4);
@@ -87,22 +114,33 @@ static inline void uvm_prefetch_budget_backoff(uvm_prefetch_budget_t *budget,
         budget->window_bytes -= decrease;
     }
     ++budget->backoffs;
-    ++budget->generation;
-    // Do not repeatedly shrink using populations produced at the old size.
-    // IDs are never reused, including when a new cohort starts in the same tick.
-    for (i = 0; i < UVM_PREFETCH_COHORT_COUNT; ++i) {
-        uvm_prefetch_cohort_t *cohort = &budget->cohorts[i];
-        budget->discarded_blocks += cohort->blocks;
-        budget->discarded_returns += cohort->returns;
-        cohort->id = 0;
-        cohort->blocks = 0;
-        cohort->returns = 0;
-    }
+    uvm_prefetch_budget_changed(budget);
+}
+
+static inline void uvm_prefetch_budget_recover(uvm_prefetch_budget_t *budget,
+                                              const uvm_prefetch_budget_config_t *config)
+{
+    NvU64 limit = uvm_prefetch_budget_limit(config->limit_bytes);
+    NvU64 increase;
+    if (!config->backoff_enabled || !config->recovery_enabled ||
+        !budget->initialized || budget->window_bytes >= limit)
+        return;
+    // An OFF window can only have fresh evidence from neighbor probes. A 2MiB
+    // hard cap cannot probe a neighbor and must not reopen from stale evidence.
+    if (!budget->window_bytes && limit < 2 * UVM_PREFETCH_BUDGET_QUANTUM)
+        return;
+    increase = budget->window_bytes ? UVM_PREFETCH_BUDGET_QUANTUM : 2 * UVM_PREFETCH_BUDGET_QUANTUM;
+    if (increase > limit - budget->window_bytes)
+        increase = limit - budget->window_bytes;
+    budget->window_bytes += increase;
+    ++budget->recoveries;
+    uvm_prefetch_budget_changed(budget);
 }
 
 // A cohort collects for T, then waits two complete T intervals: every entry
 // gets its full prefetch->eviction->return opportunity before entering the ratio.
-// Four fixed slots suffice: at most three time buckets can be immature.
+// Four fixed slots cover the observation horizon. Unfinished GPU work can hold
+// slots longer; collisions drop records instead of replacing unfinished evidence.
 // Retire lazily on events; idle GPUs need no polling or per-block traversal.
 static inline void uvm_prefetch_budget_advance(uvm_prefetch_budget_t *budget,
                                               const uvm_prefetch_budget_config_t *config,
@@ -112,7 +150,7 @@ static inline void uvm_prefetch_budget_advance(uvm_prefetch_budget_t *budget,
     unsigned i;
     for (i = 0; i < UVM_PREFETCH_COHORT_COUNT; ++i) {
         uvm_prefetch_cohort_t *cohort = &budget->cohorts[i];
-        if (!cohort->id || tick < cohort->tick || tick - cohort->tick < 3)
+        if (!cohort->id || cohort->inflight_blocks || tick < cohort->tick || tick - cohort->tick < 3)
             continue;
         budget->pending_blocks += cohort->blocks;
         budget->pending_returns += cohort->returns;
@@ -121,6 +159,7 @@ static inline void uvm_prefetch_budget_advance(uvm_prefetch_budget_t *budget,
         cohort->id = 0;
         cohort->blocks = 0;
         cohort->returns = 0;
+        cohort->inflight_blocks = 0;
     }
     if (budget->pending_blocks && budget->pending_blocks >= config->min_blocks) {
         NvU64 threshold;
@@ -131,7 +170,9 @@ static inline void uvm_prefetch_budget_advance(uvm_prefetch_budget_t *budget,
         threshold = (budget->pending_blocks / 100) * config->return_percent +
                     ((budget->pending_blocks % 100) * config->return_percent + 99) / 100;
         if (budget->pending_returns >= threshold)
-            uvm_prefetch_budget_backoff(budget, config);
+            uvm_prefetch_budget_backoff(budget, config, now);
+        else
+            uvm_prefetch_budget_recover(budget, config);
         // Non-overlapping batches: old bad evidence cannot trigger another step.
         budget->pending_blocks = 0;
         budget->pending_returns = 0;
@@ -140,17 +181,18 @@ static inline void uvm_prefetch_budget_advance(uvm_prefetch_budget_t *budget,
 
 static inline NvU64 uvm_prefetch_budget_record(uvm_prefetch_budget_t *budget,
                                               const uvm_prefetch_budget_config_t *config,
-                                              NvU64 now, NvU64 generation)
+                                              NvU64 now, uvm_prefetch_reservation_t *reservation)
 {
     NvU64 tick = now / config->observation_ns;
+    unsigned slot = tick % UVM_PREFETCH_COHORT_COUNT;
     uvm_prefetch_cohort_t *cohort;
     uvm_prefetch_budget_advance(budget, config, now);
     ++budget->prefetched_blocks;
-    if (generation != budget->generation) {
+    if (reservation->generation != budget->generation) {
         ++budget->discarded_blocks;
         return 0;
     }
-    cohort = &budget->cohorts[tick % UVM_PREFETCH_COHORT_COUNT];
+    cohort = &budget->cohorts[slot];
     // A delayed timestamp must not overwrite a live, newer cohort.
     if (cohort->id && cohort->tick != tick) {
         ++budget->dropped_records;
@@ -160,6 +202,15 @@ static inline NvU64 uvm_prefetch_budget_record(uvm_prefetch_budget_t *budget,
         cohort->id = ++budget->next_cohort_id;
         cohort->tick = tick;
     }
+    // A concurrent failed attempt may have discarded this ticket's earlier
+    // cohort. Do not replace its reference with a new ID before completion.
+    if (reservation->cohort_ids[slot] && reservation->cohort_ids[slot] != cohort->id) {
+        ++budget->dropped_records;
+        return 0;
+    }
+    reservation->cohort_ids[slot] = cohort->id;
+    ++reservation->cohort_blocks[slot];
+    ++cohort->inflight_blocks;
     ++cohort->blocks;
     return cohort->id;
 }
@@ -181,7 +232,7 @@ static inline void uvm_prefetch_budget_return(uvm_prefetch_budget_t *budget,
             return;
         }
     }
-    // Includes old-policy tokens discarded on a previous backoff.
+    // Includes tokens discarded on a size change or attempt failure.
     ++budget->dropped_returns;
 }
 
@@ -198,8 +249,15 @@ static inline NvU64 uvm_prefetch_budget_reserve(uvm_prefetch_budget_t *budget,
 {
     NvU64 limit = uvm_prefetch_budget_limit(config->limit_bytes);
     NvU64 grant, headroom, ceiling;
+    bool probe = false;
+    unsigned i;
+    for (i = 0; i < UVM_PREFETCH_COHORT_COUNT; ++i) {
+        reservation->cohort_ids[i] = 0;
+        reservation->cohort_blocks[i] = 0;
+    }
     reservation->bytes = 0;
     reservation->generation = 0;
+    reservation->probe = false;
     uvm_prefetch_budget_advance(budget, config, now);
     if (!limit || requested < UVM_PREFETCH_BUDGET_QUANTUM)
         goto denied;
@@ -209,26 +267,42 @@ static inline NvU64 uvm_prefetch_budget_reserve(uvm_prefetch_budget_t *budget,
     }
     if (budget->window_bytes > limit)
         budget->window_bytes = limit;
-    if (!budget->window_bytes || budget->reserved_bytes >= budget->window_bytes)
+    if (budget->probe_inflight)
         goto denied;
+    if (!budget->window_bytes) {
+        // No growth from silence. A bounded probe collects new ratio evidence.
+        if (!config->backoff_enabled || !config->recovery_enabled || budget->reserved_bytes ||
+            now < budget->next_probe_ns || limit < 2 * UVM_PREFETCH_BUDGET_QUANTUM ||
+            requested < 2 * UVM_PREFETCH_BUDGET_QUANTUM)
+            goto denied;
+        probe = true;
+    }
+    else if (budget->reserved_bytes >= budget->window_bytes) {
+        goto denied;
+    }
     headroom = free_bytes > config->demand_reserve_bytes ? free_bytes - config->demand_reserve_bytes : 0;
     headroom = headroom > budget->reserved_bytes ? headroom - budget->reserved_bytes : 0;
     if (headroom < UVM_PREFETCH_BUDGET_QUANTUM) {
         uvm_prefetch_budget_pressure_pause(budget);
         goto denied;
     }
-    ceiling = budget->window_bytes - budget->reserved_bytes;
+    ceiling = probe ? 2 * UVM_PREFETCH_BUDGET_QUANTUM : budget->window_bytes - budget->reserved_bytes;
     grant = requested < ceiling ? requested : ceiling;
     if (grant > headroom)
         grant = headroom;
     grant = uvm_prefetch_budget_limit(grant);
-    if (!grant)
+    if (!grant || (probe && grant < 2 * UVM_PREFETCH_BUDGET_QUANTUM))
         goto denied;
     budget->reserved_bytes += grant;
     if (budget->reserved_bytes > budget->peak_bytes)
         budget->peak_bytes = budget->reserved_bytes;
     reservation->bytes = grant;
     reservation->generation = budget->generation;
+    reservation->probe = probe;
+    if (probe) {
+        budget->probe_inflight = true;
+        ++budget->probes;
+    }
     ++budget->admissions;
     return grant;
 denied:
@@ -237,12 +311,42 @@ denied:
 }
 
 static inline void uvm_prefetch_budget_complete(uvm_prefetch_budget_t *budget,
+                                                const uvm_prefetch_budget_config_t *config,
                                                 const uvm_prefetch_reservation_t *reservation,
-                                                NvU64 transferred)
+                                                NvU64 transferred, bool success, NvU64 now)
 {
+    unsigned i;
     UVM_ASSERT(reservation->bytes <= budget->reserved_bytes);
     UVM_ASSERT(transferred <= reservation->bytes);
     budget->reserved_bytes -= reservation->bytes;
+    // Records cannot mature until all their contributing GPU attempts finish.
+    // Drop the whole affected cohort on failure: its block-level returns cannot
+    // be attributed precisely enough to subtract only this attempt's numerator.
+    for (i = 0; i < UVM_PREFETCH_COHORT_COUNT; ++i) {
+        uvm_prefetch_cohort_t *cohort = &budget->cohorts[i];
+        if (!reservation->cohort_ids[i] || cohort->id != reservation->cohort_ids[i])
+            continue;
+        UVM_ASSERT(reservation->cohort_blocks[i] <= cohort->inflight_blocks);
+        if (success) {
+            cohort->inflight_blocks -= reservation->cohort_blocks[i];
+        }
+        else {
+            budget->discarded_blocks += cohort->blocks;
+            budget->discarded_returns += cohort->returns;
+            cohort->id = 0;
+            cohort->blocks = 0;
+            cohort->returns = 0;
+            cohort->inflight_blocks = 0;
+        }
+    }
+    if (reservation->probe) {
+        UVM_ASSERT(budget->probe_inflight);
+        budget->probe_inflight = false;
+        // Includes empty/failed attempts. Let the full observation horizon pass
+        // before another probe; copy completion itself never earns recovery.
+        budget->next_probe_ns = now + 3 * config->observation_ns;
+    }
+    uvm_prefetch_budget_advance(budget, config, now);
 }
 
 #endif

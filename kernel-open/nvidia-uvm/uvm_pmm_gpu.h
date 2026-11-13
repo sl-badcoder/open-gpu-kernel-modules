@@ -225,6 +225,11 @@ typedef struct {
     NvU64 prefetch_return_percent;
     NvU64 prefetch_min_blocks;
     NvU64 prefetch_backoff_enabled;
+    NvU64 prefetch_recovery_enabled;
+    NvU64 prefetch_recoveries;
+    NvU64 prefetch_probes;
+    NvU64 prefetch_probe_inflight;
+    NvU64 prefetch_next_probe_ns;
     NvU64 prefetch_unretired_blocks;
     NvU64 prefetch_unretired_returns;
     NvU64 prefetch_ready_blocks;
@@ -688,9 +693,11 @@ NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
                                                uvm_prefetch_reservation_t *reservation);
 void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm,
                                             const uvm_prefetch_reservation_t *reservation,
-                                            NvU64 transferred_bytes);
+                                            NvU64 transferred_bytes,
+                                            bool success);
 // Event accounting, safe under VA-block lock. Cohort tokens are consumed once.
-NvU64 uvm_pmm_gpu_prefetch_record(uvm_pmm_gpu_t *pmm, NvU64 now, NvU64 generation);
+NvU64 uvm_pmm_gpu_prefetch_record(uvm_pmm_gpu_t *pmm, NvU64 now,
+                                 uvm_prefetch_reservation_t *reservation);
 void uvm_pmm_gpu_prefetch_return(uvm_pmm_gpu_t *pmm, NvU64 cohort, NvU64 now);
 // Allocation failures are diagnostics only and never reduce the window.
 void uvm_pmm_gpu_prefetch_allocation_failure(uvm_pmm_gpu_t *pmm);

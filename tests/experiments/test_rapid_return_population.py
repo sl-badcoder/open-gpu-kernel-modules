@@ -30,6 +30,7 @@ typedef struct { bool allow_eviction, no_eviction_allocation_failed; } uvm_va_bl
 typedef struct { struct { uvm_page_mask_t pages_changed_residency; unsigned all_involved_processors; } make_resident; } uvm_va_block_context_t;
 typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; } uvm_va_block_gpu_state_t;
 typedef struct { int lock; uvm_tracker_t tracker; uvm_va_block_gpu_state_t state; } uvm_va_block_t;
+typedef struct { NvU64 generation; } uvm_prefetch_reservation_t;
 typedef struct { unsigned unused; } uvm_pmm_gpu_t;
 typedef struct { int id; uvm_pmm_gpu_t pmm; } uvm_gpu_t;
 static uvm_page_mask_t cpu, resident, thrashing, changed;
@@ -60,8 +61,8 @@ static NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *b,uvm_va_block_retry
 static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get(uvm_va_block_t *b,int id)
 { assert(b->lock && id==1); return &b->state; }
 static NvU64 NV_GETTIME(void) { return 123456789; }
-static NvU64 uvm_pmm_gpu_prefetch_record(uvm_pmm_gpu_t *p,NvU64 now,NvU64 generation)
-{ (void)p; ++records; recorded_now=now; recorded_generation=generation; return 42; }
+static NvU64 uvm_pmm_gpu_prefetch_record(uvm_pmm_gpu_t *p,NvU64 now,uvm_prefetch_reservation_t *reservation)
+{ (void)p; ++records; recorded_now=now; recorded_generation=reservation->generation; return 42; }
 static NV_STATUS uvm_va_block_map(uvm_va_block_t *b,uvm_va_block_context_t *c,int id,
  int region,const uvm_page_mask_t *mask,int prot,int cause,uvm_tracker_t *tracker)
 { (void)c; assert(b->lock && id==1 && !region && *mask && prot==4 && !cause && tracker==&b->tracker);
@@ -76,6 +77,7 @@ static uvm_va_block_t block;
 static uvm_gpu_t gpu={.id=1};
 static uvm_va_block_context_t context;
 static uvm_tracker_t tracker;
+static uvm_prefetch_reservation_t reservation={.generation=17};
 static bool capacity;
 static NvU64 moved;
 static void reset(void)
@@ -86,7 +88,7 @@ static void reset(void)
  records=maps=retries=dependencies=0; moved=recorded_now=recorded_generation=0;
 }
 static NV_STATUS run(bool neighbor)
-{ return prefetch_block(&block,&gpu,NULL,&context,&tracker,&moved,17,&capacity,neighbor); }
+{ return prefetch_block(&block,&gpu,NULL,&context,&tracker,&moved,&reservation,&capacity,neighbor); }
 int main(void)
 {
  // One moved sparse page still counts as one neighbor population episode.
@@ -104,7 +106,8 @@ int main(void)
  // Allocation failures do not fabricate a population, and retain no-eviction semantics.
  reset(); resident_status=7; fail_allocation=true;
  assert(run(true)==7 && capacity && !records && !moved && !maps && retries==1 && dependencies==1);
- // Errors after a successful resident transition keep already submitted accounting.
+ // Errors after a resident transition keep provisional records here; failed
+ // attempt completion discards them (covered by controller and walker tests).
  reset(); map_status=8; assert(run(true)==8 && records==1 && moved==PAGE_SIZE && !block.lock);
  reset(); tracker_status=9; assert(run(true)==9 && records==1 && moved==PAGE_SIZE && !block.lock);
  puts("Production population accounting: moved neighbors only, sparse masks, errors and reservation generations passed.");
