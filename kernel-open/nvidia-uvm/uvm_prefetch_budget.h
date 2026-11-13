@@ -14,6 +14,7 @@ typedef struct {
     NvU64 observation_ns;
     unsigned return_percent;
     unsigned min_blocks;
+    bool backoff_enabled;
 } uvm_prefetch_budget_config_t;
 
 typedef struct {
@@ -68,6 +69,8 @@ static inline void uvm_prefetch_budget_backoff(uvm_prefetch_budget_t *budget,
     NvU64 limit = uvm_prefetch_budget_limit(config->limit_bytes);
     NvU64 decrease;
     unsigned i;
+    if (!config->backoff_enabled)
+        return;
     if (!budget->initialized) {
         budget->window_bytes = limit;
         budget->initialized = true;

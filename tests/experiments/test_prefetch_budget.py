@@ -16,7 +16,7 @@ typedef uint64_t NvU64;
 '''
 CASES = r'''
 #define Q UVM_PREFETCH_BUDGET_QUANTUM
-static const uvm_prefetch_budget_config_t cfg = {16 * Q, 0, 20, 50, 32};
+static const uvm_prefetch_budget_config_t cfg = {16 * Q, 0, 20, 50, 32, true};
 static NvU64 populate(uvm_prefetch_budget_t *b, NvU64 now, unsigned n, unsigned returns)
 {
     NvU64 id=0;
@@ -113,7 +113,7 @@ static void reservations_pressure_and_no_growth(void)
 {
     uvm_prefetch_budget_t b={0};
     uvm_prefetch_reservation_t a,c,denied;
-    uvm_prefetch_budget_config_t cap={5*Q+1,Q,20,50,32};
+    uvm_prefetch_budget_config_t cap={5*Q+1,Q,20,50,32,true};
     assert(uvm_prefetch_budget_reserve(&b,&cap,3*Q+1,64*Q,0,&a)==3*Q);
     assert(uvm_prefetch_budget_reserve(&b,&cap,3*Q,64*Q,1,&c)==2*Q);
     assert(!uvm_prefetch_budget_reserve(&b,&cap,Q,64*Q,2,&denied));
@@ -148,8 +148,32 @@ static void permanent_off_and_gentle_steps(void)
         assert(!b.window_bytes && !denied.bytes && b.backoffs==9);
     }
 }
+static void disabled_backoff_preserves_prefetch_and_measurement(void)
+{
+    uvm_prefetch_budget_t b={0};
+    uvm_prefetch_budget_config_t disabled=cfg;
+    uvm_prefetch_reservation_t ticket;
+    disabled.backoff_enabled=false;
+    assert(uvm_prefetch_budget_reserve(&b,&disabled,4*Q,64*Q,0,&ticket)==4*Q);
+    NvU64 id=0;
+    for(unsigned i=0;i<32;++i)
+        id=uvm_prefetch_budget_record(&b,&disabled,0,ticket.generation);
+    for(unsigned i=0;i<32;++i)
+        uvm_prefetch_budget_return(&b,&disabled,id,1);
+    uvm_prefetch_budget_advance(&b,&disabled,60);
+    assert(b.ratio_evaluations==1 && b.last_blocks==32 && b.last_returns==32);
+    assert(!b.backoffs && !b.generation && b.window_bytes==16*Q);
+    assert(b.reserved_bytes==4*Q); // Existing work remains accounted for.
+    uvm_prefetch_budget_complete(&b,&ticket,4*Q);
+    assert(uvm_prefetch_budget_reserve(&b,&disabled,16*Q,64*Q,80,&ticket)==16*Q);
+    uvm_prefetch_budget_complete(&b,&ticket,16*Q);
+    assert(!uvm_prefetch_budget_reserve(&b,&disabled,Q,0,81,&ticket));
+    assert(b.pressure_pauses==1 && !b.backoffs); // Headroom safety still applies.
+    assert(b.window_bytes==16*Q && b.quick_returns==32);
+}
 int main(void)
 {
+    disabled_backoff_preserves_prefetch_and_measurement();
     threshold_and_maturity(); minimum_and_fresh_evidence(); new_policy_requires_new_evidence();
     expired_tokens_and_delayed_records(); reservations_pressure_and_no_growth(); permanent_off_and_gentle_steps();
     puts("Rapid-return ratio: thresholds, maturity, epochs, caps, pressure, no recovery and permanent OFF passed.");

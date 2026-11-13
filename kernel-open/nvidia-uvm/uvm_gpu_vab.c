@@ -428,6 +428,7 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
     seq_printf(s, "prefetch_ready_blocks %llu\n", roots.prefetch_ready_blocks);
     seq_printf(s, "prefetch_ready_returns %llu\n", roots.prefetch_ready_returns);
     seq_puts(s, "prefetch_policy rapid_return_ratio_no_recovery\n");
+    seq_printf(s, "prefetch_backoff_enabled %llu\n", roots.prefetch_backoff_enabled);
     seq_printf(s, "prefetch_observation_ns %llu\nprefetch_return_percent %llu\nprefetch_min_blocks %llu\n",
                roots.prefetch_observation_ns, roots.prefetch_return_percent, roots.prefetch_min_blocks);
 

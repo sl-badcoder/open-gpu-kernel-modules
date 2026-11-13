@@ -182,6 +182,7 @@ int main(void){
  mock_now=100*NSEC_PER_MSEC; // T=20ms: tick1 ready; tick5 still young.
  uvm_prefetch_budget_t before=p.eager_eviction.budget;
  uvm_pmm_gpu_vab_stats(&p,&mock_snapshot,&stats);
+ assert(stats.prefetch_backoff_enabled==1);
  assert(stats.prefetch_unretired_blocks==36 && stats.prefetch_unretired_returns==17);
  assert(stats.prefetch_ready_blocks==32 && stats.prefetch_ready_returns==16);
  assert(!memcmp(&before,&p.eager_eviction.budget,sizeof(before)));
@@ -201,6 +202,7 @@ def main():
     code = code.replace('/* VAB stats */', stats)
     for parameter in ('churn_ms', 'return_percent', 'min_blocks'):
         code += re.search(r'static unsigned uvm_perf_speculative_prefetch_' + parameter + r' = \d+;', source).group(0) + '\n'
+    code += re.search(r'static bool uvm_perf_speculative_prefetch_backoff_enable = (?:true|false);', source).group(0) + '\n'
     code += function(source, 'uvm_pmm_gpu_prefetch_feedback_window_ns')
     code += function(source, 'speculative_prefetch_config')
     for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):

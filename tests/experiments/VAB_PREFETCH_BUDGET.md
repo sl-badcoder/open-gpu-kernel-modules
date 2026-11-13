@@ -115,6 +115,7 @@ All these parameters are set at module load and read-only afterward.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
+| `uvm_perf_speculative_prefetch_backoff_enable` | 1 | Set 0 to disable adaptive reductions while retaining fixed-cap prefetch, headroom checks, and ratio diagnostics. |
 | `uvm_perf_speculative_prefetch_limit_mb` | 32 | Aggregate speculative cap, rounded down to 2 MiB. Below 2 disables speculation. |
 | `uvm_perf_speculative_prefetch_reserve_mb` | 64 | Free PMA capacity excluded from admission. |
 | `uvm_perf_speculative_prefetch_churn_ms` | 20 | Each observation interval T; minimum 1 ms. |
@@ -125,6 +126,13 @@ The previous `uvm_perf_speculative_prefetch_quiet_ms`,
 `uvm_perf_speculative_prefetch_backoff_ms`, and
 `uvm_perf_speculative_prefetch_recovery_ms` parameters have been removed. Remove
 them from old module-load commands. Existing VAB and watermark controls remain.
+
+To compare adaptive backoff against fixed-cap prefetch, add
+`uvm_perf_speculative_prefetch_backoff_enable=0` to the module-load command.
+Use `=1` (the default) for adaptive backoff. This switch is read-only after loading;
+unload/reload between runs. Both modes retain ratio bookkeeping, the same fixed
+byte ceiling, and demand-headroom checks. To disable speculative prefetch entirely,
+use `uvm_perf_speculative_prefetch_limit_mb=0` instead.
 
 Example additions to the usual matching-module load command:
 
@@ -147,6 +155,7 @@ cat /proc/driver/nvidia-uvm/gpus/GPU-REPLACE-WITH-UUID/0/vab
 Relevant fields:
 
 - `prefetch_policy`: `rapid_return_ratio_no_recovery`.
+- `prefetch_backoff_enabled`: 1 for adaptive reductions, 0 for fixed-cap operation.
 - `prefetch_observation_ns`, `prefetch_return_percent`, `prefetch_min_blocks`:
   effective configuration.
 - `prefetch_prefetched_blocks`, `prefetch_quick_returns`: lifetime populations and

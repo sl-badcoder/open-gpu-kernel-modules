@@ -192,16 +192,19 @@ static unsigned uvm_perf_eager_eviction_batch_count = 16;
 static unsigned uvm_perf_vab_min_residency_ms = 100;
 static unsigned uvm_perf_speculative_prefetch_limit_mb = 32;
 static unsigned uvm_perf_speculative_prefetch_reserve_mb = 64;
+static bool uvm_perf_speculative_prefetch_backoff_enable = true;
 static unsigned uvm_perf_speculative_prefetch_churn_ms = 20;
 static unsigned uvm_perf_speculative_prefetch_return_percent = 50;
 static unsigned uvm_perf_speculative_prefetch_min_blocks = 32;
 module_param(uvm_perf_speculative_prefetch_limit_mb, uint, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_reserve_mb, uint, S_IRUGO);
+module_param(uvm_perf_speculative_prefetch_backoff_enable, bool, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_churn_ms, uint, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_return_percent, uint, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_min_blocks, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_limit_mb, "Per-GPU speculative bytes in flight, in MiB (default 32, rounded down to 2MiB; values below 2 disable speculation).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_reserve_mb, "Free PMA capacity reserved from speculative admission, in MiB (default 64).");
+MODULE_PARM_DESC(uvm_perf_speculative_prefetch_backoff_enable, "Enable rapid-return adaptive backoff (default true). False keeps the fixed cap, headroom checks and ratio accounting without reducing the window.");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_churn_ms, "Each rapid-return observation interval, not a polling timer (default 20 ms; minimum 1).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_return_percent, "Mature speculative block rapid-return percentage triggering backoff (default 50; clamped to 1..100).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_min_blocks, "Minimum mature speculative blocks per ratio decision (default 32; minimum 1).");
@@ -1835,6 +1838,7 @@ static uvm_prefetch_budget_config_t speculative_prefetch_config(void)
     config.observation_ns = uvm_pmm_gpu_prefetch_feedback_window_ns();
     config.return_percent = min(max(uvm_perf_speculative_prefetch_return_percent, 1U), 100U);
     config.min_blocks = max(uvm_perf_speculative_prefetch_min_blocks, 1U);
+    config.backoff_enabled = uvm_perf_speculative_prefetch_backoff_enable;
     return config;
 }
 
@@ -3587,6 +3591,7 @@ void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
     stats->prefetch_observation_ns = config.observation_ns;
     stats->prefetch_return_percent = config.return_percent;
     stats->prefetch_min_blocks = config.min_blocks;
+    stats->prefetch_backoff_enabled = config.backoff_enabled;
     stats->prefetch_unretired_blocks = 0;
     stats->prefetch_unretired_returns = 0;
     stats->prefetch_ready_blocks = 0;

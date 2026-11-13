@@ -224,6 +224,7 @@ typedef struct {
     NvU64 prefetch_observation_ns;
     NvU64 prefetch_return_percent;
     NvU64 prefetch_min_blocks;
+    NvU64 prefetch_backoff_enabled;
     NvU64 prefetch_unretired_blocks;
     NvU64 prefetch_unretired_returns;
     NvU64 prefetch_ready_blocks;
