@@ -60,6 +60,7 @@
 #include "uvm_types.h"
 #include "uvm_vab.h"
 #include "uvm_prefetch_budget.h"
+#include "uvm_prefetch_pattern.h"
 #include "nv_uvm_user_types.h"
 #if UVM_IS_CONFIG_HMM() || defined(CONFIG_PCI_P2PDMA)
 #include <linux/memremap.h>
@@ -234,6 +235,21 @@ typedef struct {
     NvU64 prefetch_unretired_returns;
     NvU64 prefetch_ready_blocks;
     NvU64 prefetch_ready_returns;
+    NvU64 prefetch_sparse_enabled;
+    NvU64 prefetch_recovery_return_percent;
+    NvU64 prefetch_bad_batches;
+    NvU64 prefetch_good_batches;
+    NvU64 prefetch_bad_streak;
+    NvU64 prefetch_good_streak;
+    NvU64 prefetch_holds;
+    NvU64 prefetch_last_locality_events;
+    NvU64 prefetch_last_locality_confirmed;
+    NvU64 prefetch_pattern_events;
+    NvU64 prefetch_pattern_confirmations;
+    NvU64 prefetch_pattern_replacements;
+    NvU64 prefetch_pattern_predictions;
+    NvU64 prefetch_pattern_learned_predictions;
+    NvU64 prefetch_pattern_expirations;
 } uvm_pmm_gpu_vab_stats_t;
 
 // Lists for allocated root chunks. When picking a root chunk to evict, lists
@@ -471,6 +487,9 @@ typedef struct uvm_pmm_gpu_struct
         // batches are mutually exclusive; recovery persists down to low.
         unsigned prefetch_count;
         uvm_prefetch_budget_t budget;
+        // Fixed-size, per-GPU co-demand history. Keys use range lifetime IDs;
+        // entries never retain VA range/block pointers. Protected by list_lock.
+        uvm_prefetch_pattern_t patterns;
         bool active;
         bool recovering_watermark;
         bool stopping;
@@ -704,6 +723,11 @@ void uvm_pmm_gpu_prefetch_allocation_failure(uvm_pmm_gpu_t *pmm);
 void uvm_pmm_gpu_prefetch_pressure_pause(uvm_pmm_gpu_t *pmm);
 NvU64 uvm_pmm_gpu_prefetch_feedback_window_ns(void);
 bool uvm_pmm_gpu_speculative_prefetch_enabled(void);
+// Observe a valid remote-demand region and return a sparse virtual-region mask.
+// Zero requests the legacy contiguous walker. Other masks describe 4MiB regions
+// within the triggering address's absolute 64MiB tile, including the trigger.
+NvU16 uvm_pmm_gpu_prefetch_pattern(uvm_pmm_gpu_t *pmm, NvU64 range_id, NvU64 address,
+                                  unsigned buffer_index, NvU64 batch_id, NvU16 demand_mask);
 
 static bool uvm_gpu_chunk_same_root(uvm_gpu_chunk_t *chunk1, uvm_gpu_chunk_t *chunk2)
 {

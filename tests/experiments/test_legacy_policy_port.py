@@ -44,6 +44,9 @@ def run_policy_harness():
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
+typedef unsigned long long NvU64;
+static NvU64 cpu_prefetch_next_range_id;
+#define atomic64_inc_return(p) (++*(p))
 typedef unsigned NvU32; typedef int uvm_processor_id_t;
 #define UVM_ID_CPU 0
 #define UVM_ID_IS_CPU(x) ((x)==UVM_ID_CPU)
@@ -56,7 +59,7 @@ typedef struct gpu_parent { bool access_counters_supported, is_integrated_gpu; }
 typedef struct gpu { gpu_parent *parent; int id; } uvm_gpu_t;
 typedef struct va_space { int lock; unsigned accessible_from[4]; uvm_gpu_t *gpus[4]; int gpu_count; } uvm_va_space_t;
 typedef struct block { unsigned gpu_prefetch_started, gpu_prefetch_retry; struct block *next; } uvm_va_block_t;
-typedef struct managed { struct { uvm_va_space_t *va_space; } va_range; bool cpu_access_counter_policy; struct { int preferred_location, preferred_nid; unsigned accessed_by; } policy; int cpu_prefetch_lock; uvm_va_block_t *blocks; } uvm_va_range_managed_t;
+typedef struct managed { struct { uvm_va_space_t *va_space; } va_range; bool cpu_access_counter_policy; NvU64 cpu_prefetch_range_id; struct { int preferred_location, preferred_nid; unsigned accessed_by; } policy; int cpu_prefetch_lock; uvm_va_block_t *blocks; } uvm_va_range_managed_t;
 struct { bool conf_computing_enabled; } g_uvm_global;
 static unsigned uvm_cpu_preferred_blocks_enable = 1;
 static void uvm_assert_rwsem_locked_write(int *x) {(void)x;} static void uvm_assert_rwsem_locked(int *x) {(void)x;}
@@ -109,6 +112,7 @@ def run_promotion_harness():
     code = r'''
 #include <assert.h>
 #include <stdbool.h>
+typedef unsigned long long NvU64;
 typedef unsigned NvU32; typedef struct { unsigned bits; } uvm_page_mask_t;
 #define UVM_ID_CPU 0
 #define NUMA_NO_NODE (-1)

@@ -310,6 +310,9 @@ struct uvm_va_range_managed_struct
     // hardware access-counter notification promotes their complete VA block.
     bool cpu_access_counter_policy;
 
+    // Unique allocation-lifetime key for bounded prefetch pattern history.
+    NvU64 cpu_prefetch_range_id;
+
     // Force the next split on this range to fail. Set by error injection ioctl
     // (testing purposes only).
     bool inject_split_error;

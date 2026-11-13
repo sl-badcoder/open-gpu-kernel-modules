@@ -13,13 +13,15 @@ PRELUDE = r'''
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
-typedef unsigned long long NvU64;
+typedef unsigned long long NvU64; typedef unsigned short NvU16;
 typedef int NV_STATUS;
 #define NV_OK 0
 #define UVM_SIZE_1MB (1ULL << 20)
 #define UVM_VA_BLOCK_SIZE (2ULL << 20)
 #define NSEC_PER_MSEC 1000000ULL
 #define UVM_ASSERT(x) assert(x)
+#define UVM_ALIGN_DOWN(x,a) ((x) & ~((NvU64)(a)-1))
+#define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
 #define READ_ONCE(x) (x)
 #define min(a,b) ((a)<(b)?(a):(b))
 #define UVM_DBG_PRINT(...) do {} while(0)
@@ -36,7 +38,7 @@ typedef struct {
 } uvm_va_block_t;
 struct uvm_va_range_managed_struct {
  struct { uvm_va_space_t *va_space; } va_range;
- size_t count; uvm_va_block_t *blocks[8];
+ NvU64 start; size_t count; uvm_va_block_t *blocks[64];
 };
 typedef struct { int unused; } uvm_va_block_context_t;
 typedef struct { int unused; } uvm_tracker_t;
@@ -54,11 +56,11 @@ static NvU64 reservation_generation = 17;
 static int calls, begin_calls, end_calls, waits, capacity_at, error_at, wait_error;
 static int watermark_at, watermark_calls, feedback_quick, feedback_capacity;
 static int pressure_pauses;
-static size_t visited[8];
+static size_t visited[64];
 static size_t trigger_slot;
 static uvm_va_space_t space;
 static uvm_va_range_managed_t range;
-static uvm_va_block_t blocks[8];
+static uvm_va_block_t blocks[64];
 static uvm_gpu_t gpu;
 static struct mm_struct mm;
 static uvm_va_block_context_t context;
@@ -82,7 +84,7 @@ static void uvm_processor_mask_set_atomic(unsigned *p,int id) {(void)id;*p=1;}
 static uvm_va_block_context_t *uvm_va_block_context_alloc(struct mm_struct *m) {(void)m;return alloc_fail?NULL:&context;}
 static void uvm_va_block_context_free(uvm_va_block_context_t *p) {assert(p==&context);}
 static size_t uvm_va_range_num_blocks(uvm_va_range_managed_t *r) {return r->count;}
-static size_t uvm_va_range_block_index(uvm_va_range_managed_t *r,NvU64 start) {(void)r;return start/UVM_VA_BLOCK_SIZE;}
+static size_t uvm_va_range_block_index(uvm_va_range_managed_t *r,NvU64 start) {return start/UVM_VA_BLOCK_SIZE-r->start/UVM_VA_BLOCK_SIZE;}
 static uvm_va_block_t *uvm_va_range_block(uvm_va_range_managed_t *r,size_t index) {assert(index<r->count);return r->blocks[index];}
 static bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *p) {(void)p;return watermark_at>=0 && watermark_calls++>=watermark_at;}
 static NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *p,NvU64 bytes,uvm_prefetch_reservation_t *r) {
@@ -97,7 +99,7 @@ static NV_STATUS uvm_tracker_wait_deinit(uvm_tracker_t *p) {(void)p;++waits;retu
 static NV_STATUS prefetch_block(uvm_va_block_t *b,uvm_gpu_t *g,struct mm_struct *m,
  uvm_va_block_context_t *ctx,uvm_tracker_t *tracker,NvU64 *moved,uvm_prefetch_reservation_t *reservation,bool *capacity,bool neighbor) {
  assert(reservation->generation==reservation_generation);
- (void)g;(void)m;(void)ctx;(void)tracker;assert(!b->lock && reserved && calls<8);
+ (void)g;(void)m;(void)ctx;(void)tracker;assert(!b->lock && reserved && calls<64);
  visited[calls]=(size_t)(b-blocks);assert(neighbor == (b!=&blocks[trigger_slot]));
  ++calls;*capacity=(calls==capacity_at);
  if(*capacity)return 7;
@@ -121,7 +123,7 @@ static void reset(void) {
  uvm_cpu_preferred_prefetch_capacity_stops=uvm_cpu_preferred_range_prefetches=0;
  uvm_cpu_preferred_prefetch_retries=uvm_cpu_preferred_prefetched_bytes=0;
 }
-static void run(void){uvm_cpu_block_policy_prefetch_on_signal(&blocks[trigger_slot],&gpu,&mm);}
+static void run(void){uvm_cpu_block_policy_prefetch_on_signal(&blocks[trigger_slot],&gpu,&mm,0);}
 int main(void) {
  // Actual production loop: range clamps request; grant truncates it; trigger is first.
  reset();run();assert(requested==16*UVM_SIZE_1MB && calls==2 && visited[0]==4 && visited[1]==3);
@@ -169,6 +171,37 @@ int main(void) {
  reset();blocks[4].state.speculative_cohort=42;
  blocks[4].state.speculative_evicted_ns=now-20*NSEC_PER_MSEC-1;
  grant=0;run();run();assert(!feedback_quick && !blocks[4].state.speculative_cohort);
+ // Sparse learned regions 1 and 4: move trigger and sibling, then region4,
+ // never transfer the intervening virtual regions or cross the 64MiB tile.
+ reset();range.count=64;
+ for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
+ trigger_slot=2;grant=8*UVM_SIZE_1MB;
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[2],&gpu,&mm,(1u<<1)|(1u<<4));
+ assert(requested==8*UVM_SIZE_1MB && calls==4 && visited[0]==2 && visited[1]==3 && visited[2]==8 && visited[3]==9);
+ assert(transferred==grant && completed_success && !reserved);
+ // Entire learned tile remains bounded by a smaller concurrent budget grant.
+ reset();range.count=64;
+ for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
+ trigger_slot=31;grant=6*UVM_SIZE_1MB;
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[31],&gpu,&mm,0xffff);
+ assert(requested==64*UVM_SIZE_1MB && calls==3 && visited[0]==31 && visited[1]==30 && visited[2]==0);
+ // Partial first block at an unaligned range start: never visit the prior half.
+ reset();range.start=3*UVM_VA_BLOCK_SIZE+4096;range.count=4;trigger_slot=0;grant=6*UVM_SIZE_1MB;
+ for(size_t i=0;i<4;++i){blocks[i].start=(3+i)*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
+ blocks[0].start=range.start;
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[0],&gpu,&mm,(1u<<1)|(1u<<2));
+ assert(calls==3 && visited[0]==0 && visited[1]==1 && visited[2]==2 && requested==grant);
+ // Allocation ending in the first half of a region must not invent its sibling.
+ reset();range.count=3;trigger_slot=2;grant=2*UVM_SIZE_1MB;
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[2],&gpu,&mm,(1u<<1));
+ assert(calls==1 && visited[0]==2 && requested==grant);
+ // A tile boundary must clip a long allocation beginning before that tile.
+ reset();range.count=64;
+ for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
+ trigger_slot=32;grant=64*UVM_SIZE_1MB;
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[32],&gpu,&mm,0xffff);
+ assert(calls==32 && visited[0]==32 && visited[1]==33);
+ for(int i=0;i<calls;++i)assert(visited[i]>=32 && visited[i]<64);
  puts("Production prefetch walker: bounded copies, trigger order, retry, balanced failures, waits and churn feedback passed.");
  return 0;
 }

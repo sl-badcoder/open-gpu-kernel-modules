@@ -66,7 +66,7 @@ typedef struct { uvm_gpu_chunk_t chunk; NvU64 vab_generation,vab_ready_generatio
 typedef struct { int dummy; } uvm_parent_gpu_t;
 typedef struct { uvm_parent_gpu_t *parent; } uvm_gpu_t;
 static uvm_gpu_t mock_gpu;
-typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
+typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; struct {NvU64 events, confirmations, replacements, predictions, learned_predictions, expirations;} patterns; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
 static uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *p) {(void)p; return &mock_gpu;}
 static uvm_vab_snapshot_t mock_snapshot;
 static unsigned snapshot_calls;
@@ -200,9 +200,9 @@ def main():
     stats_end = pmm_header.index('} uvm_pmm_gpu_vab_stats_t;') + len('} uvm_pmm_gpu_vab_stats_t;')
     stats = pmm_header[pmm_header.rfind('typedef struct', 0, stats_end):stats_end]
     code = code.replace('/* VAB stats */', stats)
-    for parameter in ('churn_ms', 'return_percent', 'min_blocks'):
+    for parameter in ('churn_ms', 'return_percent', 'min_blocks', 'recovery_return_percent', 'bad_batches', 'good_batches'):
         code += re.search(r'static unsigned uvm_perf_speculative_prefetch_' + parameter + r' = \d+;', source).group(0) + '\n'
-    for parameter in ('backoff_enable', 'recovery_enable'):
+    for parameter in ('backoff_enable', 'recovery_enable', 'sparse_enable'):
         code += re.search(r'static bool uvm_perf_speculative_prefetch_' + parameter + r' = (?:true|false);', source).group(0) + '\n'
     code += function(source, 'uvm_pmm_gpu_prefetch_feedback_window_ns')
     code += function(source, 'speculative_prefetch_config')

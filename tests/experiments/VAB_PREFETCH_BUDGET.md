@@ -6,8 +6,10 @@ Branch: `615.71.09/experiment/rapid-return-ratio`, based on
 This experiment uses **one backoff metric**: the fraction of speculative neighbor
 block population episodes followed by rapid eviction and rapid demand return.
 It removes the previous allocation-failure confirmation filter, copy-completion
-recovery credits, and sequential-growth detector. Recovery now uses the same
-mature rapid-return ratio as backoff, with bounded probes when OFF.
+recovery credits, and sequential-growth detector. The controller now uses
+consecutive mature batches and a deadband: two bad batches are required to
+shrink, while three good batches are required to grow. Recovery can also require
+positive sparse-locality evidence.
 It does not change VAB sampling, address mapping, or reset behavior.
 
 ## Metric and tracking
@@ -63,9 +65,11 @@ Mature cohorts accumulate into a decision batch until there are at least
 ```text
 ratio = mature rapid-return episodes / mature population episodes
 
-ratio >= 50%: reduce the adaptive byte window by approximately 25%
-ratio <  50%: increase an active window by 2 MiB, up to the configured cap
-              (OFF reopens at 4 MiB after sufficient mature probe evidence)
+ratio >= 50%: count a bad batch; after two consecutive bad batches, reduce
+              the adaptive byte window by approximately 12.5% (2 MiB units)
+ratio <= 25%: count a good batch; after three consecutive good batches, grow
+              an active window by 2 MiB, subject to locality evidence
+25% < ratio < 50%: hold the window and reset both streaks
 ```
 
 Every decision consumes its entire batch, even below threshold. On any size change,
@@ -82,15 +86,15 @@ allocations on the same GPU shares the ratio and budget.
 At the default 32 MiB cap, successive reductions are:
 
 ```text
-32 -> 24 -> 18 -> 14 -> 12 -> 10 -> 8 -> 6 -> 4 -> OFF   MiB
+32 -> 28 -> 26 -> 24 -> 22 -> 20 -> 18 -> 16 -> 14 -> 12 -> 10 -> 8 -> 6 -> 4 -> OFF MiB
 ```
 
-Recovery is enabled by default. An active window grows **2 MiB per mature batch
-strictly below the configured threshold**. Equality still backs off. There is no
-separate sequential-growth path, elapsed-time growth credit, or reward for copy
-completion. At the cap, a good batch changes neither size nor generation. Because
-there is no hysteresis band, ratios fluctuating around the threshold can alternate
-small increases and reductions; the minimum batch size controls evidence volume.
+Recovery is enabled by default. The production configuration uses a 25% recovery
+cutoff, two bad batches, and three good batches. When sparse locality learning is
+enabled, at least `min_blocks` locality observations and at least half confirmed
+co-demand observations are required before a good streak can grow the window.
+There is no sequential-growth path, elapsed-time growth credit, or reward for
+copy completion. At the cap, a good batch changes neither size nor generation.
 
 OFF has no normal speculative populations to observe. After older reservations
 drain, admit at most one **4 MiB probe** (trigger plus neighbor) at a time, no sooner
@@ -103,11 +107,12 @@ probes provide no neighbor evidence. None can cause recovery merely by completin
 only completed successful neighbor populations enter the mature denominator.
 
 Each actual neighbor populated by a probe contributes to the usual mature batch.
-Only a batch of at least `min_blocks` with a ratio below the threshold reopens the
-window at 4 MiB. A bad probe batch leaves it OFF and bounded probing continues.
-With min_blocks=32 and one neighbor per probe, approximately 32 probes are needed:
-about two seconds plus GPU work and demand-notification delays at default T.
-No notifications, no headroom, or too few observed neighbors means no recovery.
+Recovery still requires three consecutive qualified good batches and, when sparse
+learning is enabled, the locality confirmation requirement. A bad or
+insufficiently evidenced probe batch leaves the window OFF and bounded probing
+continues. Missing locality evidence is neutral; it is not treated as a negative
+locality result. No notifications, no headroom, or too few observed neighbors
+means no recovery.
 This path can still move unused data: low ping-pong is not proof of useful reuse.
 
 Set `uvm_perf_speculative_prefetch_recovery_enable=0` to retain the preceding
@@ -116,6 +121,23 @@ experiment's one-way backoff and permanent OFF. Set
 recovery/probes while preserving fixed-cap prefetch and ratio diagnostics. These
 are module-load controls, not runtime reset switches. Reload between independent
 runs: budget and evidence are per GPU, not per process.
+
+## Sparse region learning
+
+The optional sparse learner groups 4 MiB regions inside a bounded 64 MiB address
+tile. It records valid remote access-counter observations before native demand
+service, deduplicated to distinct 4 MiB offsets within a notification batch.
+Later it admits only learned offsets, so gaps are not copied merely because they
+fall between two addresses. It does not train on its own prefetch copies. A
+positive locality event means that a candidate region was co-observed with
+another region; it is a kernel-side reuse proxy, not an application-level
+locality guarantee or a prediction-accuracy metric. Cold start admits only the
+trigger's 4 MiB region (the two 2 MiB halves). Learned entries expire after 512 distinct region observations on the GPU
+since the last group confirmation. Hash collisions replace learning history only. At a batch boundary, the learner replaces its active phase only
+after three completed batch masks share at least two 4 MiB offsets; it does not
+infer misses from absent offsets. Learning
+does not alter VAB access-bit sampling, physical-address mapping, or bit reset
+behavior; VAB remains an eviction-ordering signal.
 
 ## Admission and VAB eviction
 
@@ -158,6 +180,10 @@ All these parameters are set at module load and read-only afterward.
 | `uvm_perf_speculative_prefetch_churn_ms` | 20 | Each observation interval T; minimum 1 ms. |
 | `uvm_perf_speculative_prefetch_return_percent` | 50 | Backoff percentage, clamped to 1–100. Equality triggers. |
 | `uvm_perf_speculative_prefetch_min_blocks` | 32 | Minimum mature population episodes per decision; minimum 1. |
+| `uvm_perf_speculative_prefetch_recovery_return_percent` | 25 | Low-return cutoff for recovery; clamped below the backoff threshold. |
+| `uvm_perf_speculative_prefetch_bad_batches` | 2 | Consecutive high-return batches required before shrinking. |
+| `uvm_perf_speculative_prefetch_good_batches` | 3 | Consecutive low-return batches required before growing. |
+| `uvm_perf_speculative_prefetch_sparse_enable` | 1 | Select the sparse 4 MiB walker within 64 MiB tiles and require sparse co-demand evidence before recovery; 0 selects the contiguous walker. |
 
 The previous `uvm_perf_speculative_prefetch_quiet_ms`,
 `uvm_perf_speculative_prefetch_backoff_ms`, and
@@ -191,7 +217,7 @@ cat /proc/driver/nvidia-uvm/gpus/GPU-REPLACE-WITH-UUID/0/vab
 
 Relevant fields:
 
-- `prefetch_policy`: `rapid_return_ratio`.
+- `prefetch_policy`: `rapid_return_locality_hysteresis`.
 - `prefetch_backoff_enabled`: 1 for adaptive operation, 0 for fixed-cap operation.
 - `prefetch_recovery_enabled`: effective recovery setting (requires backoff enabled).
 - `prefetch_recoveries`, `prefetch_probes`, `prefetch_probe_inflight`: window
@@ -221,6 +247,14 @@ Relevant fields:
   and unmatched/expired tokens, including old-policy tokens discarded at backoff.
 - `prefetch_ratio_evaluations`, `prefetch_backoffs`, `prefetch_window_bytes`,
   `prefetch_off`: decisions and resulting state.
+- `prefetch_bad_streak`, `prefetch_good_streak`, `prefetch_holds`: hysteresis
+  state and mature batches that did not resize the window.
+- `prefetch_last_locality_events`, `prefetch_last_locality_confirmed`: sparse
+  co-demand observations used to gate recovery at the last ratio decision.
+- `prefetch_pattern_predictions` and `prefetch_pattern_learned_predictions`:
+  sparse-walker suggestions and suggestions remaining after known-demand
+  exclusion. These count candidate suggestions, not successful copies or
+  prediction accuracy.
 - `prefetch_reserved_bytes`, `prefetch_peak_bytes`, `prefetch_admissions`,
   `prefetch_denials`, `prefetch_capacity_stops`, `prefetch_pressure_pauses`,
   `prefetch_allocation_failures`: admission diagnostics.
@@ -248,8 +282,7 @@ churn. Keep it separate from this initial experiment so results stay attributabl
 
 ```sh
 python3 tests/experiments/test_prefetch_budget.py
-python3 tests/experiments/test_speculative_prefetch.py
-python3 tests/experiments/test_rapid_return_population.py
+python3 tests/experiments/test_prefetch_pattern.py
 python3 tests/experiments/test_demand_first_eviction.py
 python3 tests/experiments/test_demand_first_notifications.py
 python3 tests/experiments/test_vab_classifier.py

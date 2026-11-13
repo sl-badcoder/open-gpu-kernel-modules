@@ -29,6 +29,8 @@
 #include "uvm_va_range.h"
 #include "uvm_va_space.h"
 
+static atomic64_t cpu_prefetch_next_range_id = ATOMIC64_INIT(0);
+
 static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
 static unsigned uvm_cpu_preferred_block_promotion_enable __read_mostly = 1;
 static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly = 64;
@@ -111,6 +113,7 @@ void uvm_cpu_block_policy_init_range(uvm_va_range_managed_t *managed_range)
     if (!uvm_cpu_block_policy_enabled() || g_uvm_global.conf_computing_enabled)
         return;
 
+    managed_range->cpu_prefetch_range_id = (NvU64)atomic64_inc_return(&cpu_prefetch_next_range_id);
     managed_range->cpu_access_counter_policy = true;
     managed_range->policy.preferred_location = UVM_ID_CPU;
     managed_range->policy.preferred_nid = NUMA_NO_NODE;
@@ -309,7 +312,8 @@ out_unlock:
 
 void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                              uvm_gpu_t *gpu,
-                                             struct mm_struct *mm)
+                                             struct mm_struct *mm,
+                                             NvU16 region_mask)
 {
     uvm_va_range_managed_t *managed_range = trigger_block->managed_range;
     uvm_va_space_t *va_space;
@@ -321,6 +325,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     size_t trigger_index;
     size_t block_index;
     size_t candidate_index;
+    size_t sparse_indices[32];
+    size_t sparse_count = 0;
     NvU64 chunk_bytes;
     NvU64 prefetched_bytes = 0;
     NvU64 reserved_bytes = 0;
@@ -387,6 +393,41 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     chunk_block_count = (chunk_bytes + UVM_VA_BLOCK_SIZE - 1) / UVM_VA_BLOCK_SIZE;
     chunk_block_count = min(chunk_block_count, block_count);
 
+    if (region_mask) {
+        NvU64 range_block_base = UVM_ALIGN_DOWN(trigger_block->start, UVM_VA_BLOCK_SIZE) -
+                                   (NvU64)trigger_index * UVM_VA_BLOCK_SIZE;
+        NvU64 tile_base = UVM_ALIGN_DOWN(trigger_block->start, 64ULL * UVM_SIZE_1MB);
+        NvU64 tile_last = tile_base + 64ULL * UVM_SIZE_1MB - 1;
+        size_t first = tile_base > range_block_base ?
+                           (size_t)((tile_base - range_block_base) / UVM_VA_BLOCK_SIZE) : 0;
+        size_t outer = min(block_count,
+                            (size_t)((tile_last - range_block_base) / UVM_VA_BLOCK_SIZE + 1));
+        size_t sibling = trigger_index;
+        NvU64 trigger_base = range_block_base + (NvU64)trigger_index * UVM_VA_BLOCK_SIZE;
+
+        sparse_indices[sparse_count++] = trigger_index;
+        // Keep the other 2MiB half of the triggering 4MiB region first.
+        if (trigger_base & UVM_VA_BLOCK_SIZE) {
+            if (trigger_index > first)
+                sibling = trigger_index - 1;
+        }
+        else if (trigger_index + 1 < outer) {
+            sibling = trigger_index + 1;
+        }
+        if (sibling != trigger_index)
+            sparse_indices[sparse_count++] = sibling;
+        for (candidate_index = first; candidate_index < outer; ++candidate_index) {
+            NvU64 address = range_block_base + (NvU64)candidate_index * UVM_VA_BLOCK_SIZE;
+            unsigned region = (unsigned)((address >> 22) & 15);
+            if (candidate_index != trigger_index && candidate_index != sibling &&
+                (region_mask & (1U << region))) {
+                UVM_ASSERT(sparse_count < ARRAY_SIZE(sparse_indices));
+                sparse_indices[sparse_count++] = candidate_index;
+            }
+        }
+        chunk_block_count = min(chunk_block_count, sparse_count);
+    }
+
     // Reserve the entire bounded chunk before any speculative submission. The
     // reservation stays live through the final GPU wait on every exit path.
     reserved_bytes = uvm_pmm_gpu_eager_eviction_prefetch_begin(&gpu->pmm,
@@ -425,7 +466,10 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         NV_STATUS status;
         bool capacity_stop;
 
-        if (block_index == 0) {
+        if (region_mask) {
+            candidate_index = sparse_indices[block_index];
+        }
+        else if (block_index == 0) {
             candidate_index = trigger_index;
         }
         else {
@@ -434,7 +478,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                 ++candidate_index;
         }
 
-        UVM_ASSERT(candidate_index >= start_index && candidate_index < end_index);
+        UVM_ASSERT(candidate_index < block_count);
+        UVM_ASSERT(region_mask || (candidate_index >= start_index && candidate_index < end_index));
 
         va_block = candidate_index == trigger_index ?
                        trigger_block :

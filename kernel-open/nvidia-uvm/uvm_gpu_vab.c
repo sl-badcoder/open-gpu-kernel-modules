@@ -427,8 +427,24 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
     seq_printf(s, "prefetch_unretired_returns %llu\n", roots.prefetch_unretired_returns);
     seq_printf(s, "prefetch_ready_blocks %llu\n", roots.prefetch_ready_blocks);
     seq_printf(s, "prefetch_ready_returns %llu\n", roots.prefetch_ready_returns);
-    seq_puts(s, "prefetch_policy rapid_return_ratio\n");
+    seq_puts(s, "prefetch_policy rapid_return_locality_hysteresis\n");
     seq_printf(s, "prefetch_backoff_enabled %llu\n", roots.prefetch_backoff_enabled);
+    seq_printf(s, "prefetch_sparse_enabled %llu\n", roots.prefetch_sparse_enabled);
+    seq_printf(s, "prefetch_recovery_return_percent %llu\n", roots.prefetch_recovery_return_percent);
+    seq_printf(s, "prefetch_bad_batches %llu\n", roots.prefetch_bad_batches);
+    seq_printf(s, "prefetch_good_batches %llu\n", roots.prefetch_good_batches);
+    seq_printf(s, "prefetch_bad_streak %llu\n", roots.prefetch_bad_streak);
+    seq_printf(s, "prefetch_good_streak %llu\n", roots.prefetch_good_streak);
+    seq_printf(s, "prefetch_holds %llu\n", roots.prefetch_holds);
+    seq_printf(s, "prefetch_last_locality_events %llu\n", roots.prefetch_last_locality_events);
+    seq_printf(s, "prefetch_last_locality_confirmed %llu\n", roots.prefetch_last_locality_confirmed);
+    seq_printf(s, "prefetch_pattern_events %llu\n", roots.prefetch_pattern_events);
+    seq_printf(s, "prefetch_pattern_confirmations %llu\n", roots.prefetch_pattern_confirmations);
+    seq_printf(s, "prefetch_pattern_replacements %llu\n", roots.prefetch_pattern_replacements);
+    seq_printf(s, "prefetch_pattern_predictions %llu\n", roots.prefetch_pattern_predictions);
+    seq_printf(s, "prefetch_pattern_learned_predictions %llu\n", roots.prefetch_pattern_learned_predictions);
+    seq_printf(s, "prefetch_pattern_expirations %llu\n", roots.prefetch_pattern_expirations);
+
     seq_printf(s, "prefetch_recovery_enabled %llu\n", roots.prefetch_recovery_enabled);
     seq_printf(s, "prefetch_recoveries %llu\n", roots.prefetch_recoveries);
     seq_printf(s, "prefetch_probes %llu\n", roots.prefetch_probes);

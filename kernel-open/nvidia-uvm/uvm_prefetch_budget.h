@@ -14,8 +14,12 @@ typedef struct {
     NvU64 observation_ns;
     unsigned return_percent;
     unsigned min_blocks;
+    unsigned recovery_return_percent;
+    unsigned bad_batches;
+    unsigned good_batches;
     bool backoff_enabled;
     bool recovery_enabled;
+    bool locality_enabled;
 } uvm_prefetch_budget_config_t;
 
 typedef struct {
@@ -64,6 +68,13 @@ typedef struct {
     NvU64 discarded_returns;
     NvU64 dropped_records;
     NvU64 dropped_returns;
+    unsigned bad_streak;
+    unsigned good_streak;
+    NvU64 locality_events;
+    NvU64 locality_confirmed;
+    NvU64 last_locality_events;
+    NvU64 last_locality_confirmed;
+    NvU64 holds;
     uvm_prefetch_cohort_t cohorts[UVM_PREFETCH_COHORT_COUNT];
 } uvm_prefetch_budget_t;
 
@@ -72,11 +83,23 @@ static inline NvU64 uvm_prefetch_budget_limit(NvU64 bytes)
     return bytes - bytes % UVM_PREFETCH_BUDGET_QUANTUM;
 }
 
+static inline void uvm_prefetch_budget_locality(uvm_prefetch_budget_t *budget,
+                                                bool confirmed)
+{
+    ++budget->locality_events;
+    if (confirmed)
+        ++budget->locality_confirmed;
+}
+
 // A changed size needs fresh measurements, in either direction.
 static inline void uvm_prefetch_budget_changed(uvm_prefetch_budget_t *budget)
 {
     unsigned i;
     ++budget->generation;
+    budget->locality_events = 0;
+    budget->locality_confirmed = 0;
+    budget->bad_streak = 0;
+    budget->good_streak = 0;
     // IDs are never reused, including when a new cohort starts in the same tick.
     for (i = 0; i < UVM_PREFETCH_COHORT_COUNT; ++i) {
         uvm_prefetch_cohort_t *cohort = &budget->cohorts[i];
@@ -108,7 +131,7 @@ static inline void uvm_prefetch_budget_backoff(uvm_prefetch_budget_t *budget,
         budget->next_probe_ns = now + 3 * config->observation_ns;
     }
     else {
-        decrease = uvm_prefetch_budget_limit(budget->window_bytes / 4);
+        decrease = uvm_prefetch_budget_limit(budget->window_bytes / 8);
         if (decrease < UVM_PREFETCH_BUDGET_QUANTUM)
             decrease = UVM_PREFETCH_BUDGET_QUANTUM;
         budget->window_bytes -= decrease;
@@ -163,16 +186,56 @@ static inline void uvm_prefetch_budget_advance(uvm_prefetch_budget_t *budget,
     }
     if (budget->pending_blocks && budget->pending_blocks >= config->min_blocks) {
         NvU64 threshold;
+        unsigned recovery_percent = config->recovery_return_percent;
+        unsigned bad_batches = config->bad_batches ? config->bad_batches : 1;
+        unsigned good_batches = config->good_batches ? config->good_batches : 1;
         budget->last_blocks = budget->pending_blocks;
         budget->last_returns = budget->pending_returns;
+        budget->last_locality_events = budget->locality_events;
+        budget->last_locality_confirmed = budget->locality_confirmed;
         ++budget->ratio_evaluations;
         // ceil(blocks * percentage / 100), without overflowing the product.
         threshold = (budget->pending_blocks / 100) * config->return_percent +
                     ((budget->pending_blocks % 100) * config->return_percent + 99) / 100;
-        if (budget->pending_returns >= threshold)
-            uvm_prefetch_budget_backoff(budget, config, now);
-        else
-            uvm_prefetch_budget_recover(budget, config);
+        if (budget->pending_returns >= threshold) {
+            ++budget->bad_streak;
+            budget->good_streak = 0;
+            if (budget->bad_streak >= bad_batches) {
+                uvm_prefetch_budget_backoff(budget, config, now);
+                budget->bad_streak = 0;
+            }
+            else {
+                ++budget->holds;
+            }
+        }
+        else {
+            if (recovery_percent >= config->return_percent)
+                recovery_percent = config->return_percent ? config->return_percent - 1 : 0;
+            threshold = (budget->pending_blocks / 100) * recovery_percent +
+                        ((budget->pending_blocks % 100) * recovery_percent) / 100;
+            if (budget->pending_returns <= threshold &&
+                (!config->locality_enabled ||
+                 (budget->locality_events >= config->min_blocks &&
+                  budget->locality_confirmed >=
+                      budget->locality_events / 2 + budget->locality_events % 2))) {
+                ++budget->good_streak;
+                budget->bad_streak = 0;
+                if (budget->good_streak >= good_batches) {
+                    uvm_prefetch_budget_recover(budget, config);
+                    budget->good_streak = 0;
+                }
+                else {
+                    ++budget->holds;
+                }
+            }
+            else {
+                ++budget->holds;
+                budget->good_streak = 0;
+                budget->bad_streak = 0;
+            }
+        }
+        budget->locality_events = 0;
+        budget->locality_confirmed = 0;
         // Non-overlapping batches: old bad evidence cannot trigger another step.
         budget->pending_blocks = 0;
         budget->pending_returns = 0;

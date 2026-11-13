@@ -16,7 +16,11 @@ typedef uint64_t NvU64;
 '''
 CASES = r'''
 #define Q UVM_PREFETCH_BUDGET_QUANTUM
-static const uvm_prefetch_budget_config_t cfg = {16 * Q, 0, 20, 50, 32, true, false};
+static const uvm_prefetch_budget_config_t cfg = {
+    .limit_bytes=16 * Q, .demand_reserve_bytes=0, .observation_ns=20,
+    .return_percent=50, .min_blocks=32, .recovery_return_percent=49,
+    .bad_batches=1, .good_batches=1, .backoff_enabled=true,
+    .recovery_enabled=false, .locality_enabled=false};
 static NvU64 record_completed(uvm_prefetch_budget_t *b, const uvm_prefetch_budget_config_t *config,
                                NvU64 now, NvU64 generation)
 {
@@ -41,6 +45,39 @@ static NvU64 populate(uvm_prefetch_budget_t *b, NvU64 now, unsigned n, unsigned 
 {
     return populate_config(b,&cfg,now,n,returns);
 }
+static void hysteresis_and_locality_gates(void)
+{
+    uvm_prefetch_budget_config_t c=cfg;
+    c.bad_batches=2; c.good_batches=3; c.recovery_enabled=true;
+    uvm_prefetch_budget_t b={.initialized=true,.window_bytes=8*Q};
+    for (unsigned i=0; i<2; ++i) {
+        populate_config(&b,&c,i*80,32,16);
+        uvm_prefetch_budget_advance(&b,&c,i*80+60);
+    }
+    assert(b.backoffs==1 && b.window_bytes==7*Q && b.bad_streak==0);
+    populate_config(&b,&c,200,32,0);
+    uvm_prefetch_budget_advance(&b,&c,260);
+    populate_config(&b,&c,280,32,0);
+    uvm_prefetch_budget_advance(&b,&c,340);
+    assert(!b.recoveries); // only two clean batches
+    populate_config(&b,&c,360,32,0);
+    uvm_prefetch_budget_advance(&b,&c,420);
+    assert(b.recoveries==1 && b.window_bytes==8*Q);
+
+    c.locality_enabled=true;
+    b.window_bytes=6*Q; b.good_streak=0;
+    populate_config(&b,&c,440,32,0);
+    for (unsigned i=0; i<32; ++i) uvm_prefetch_budget_locality(&b, i < 15);
+    uvm_prefetch_budget_advance(&b,&c,500);
+    assert(b.holds && b.recoveries==1); // below 50% locality confirmation
+
+    c.locality_enabled=false; c.recovery_return_percent=25;
+    b.window_bytes=6*Q; b.good_streak=0; b.locality_events=UINT64_MAX;
+    b.locality_confirmed=UINT64_MAX / 2;
+    populate_config(&b,&c,520,3,1); // 1/3 is above the 25% recovery floor
+    uvm_prefetch_budget_advance(&b,&c,580);
+    assert(b.window_bytes==6*Q);
+}
 static void threshold_and_maturity(void)
 {
     for (unsigned returns=15; returns<=16; ++returns) {
@@ -50,7 +87,7 @@ static void threshold_and_maturity(void)
         assert(!b.ratio_evaluations && !b.mature_blocks); // Last member gets full 40ms.
         uvm_prefetch_budget_advance(&b,&cfg,60);
         assert(b.ratio_evaluations==1 && b.last_blocks==32 && b.last_returns==returns);
-        assert(b.backoffs==(returns==16) && b.window_bytes==(returns==16?12:16)*Q);
+        assert(b.backoffs==(returns==16) && b.window_bytes==(returns==16?14:16)*Q);
         uvm_prefetch_budget_advance(&b,&cfg,1000000);
         assert(b.ratio_evaluations==1); // Consumed evidence cannot repeat.
     }
@@ -88,7 +125,7 @@ static void new_policy_requires_new_evidence(void)
     populate(&b,40,32,16);
     uvm_prefetch_budget_advance(&b,&cfg,60);
     assert(b.backoffs==1 && b.generation==1 && b.discarded_blocks==64);
-    assert(b.discarded_returns==32 && b.window_bytes==12*Q);
+    assert(b.discarded_returns==32 && b.window_bytes==14*Q);
     uvm_prefetch_budget_advance(&b,&cfg,100);
     assert(b.backoffs==1 && b.ratio_evaluations==1);
     assert(!record_completed(&b,&cfg,100,0)); // Old in-flight reservation.
@@ -126,7 +163,8 @@ static void reservations_pressure_and_no_growth(void)
 {
     uvm_prefetch_budget_t b={0};
     uvm_prefetch_reservation_t a,c,denied;
-    uvm_prefetch_budget_config_t cap={5*Q+1,Q,20,50,32,true,false};
+    uvm_prefetch_budget_config_t cap=cfg;
+    cap.limit_bytes=5*Q+1; cap.demand_reserve_bytes=Q;
     assert(uvm_prefetch_budget_reserve(&b,&cap,3*Q+1,64*Q,0,&a)==3*Q);
     assert(uvm_prefetch_budget_reserve(&b,&cap,3*Q,64*Q,1,&c)==2*Q);
     assert(!uvm_prefetch_budget_reserve(&b,&cap,Q,64*Q,2,&denied));
@@ -150,7 +188,7 @@ static void reservations_pressure_and_no_growth(void)
 static void permanent_off_and_gentle_steps(void)
 {
     uvm_prefetch_budget_t b={0};
-    const unsigned expected[]={12,9,7,6,5,4,3,2,0};
+    const unsigned expected[]={14,13,12,11,10,9,8,7,6,5,4,3,2,0};
     for (unsigned i=0;i<sizeof(expected)/sizeof(expected[0]);++i) {
         uvm_prefetch_budget_backoff(&b,&cfg,0);
         assert(b.window_bytes==expected[i]*Q && b.backoffs==i+1);
@@ -158,7 +196,7 @@ static void permanent_off_and_gentle_steps(void)
     uvm_prefetch_reservation_t denied;
     for (unsigned i=0;i<4;++i) {
         assert(!uvm_prefetch_budget_reserve(&b,&cfg,16*Q,64*Q,1000000ULL<<i,&denied));
-        assert(!b.window_bytes && !denied.bytes && b.backoffs==9);
+        assert(!b.window_bytes && !denied.bytes && b.backoffs==14);
     }
 }
 static void disabled_backoff_preserves_prefetch_and_measurement(void)
@@ -362,6 +400,7 @@ static void configured_percentage_controls_both_directions(void)
         for(unsigned equality=0;equality<2;++equality) {
             uvm_prefetch_budget_config_t recovery=cfg;
             recovery.recovery_enabled=true; recovery.return_percent=percentages[p];
+            recovery.recovery_return_percent=percentages[p] ? percentages[p]-1 : 0;
             uvm_prefetch_budget_t b={.initialized=true,.window_bytes=4*Q};
             unsigned threshold=32*percentages[p]/100;
             populate_config(&b,&recovery,0,32,threshold-1+equality);
@@ -394,6 +433,7 @@ static void shared_cohort_failure_in_both_completion_orders(void)
 }
 int main(void)
 {
+    hysteresis_and_locality_gates();
     configured_percentage_controls_both_directions(); shared_cohort_failure_in_both_completion_orders();
     incomplete_and_failed_attempts_cannot_recover(); concurrent_failure_and_same_tick_replacement();
     failed_probe_does_not_help_reopen();
