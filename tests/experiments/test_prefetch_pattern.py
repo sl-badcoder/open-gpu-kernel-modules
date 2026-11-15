@@ -13,7 +13,11 @@ HARNESS = r'''
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#define current get_current()
 #include "uvm_prefetch_pattern.h"
+#ifndef current
+#error "The kernel current macro must remain defined"
+#endif
 static void obs(uvm_prefetch_pattern_t *t, uint64_t r, unsigned n, uint64_t b) {
     bool c;
     assert(uvm_prefetch_pattern_observe(t, r, (uint64_t)n << 22, 0, b, &c));
@@ -71,7 +75,11 @@ WRAPPER_PRELUDE = r'''
 #include <stddef.h>
 #define UVM_ASSERT assert
 #include "uvm_prefetch_budget.h"
+#define current get_current()
 #include "uvm_prefetch_pattern.h"
+#ifndef current
+#error "The kernel current macro must remain defined"
+#endif
 typedef struct {
     int list_lock;
     struct { uvm_prefetch_budget_t budget; uvm_prefetch_pattern_t patterns; } eager_eviction;
@@ -125,7 +133,7 @@ def test_prefetch_pattern_compiles_and_runs():
 
 def compile_and_run(src, exe):
     subprocess.run([
-        "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
+        "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wstrict-prototypes", "-fsanitize=address,undefined",
         "-I", str(ROOT / "kernel-open/common/inc"),
         "-I", str(ROOT / "kernel-open/nvidia-uvm"), str(src), "-o", str(exe),
     ], check=True)

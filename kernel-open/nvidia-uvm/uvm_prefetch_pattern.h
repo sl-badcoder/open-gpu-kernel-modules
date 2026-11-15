@@ -17,7 +17,7 @@ typedef struct {
     NvU64 tile;
     unsigned buffer_index;
     NvU64 batch_id;
-    NvU16 current;
+    NvU16 current_regions;
     NvU16 previous;
     NvU16 older;
     NvU16 learned;
@@ -61,7 +61,7 @@ static inline unsigned uvm_prefetch_pattern_hash(NvU64 range_id,
 
 static inline void uvm_prefetch_pattern_reset_history(uvm_prefetch_pattern_entry_t *entry)
 {
-    entry->current = 0;
+    entry->current_regions = 0;
     entry->previous = 0;
     entry->older = 0;
     entry->learned = 0;
@@ -135,26 +135,26 @@ uvm_prefetch_pattern_observe(uvm_prefetch_pattern_t *table,
 
     if (confirmed)
         *confirmed = false;
-    if (entry->batch_id == batch_id && (entry->current & bit))
+    if (entry->batch_id == batch_id && (entry->current_regions & bit))
         return false;
     ++table->events;
     uvm_prefetch_pattern_maybe_expire(table, entry);
     if (entry->batch_id != batch_id) {
         // Replace a group only with repeated positive evidence from complete
         // batches. Do not union unrelated workload phases indefinitely.
-        stable = entry->current & entry->previous & entry->older;
+        stable = entry->current_regions & entry->previous & entry->older;
         if (uvm_prefetch_pattern_popcount16(stable) >= 2u) {
             entry->learned = stable;
             entry->last_learned_event = table->events;
         }
         entry->active = entry->learned;
         entry->older = entry->previous;
-        entry->previous = entry->current;
-        entry->current = 0;
+        entry->previous = entry->current_regions;
+        entry->current_regions = 0;
         entry->batch_id = batch_id;
     }
-    entry->current |= bit;
-    stable = entry->current & entry->previous & entry->older;
+    entry->current_regions |= bit;
+    stable = entry->current_regions & entry->previous & entry->older;
     if (confirmed)
         *confirmed = (uvm_prefetch_pattern_popcount16(stable) >= 2u) &&
                     ((stable & bit) != 0);
@@ -181,7 +181,7 @@ uvm_prefetch_pattern_predict(uvm_prefetch_pattern_t *table,
         return result;
     uvm_prefetch_pattern_maybe_expire(table, entry);
     if (entry->batch_id == batch_id && (entry->active & bit)) {
-        result = entry->active & (NvU16)~entry->current;
+        result = entry->active & (NvU16)~entry->current_regions;
         result |= bit;
     }
     return result;
