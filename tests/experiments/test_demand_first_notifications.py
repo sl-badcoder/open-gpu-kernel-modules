@@ -118,7 +118,7 @@ typedef struct uvm_gpu_va_space_struct { uvm_va_space_t *va_space; uvm_gpu_t *gp
 typedef struct {bool cpu_access_counter_policy; NvU64 cpu_prefetch_range_id;} managed_t;
 typedef struct uvm_va_block_struct { NvU64 end; int id; int lock; NvU64 start; managed_t *managed_range;} uvm_va_block_t;
 typedef struct { int marker; } uvm_prefetch_refault_block_t;
-typedef struct { uvm_page_mask_t evicted; uvm_prefetch_refault_block_t refault; } uvm_va_block_gpu_state_t;
+typedef struct { uvm_page_mask_t evicted, resident; uvm_prefetch_refault_block_t refault; } uvm_va_block_gpu_state_t;
 typedef struct uvm_va_block_context_struct { int id; uvm_page_mask_t scratch_page_mask; } uvm_va_block_context_t;
 typedef struct uvm_service_block_context_struct { uvm_va_block_context_t *block_context; int access_counters_buffer_index; } uvm_service_block_context_t;
 typedef struct entry_struct { uvm_va_space_t *va_space; uvm_gpu_t *gpu; NvU64 address; int counter_value; } uvm_access_counter_buffer_entry_t;
@@ -160,8 +160,9 @@ static void uvm_va_block_context_init(uvm_va_block_context_t *c, struct mm_struc
 static void uvm_mutex_lock(void *m) { (void)m; } static void uvm_mutex_unlock(void *m) { (void)m; }
 static void expand_notification_block(uvm_gpu_va_space_t *g, struct mm_struct *m, uvm_va_block_t *b, uvm_access_counter_buffer_t *a, uvm_va_block_context_t *c, uvm_page_mask_t *p, uvm_access_counter_buffer_entry_t *e) { (void)g;(void)m;(void)b;(void)a;(void)c; *p = e->counter_value; }
 static uvm_va_block_gpu_state_t gpu_state;
-static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get(uvm_va_block_t *b, int id) { (void)b; (void)id; return &gpu_state; }
-static NV_STATUS service_notification_va_block_helper(struct mm_struct *m, uvm_va_block_t *b, uvm_gpu_t *g, uvm_access_counter_service_batch_context_t *c, bool *did_migrate) { (void)m;(void)b;(void)g;(void)c; *did_migrate = demand_status == NV_OK; return demand_status; }
+static bool gpu_state_present=true;
+static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get(uvm_va_block_t *b, int id) { (void)b; (void)id; return gpu_state_present ? &gpu_state : NULL; }
+static NV_STATUS service_notification_va_block_helper(struct mm_struct *m, uvm_va_block_t *b, uvm_gpu_t *g, uvm_access_counter_service_batch_context_t *c, bool *did_migrate) { (void)m;(void)b;(void)g;(void)c; *did_migrate = demand_status == NV_OK; gpu_state.resident=gpu_after_mask; gpu_state.evicted=0; gpu_state_present=true; return demand_status; }
 static NV_STATUS notify_tools_and_process_flags(uvm_va_space_t *v, uvm_gpu_t *g, uvm_access_counter_buffer_t *a, NvU64 x, uvm_access_counter_buffer_entry_t **e, NvU32 n, NvU32 f, void *m) { (void)v;(void)g;(void)a;(void)x;(void)e;(void)n;(void)f;(void)m; return flags_status; }
 '''
     block_queue = text[text.index("#define UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY"):text.index("// Each page in a tracked physical range")]
@@ -193,17 +194,21 @@ int main(void) {
     assert(observed==before && !queue.count);
     /* Refault mode accounts only CPU pages newly resident on the GPU after
      * native demand service, and reports failed service as invalid. */
-    refault_mode = true; cpu_mask = 0xf; local_mask = 1; gpu_after_mask = 7; local_reads = 0; refault_bytes = ~0ULL; refault_valid = false; refault_returned = false; gpu_state.evicted = 2;
+    refault_mode = true; cpu_mask = 0xf; local_mask = 1; gpu_after_mask = 7; gpu_state.resident=local_mask; local_reads = 0; refault_bytes = ~0ULL; refault_valid = false; refault_returned = false; gpu_state.evicted = 2;
     entry.counter_value = 3; demand_status = NV_OK; flags_status = NV_OK;
     assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,NULL)==NV_OK);
     assert(refault_bytes == 2 * PAGE_SIZE && refault_valid && refault_returned);
     /* A CPU-resident demand with no overlap in the evicted mask is not a return. */
-    gpu_state.evicted = 8; local_mask = 1; gpu_after_mask = 7; local_reads = 0; refault_bytes = ~0ULL; refault_valid = true; refault_returned = true;
+    gpu_state.evicted = 8; local_mask = 1; gpu_after_mask = 7; gpu_state.resident=local_mask; local_reads = 0; refault_bytes = ~0ULL; refault_valid = true; refault_returned = true;
     assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,NULL)==NV_OK);
     assert(refault_bytes == 2 * PAGE_SIZE && refault_valid && !refault_returned);
-    local_mask = 1; gpu_after_mask = 7; local_reads = 0; refault_bytes = ~0ULL; refault_valid = true; refault_returned = true; demand_status = 7;
+    local_mask = 1; gpu_after_mask = 7; gpu_state.resident=local_mask; local_reads = 0; refault_bytes = ~0ULL; refault_valid = true; refault_returned = true; demand_status = 7;
     assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,NULL)==7);
     assert(refault_bytes == 2 * PAGE_SIZE && !refault_valid && !refault_returned);
+    // First GPU state can be created by demand service itself.
+    gpu_state_present=false; gpu_after_mask=7; demand_status=NV_OK;
+    assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,NULL)==NV_OK);
+    assert(refault_bytes==3*PAGE_SIZE && refault_valid && !refault_returned);
     return 0;
 }
 '''

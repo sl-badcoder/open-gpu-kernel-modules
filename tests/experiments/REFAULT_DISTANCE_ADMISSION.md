@@ -3,9 +3,14 @@
 Branch: `615.71.09/experiment/refault-distance-admission`.
 Base: rapid-return-ratio at `7410eed3`.
 
-This experiment keeps native access-counter demand migration and existing VAB
-root selection. It controls **additional speculative neighbors**, without
-filling the rest of the triggering VA block. Its default is at most one extra
+This experiment uses native access-counter service and existing VAB root
+selection. For eligible CPU-preferred ranges in refault mode, it explicitly
+selects the accessing GPU for the pages indicated by access counters. The normal
+CPU-preferred selector otherwise retains host residency. Thrashing pin/throttle
+decisions and non-CPU per-page preferred-location overrides still apply.
+CPU-preferred advice within an eligible range remains subject to this experiment’s
+access-counter-triggered GPU migration. It controls
+**additional speculative neighbors**, without filling the rest of the triggering VA block. Its default is at most one extra
 2 MiB block per admitted attempt. Demand service runs first and is never denied
 by this policy. This is kernel-only and needs no vLLM changes.
 
@@ -64,8 +69,11 @@ return_distance = demand_byte_clock_before_this_service - eviction_byte_clock
 short_return = return_distance <= GPU_capacity_bytes * short_percent / 100
 ```
 
-The current demand's own migration is excluded. Byte arithmetic uses residency
-bookkeeping, not copy-completion timestamps. Specifically, the clock advances by
+For the intended active workload, `prefetch_refault_demand_bytes` should now
+advance as counter-triggered demand pages migrate. It can legitimately stay
+unchanged for stale notifications or pages held remotely by thrashing policy.
+The current demand's own migration is excluded from its return distance. Byte
+arithmetic uses residency bookkeeping, not copy-completion timestamps. Specifically, the clock advances by
 pages that were CPU-resident and not GPU-resident before access-counter service,
 and became GPU-resident afterward. Partial residency additions on a failed
 service advance the clock, but the failed observation does not train the policy.
@@ -190,6 +198,7 @@ processes using this policy.
 
 ```sh
 python3 tests/experiments/test_prefetch_refault.py
+python3 tests/experiments/test_refault_demand_service.py
 python3 tests/experiments/test_speculative_prefetch.py
 python3 tests/experiments/test_demand_first_notifications.py
 python3 tests/experiments/test_rapid_return_population.py

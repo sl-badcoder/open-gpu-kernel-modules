@@ -1193,6 +1193,9 @@ static NV_STATUS service_va_block_locked(uvm_gpu_t *gpu,
     const bool hmm_migratable = true;
     uvm_processor_id_t processor = gpu ? gpu->id : UVM_ID_CPU;
     const bool promote_full_block = gpu && uvm_cpu_block_policy_should_promote(va_block, gpu);
+    const bool migrate_accessed_pages = gpu && uvm_pmm_gpu_refault_enabled() &&
+                                           !uvm_va_block_is_hmm(va_block) && va_block->managed_range &&
+                                           uvm_cpu_block_policy_should_service_4k(va_block->managed_range, gpu);
 
     uvm_assert_mutex_locked(&va_block->lock);
 
@@ -1292,6 +1295,16 @@ static NV_STATUS service_va_block_locked(uvm_gpu_t *gpu,
                                                           UVM_SERVICE_OPERATION_ACCESS_COUNTERS,
                                                           hmm_migratable,
                                                           &read_duplicate);
+            // CPU-preferred policy normally keeps remotely accessed pages on
+            // the host. Refault admission requires the threshold-triggering
+            // demand itself to migrate; only extra neighbors are speculative.
+            // Keep the original accessed mask and honor thrashing pin/throttle
+            // decisions and non-CPU per-page preferred-location overrides.
+            if (migrate_accessed_pages &&
+                thrashing_hint.type == UVM_PERF_THRASHING_HINT_TYPE_NONE &&
+                UVM_ID_IS_CPU(policy->preferred_location) && UVM_ID_IS_CPU(new_residency)) {
+                new_residency = gpu->id;
+            }
         }
 
         if (!uvm_processor_mask_test_and_set(&service_context->resident_processors, new_residency))
@@ -1587,19 +1600,17 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     refault_mode = has_accessed_pages && !is_hmm &&
                        va_block->managed_range->cpu_access_counter_policy && uvm_pmm_gpu_refault_enabled();
     if (refault_mode) {
+        uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
         const uvm_page_mask_t *cpu = uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, NUMA_NO_NODE);
-        const uvm_page_mask_t *local = uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE);
+        const uvm_page_mask_t *local = state ? &state->resident : NULL;
         uvm_page_mask_zero(&cpu_before);
         if (cpu)
             uvm_page_mask_copy(&cpu_before, cpu);
         if (local)
             uvm_page_mask_andnot(&cpu_before, &cpu_before, local);
-        {
-            uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
-            // Snapshot before native service clears evicted residency markers.
-            returned_page = state && uvm_page_mask_and(&service_context->block_context->scratch_page_mask,
-                                                        accessed_pages, &state->evicted);
-        }
+        // Snapshot before native service clears evicted residency markers.
+        returned_page = state && uvm_page_mask_and(&service_context->block_context->scratch_page_mask,
+                                                    accessed_pages, &state->evicted);
     }
     if (has_accessed_pages && prefetch_queue && !is_hmm && !refault_mode &&
         va_block->managed_range->cpu_access_counter_policy) {
@@ -1623,7 +1634,8 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     }
     status = service_notification_va_block_helper(mm, va_block, gpu, batch_context, &did_migrate);
     if (refault_mode) {
-        const uvm_page_mask_t *local = uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE);
+        uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+        const uvm_page_mask_t *local = state ? &state->resident : NULL;
         NvU64 moved = 0;
         if (local) {
             uvm_page_mask_and(&cpu_before, &cpu_before, local);
@@ -1631,13 +1643,10 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
         }
         // Account residency additions even if later mapping work failed. Only
         // successful demand service trains locality and consumes refault history.
-        {
-            uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
-            uvm_pmm_gpu_refault_demand(&gpu->pmm, state ? &state->refault : NULL,
-                                      va_block->managed_range->cpu_prefetch_range_id,
-                                      va_block->start, moved, access_counters->index,
-                                      batch_context->batch_id, status == NV_OK, returned_page);
-        }
+        uvm_pmm_gpu_refault_demand(&gpu->pmm, state ? &state->refault : NULL,
+                                  va_block->managed_range->cpu_prefetch_range_id,
+                                  va_block->start, moved, access_counters->index,
+                                  batch_context->batch_id, status == NV_OK, returned_page);
     }
 
     uvm_mutex_unlock(&va_block->lock);
