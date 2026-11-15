@@ -29,14 +29,17 @@ struct mm_struct { int unused; };
 typedef struct { bool allow_eviction, no_eviction_allocation_failed; } uvm_va_block_retry_t;
 typedef struct { struct { uvm_page_mask_t pages_changed_residency; unsigned all_involved_processors; } make_resident; } uvm_va_block_context_t;
 typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; } uvm_va_block_gpu_state_t;
-typedef struct { int lock; uvm_tracker_t tracker; uvm_va_block_gpu_state_t state; } uvm_va_block_t;
+typedef struct { NvU64 cpu_prefetch_range_id; } managed_t;
+typedef struct { int lock; uvm_tracker_t tracker; uvm_va_block_gpu_state_t state; managed_t *managed_range; NvU64 start; } uvm_va_block_t;
 typedef struct { NvU64 generation; } uvm_prefetch_reservation_t;
 typedef struct { unsigned unused; } uvm_pmm_gpu_t;
 typedef struct { int id; uvm_pmm_gpu_t pmm; } uvm_gpu_t;
 static uvm_page_mask_t cpu, resident, thrashing, changed;
 static bool has_cpu, fail_allocation;
 static NV_STATUS resident_status, map_status, tracker_status;
-static unsigned records, maps, retries, dependencies;
+static unsigned records, maps, retries, dependencies, populations;
+static void uvm_pmm_gpu_refault_population(uvm_pmm_gpu_t *p,NvU64 range_id,NvU64 address)
+{(void)p;assert(range_id==77 && address==0);++populations;}
 static NvU64 recorded_now, recorded_generation;
 static void uvm_mutex_lock(int *l) { assert(!*l); *l=1; }
 static void uvm_mutex_unlock(int *l) { assert(*l); *l=0; }
@@ -74,6 +77,7 @@ static void uvm_va_block_retry_deinit(uvm_va_block_retry_t *r,uvm_va_block_t *b)
 '''
 CASES = r'''
 static uvm_va_block_t block;
+static managed_t managed={77};
 static uvm_gpu_t gpu={.id=1};
 static uvm_va_block_context_t context;
 static uvm_tracker_t tracker;
@@ -82,7 +86,7 @@ static bool capacity;
 static NvU64 moved;
 static void reset(void)
 {
- memset(&block,0,sizeof(block)); memset(&context,0,sizeof(context));
+ memset(&block,0,sizeof(block));block.managed_range=&managed;populations=0; memset(&context,0,sizeof(context));
  has_cpu=true; fail_allocation=false; cpu=7; resident=2; thrashing=4; changed=1;
  resident_status=map_status=tracker_status=0;
  records=maps=retries=dependencies=0; moved=recorded_now=recorded_generation=0;
@@ -92,20 +96,20 @@ static NV_STATUS run(bool neighbor)
 int main(void)
 {
  // One moved sparse page still counts as one neighbor population episode.
- reset(); assert(run(true)==0 && moved==PAGE_SIZE && records==1 && maps==1);
+ reset(); assert(run(true)==0 && moved==PAGE_SIZE && records==1 && populations==1 && maps==1);
  assert(block.state.speculative_cohort==42 && block.state.speculative_prefetch_ns==123456789);
  assert(recorded_generation==17 && recorded_now==123456789 && !capacity && !block.lock);
  assert(retries==1 && dependencies==1);
  // Demand-triggering populations never enter the speculative denominator.
- reset(); assert(run(false)==0 && moved==PAGE_SIZE && !records && !block.state.speculative_cohort);
+ reset(); assert(run(false)==0 && moved==PAGE_SIZE && !records && !populations && !block.state.speculative_cohort);
  // Empty, already resident, protected, or unchanged populations do not count.
- reset(); has_cpu=false; assert(run(true)==0 && !records && !moved && !retries);
- reset(); resident=cpu; assert(run(true)==0 && !records && !moved && !retries);
- reset(); thrashing=cpu; assert(run(true)==0 && !records && !moved && !retries);
- reset(); changed=0; assert(run(true)==0 && !records && !moved && maps==1);
+ reset(); has_cpu=false; assert(run(true)==0 && !records && !populations && !moved && !retries);
+ reset(); resident=cpu; assert(run(true)==0 && !records && !populations && !moved && !retries);
+ reset(); thrashing=cpu; assert(run(true)==0 && !records && !populations && !moved && !retries);
+ reset(); changed=0; assert(run(true)==0 && !records && !populations && !moved && maps==1);
  // Allocation failures do not fabricate a population, and retain no-eviction semantics.
  reset(); resident_status=7; fail_allocation=true;
- assert(run(true)==7 && capacity && !records && !moved && !maps && retries==1 && dependencies==1);
+ assert(run(true)==7 && capacity && !records && !populations && !moved && !maps && retries==1 && dependencies==1);
  // Errors after a resident transition keep provisional records here; failed
  // attempt completion discards them (covered by controller and walker tests).
  reset(); map_status=8; assert(run(true)==8 && records==1 && moved==PAGE_SIZE && !block.lock);

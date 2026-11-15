@@ -427,8 +427,23 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
     seq_printf(s, "prefetch_unretired_returns %llu\n", roots.prefetch_unretired_returns);
     seq_printf(s, "prefetch_ready_blocks %llu\n", roots.prefetch_ready_blocks);
     seq_printf(s, "prefetch_ready_returns %llu\n", roots.prefetch_ready_returns);
-    seq_puts(s, "prefetch_policy rapid_return_locality_hysteresis\n");
+    seq_printf(s, "prefetch_policy %s\n", roots.prefetch_refault_enabled ?
+                   "refault_distance_admission" : "rapid_return_locality_hysteresis");
     seq_printf(s, "prefetch_backoff_enabled %llu\n", roots.prefetch_backoff_enabled);
+    seq_printf(s, "prefetch_refault_enabled %llu\n", roots.prefetch_refault_enabled);
+    seq_printf(s, "prefetch_refault_max_neighbors %llu\n", roots.prefetch_refault_max_neighbors);
+    seq_printf(s, "prefetch_refault_short_percent %llu\n", roots.prefetch_refault_short_percent);
+    seq_printf(s, "prefetch_refault_capacity_bytes %llu\n", roots.prefetch_refault_capacity_bytes);
+    seq_printf(s, "prefetch_refault_demand_bytes %llu\n", roots.prefetch_refault_demand_bytes);
+    seq_printf(s, "prefetch_refault_evictions %llu\n", roots.prefetch_refault_evictions);
+    seq_printf(s, "prefetch_refault_returns %llu\n", roots.prefetch_refault_returns);
+    seq_printf(s, "prefetch_refault_short_returns %llu\n", roots.prefetch_refault_short_returns);
+    seq_printf(s, "prefetch_refault_last_distance_bytes %llu\n", roots.prefetch_refault_last_distance_bytes);
+    seq_printf(s, "prefetch_refault_replacements %llu\n", roots.prefetch_refault_replacements);
+    seq_printf(s, "prefetch_refault_plans %llu\n", roots.prefetch_refault_plans);
+    seq_printf(s, "prefetch_refault_paused %llu\n", roots.prefetch_refault_paused);
+    seq_printf(s, "prefetch_refault_growths %llu\n", roots.prefetch_refault_growths);
+    seq_printf(s, "prefetch_refault_reductions %llu\n", roots.prefetch_refault_reductions);
     seq_printf(s, "prefetch_sparse_enabled %llu\n", roots.prefetch_sparse_enabled);
     seq_printf(s, "prefetch_recovery_return_percent %llu\n", roots.prefetch_recovery_return_percent);
     seq_printf(s, "prefetch_bad_batches %llu\n", roots.prefetch_bad_batches);

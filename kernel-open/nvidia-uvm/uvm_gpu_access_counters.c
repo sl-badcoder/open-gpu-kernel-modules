@@ -1521,6 +1521,9 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     bool did_migrate = false;
     bool has_accessed_pages;
     NvU16 region_mask = 0;
+    uvm_page_mask_t cpu_before;
+    bool refault_mode = false;
+    bool returned_page = false;
     NvU64 end;
     uvm_gpu_t *gpu = gpu_va_space->gpu;
     uvm_va_space_t *va_space = gpu_va_space->va_space;
@@ -1581,7 +1584,24 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     batch_context->block_service_context.access_counters_buffer_index = access_counters->index;
 
     has_accessed_pages = !uvm_page_mask_empty(accessed_pages);
-    if (has_accessed_pages && prefetch_queue && !is_hmm &&
+    refault_mode = has_accessed_pages && !is_hmm &&
+                       va_block->managed_range->cpu_access_counter_policy && uvm_pmm_gpu_refault_enabled();
+    if (refault_mode) {
+        const uvm_page_mask_t *cpu = uvm_va_block_resident_mask_get(va_block, UVM_ID_CPU, NUMA_NO_NODE);
+        const uvm_page_mask_t *local = uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE);
+        uvm_page_mask_zero(&cpu_before);
+        if (cpu)
+            uvm_page_mask_copy(&cpu_before, cpu);
+        if (local)
+            uvm_page_mask_andnot(&cpu_before, &cpu_before, local);
+        {
+            uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+            // Snapshot before native service clears evicted residency markers.
+            returned_page = state && uvm_page_mask_and(&service_context->block_context->scratch_page_mask,
+                                                        accessed_pages, &state->evicted);
+        }
+    }
+    if (has_accessed_pages && prefetch_queue && !is_hmm && !refault_mode &&
         va_block->managed_range->cpu_access_counter_policy) {
         NvU16 demand_mask = 0;
         NvU64 tile = va_block->start >> UVM_PREFETCH_PATTERN_TILE_SHIFT;
@@ -1602,6 +1622,23 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
                                                    batch_context->batch_id, demand_mask);
     }
     status = service_notification_va_block_helper(mm, va_block, gpu, batch_context, &did_migrate);
+    if (refault_mode) {
+        const uvm_page_mask_t *local = uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE);
+        NvU64 moved = 0;
+        if (local) {
+            uvm_page_mask_and(&cpu_before, &cpu_before, local);
+            moved = (NvU64)uvm_page_mask_weight(&cpu_before) * PAGE_SIZE;
+        }
+        // Account residency additions even if later mapping work failed. Only
+        // successful demand service trains locality and consumes refault history.
+        {
+            uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+            uvm_pmm_gpu_refault_demand(&gpu->pmm, state ? &state->refault : NULL,
+                                      va_block->managed_range->cpu_prefetch_range_id,
+                                      va_block->start, moved, access_counters->index,
+                                      batch_context->batch_id, status == NV_OK, returned_page);
+        }
+    }
 
     uvm_mutex_unlock(&va_block->lock);
 

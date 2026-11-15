@@ -431,8 +431,46 @@ static void shared_cohort_failure_in_both_completion_orders(void)
         assert(b.window_bytes==8*Q && !b.generation && !b.recoveries);
     }
 }
+static void neighbor_only_off_probe(void)
+{
+    uvm_prefetch_budget_t b={.initialized=true};
+    uvm_prefetch_reservation_t ticket={0}, other={0};
+    uvm_prefetch_budget_config_t c=cfg;
+    c.neighbor_only=true;c.limit_bytes=Q;c.recovery_enabled=true;c.good_batches=1;
+    assert(uvm_prefetch_budget_reserve(&b,&c,Q,100*Q,0,&ticket)==Q && ticket.probe);
+    assert(!uvm_prefetch_budget_reserve(&b,&c,Q,100*Q,0,&other));
+    assert(uvm_prefetch_budget_record(&b,&c,0,&ticket));
+    uvm_prefetch_budget_complete(&b,&c,&ticket,Q,true,0);
+    assert(!b.reserved_bytes && !b.window_bytes && !b.probe_inflight);
+    c.min_blocks=1;
+    uvm_prefetch_budget_advance(&b,&c,60);
+    assert(b.window_bytes==Q && b.recoveries==1);
+    // A headroom shortfall cannot produce a partial one-neighbor probe.
+    b=(uvm_prefetch_budget_t){.initialized=true};
+    assert(!uvm_prefetch_budget_reserve(&b,&c,Q,Q-1,0,&ticket));
+}
+static void neighbor_only_default_probe_evidence(void)
+{
+    uvm_prefetch_budget_t b={.initialized=true};
+    uvm_prefetch_reservation_t ticket={0};
+    uvm_prefetch_budget_config_t c=cfg;
+    c.neighbor_only=true;c.limit_bytes=Q;c.recovery_enabled=true;c.good_batches=3;
+    // Three good batches of32 real neighbor populations, no recovery from silence.
+    for(unsigned i=0;i<96;i++) {
+        NvU64 now=(NvU64)i*60;
+        assert(!b.window_bytes);
+        assert(uvm_prefetch_budget_reserve(&b,&c,Q,100*Q,now,&ticket)==Q && ticket.probe);
+        assert(uvm_prefetch_budget_record(&b,&c,now,&ticket));
+        uvm_prefetch_budget_complete(&b,&c,&ticket,Q,true,now);
+    }
+    assert(!b.window_bytes && b.probes==96);
+    uvm_prefetch_budget_advance(&b,&c,96*60);
+    assert(b.window_bytes==Q && b.recoveries==1 && b.ratio_evaluations==3);
+}
 int main(void)
 {
+    neighbor_only_off_probe();
+    neighbor_only_default_probe_evidence();
     hysteresis_and_locality_gates();
     configured_percentage_controls_both_directions(); shared_cohort_failure_in_both_completion_orders();
     incomplete_and_failed_attempts_cannot_recover(); concurrent_failure_and_same_tick_replacement();

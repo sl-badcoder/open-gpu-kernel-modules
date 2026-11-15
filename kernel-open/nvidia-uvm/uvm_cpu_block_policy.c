@@ -266,6 +266,8 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
         if (moved && speculative_neighbor) {
             uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
             UVM_ASSERT(gpu_state);
+            uvm_pmm_gpu_refault_population(&gpu->pmm, va_block->managed_range->cpu_prefetch_range_id,
+                                           va_block->start);
             // A submission timestamp is sufficient for coarse churn detection;
             // it is never treated as hardware access/reuse evidence.
             gpu_state->speculative_prefetch_ns = NV_GETTIME();
@@ -334,6 +336,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     unsigned prefetch_chunk_mb = READ_ONCE(uvm_cpu_preferred_prefetch_chunk_mb);
     bool retry = false;
     bool capacity_stopped = false;
+    bool refault_mode = uvm_pmm_gpu_refault_enabled();
     bool prefetch_admitted = false;
     bool prefetch_success = true;
     uvm_tracker_t prefetch_tracker = UVM_TRACKER_INIT();
@@ -393,7 +396,31 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     chunk_block_count = (chunk_bytes + UVM_VA_BLOCK_SIZE - 1) / UVM_VA_BLOCK_SIZE;
     chunk_block_count = min(chunk_block_count, block_count);
 
-    if (region_mask) {
+    if (refault_mode) {
+        unsigned neighbors = uvm_pmm_gpu_refault_neighbors(&gpu->pmm,
+                                                          managed_range->cpu_prefetch_range_id,
+                                                          trigger_block->start);
+        NvU64 base = UVM_ALIGN_DOWN(trigger_block->start, UVM_VA_BLOCK_SIZE) -
+                         (NvU64)trigger_index * UVM_VA_BLOCK_SIZE;
+        NvU64 tile = trigger_block->start >> 26;
+        size_t distance;
+        // Only additional neighbors are speculative. Native demand has already
+        // serviced the trigger's accessed pages; do not fill the rest of it.
+        for (distance = 1; distance < 32 && sparse_count < neighbors; ++distance) {
+            size_t next = trigger_index + distance;
+            if (next < block_count && ((base + (NvU64)next * UVM_VA_BLOCK_SIZE) >> 26) == tile)
+                sparse_indices[sparse_count++] = next;
+            if (sparse_count < neighbors && trigger_index >= distance) {
+                next = trigger_index - distance;
+                if (((base + (NvU64)next * UVM_VA_BLOCK_SIZE) >> 26) == tile)
+                    sparse_indices[sparse_count++] = next;
+            }
+        }
+        chunk_block_count = min(chunk_block_count, sparse_count);
+        if (!chunk_block_count)
+            goto out;
+    }
+    else if (region_mask) {
         NvU64 range_block_base = UVM_ALIGN_DOWN(trigger_block->start, UVM_VA_BLOCK_SIZE) -
                                    (NvU64)trigger_index * UVM_VA_BLOCK_SIZE;
         NvU64 tile_base = UVM_ALIGN_DOWN(trigger_block->start, 64ULL * UVM_SIZE_1MB);
@@ -466,7 +493,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         NV_STATUS status;
         bool capacity_stop;
 
-        if (region_mask) {
+        if (refault_mode || region_mask) {
             candidate_index = sparse_indices[block_index];
         }
         else if (block_index == 0) {
@@ -479,7 +506,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         }
 
         UVM_ASSERT(candidate_index < block_count);
-        UVM_ASSERT(region_mask || (candidate_index >= start_index && candidate_index < end_index));
+        UVM_ASSERT(refault_mode || region_mask || (candidate_index >= start_index && candidate_index < end_index));
 
         va_block = candidate_index == trigger_index ?
                        trigger_block :
@@ -564,6 +591,8 @@ void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t 
     uvm_assert_mutex_locked(&va_block->lock);
 
     gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    if (gpu_state && va_block->managed_range && va_block->managed_range->cpu_access_counter_policy)
+        uvm_pmm_gpu_refault_evict(&gpu->pmm, &gpu_state->refault);
     if (gpu_state && gpu_state->speculative_prefetch_ns) {
         // Preserve the first eviction marker across further partial evictions.
         gpu_state->speculative_evicted_ns = 0;

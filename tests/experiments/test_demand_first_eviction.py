@@ -28,6 +28,7 @@ PRELUDE = r'''
 #include <string.h>
 #include <limits.h>
 typedef uint64_t NvU64;
+typedef uint16_t NvU16;
 typedef unsigned NvU32;
 /* VAB classifier */
 typedef unsigned uvm_pmm_alloc_list_t;
@@ -57,6 +58,9 @@ static NvU64 mock_now=1000;
 static unsigned uvm_perf_vab_min_residency_ms=100;
 static unsigned uvm_perf_speculative_prefetch_limit_mb=32;
 static unsigned uvm_perf_speculative_prefetch_reserve_mb=64;
+static bool uvm_perf_prefetch_refault_enable=false;
+static unsigned uvm_perf_prefetch_refault_short_percent=25;
+static unsigned uvm_perf_prefetch_refault_max_neighbors=1;
 #define NSEC_PER_MSEC 1000000ULL
 struct chunk;
 struct list_head { struct chunk *first; };
@@ -64,9 +68,9 @@ typedef struct chunk { struct { struct chunk *next; } list; bool is_zero, claime
 typedef struct { uvm_gpu_chunk_t chunk; NvU64 vab_generation,vab_ready_generation,vab_ready_ns; } uvm_gpu_root_chunk_t;
 /* VAB stats */
 typedef struct { int dummy; } uvm_parent_gpu_t;
-typedef struct { uvm_parent_gpu_t *parent; } uvm_gpu_t;
+typedef struct { uvm_parent_gpu_t *parent; struct { NvU64 size; } mem_info; } uvm_gpu_t;
 static uvm_gpu_t mock_gpu;
-typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; struct {NvU64 events, confirmations, replacements, predictions, learned_predictions, expirations;} patterns; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
+typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; uvm_prefetch_refault_t refault; struct {NvU64 events, confirmations, replacements, predictions, learned_predictions, expirations;} patterns; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
 static uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *p) {(void)p; return &mock_gpu;}
 static uvm_vab_snapshot_t mock_snapshot;
 static unsigned snapshot_calls;
@@ -195,7 +199,8 @@ def main():
     source=(ROOT / 'kernel-open/nvidia-uvm/uvm_pmm_gpu.c').read_text()
     header=(ROOT / 'kernel-open/nvidia-uvm/uvm_vab.h').read_text().replace('#include "nvtypes.h"','')
     budget=(ROOT / 'kernel-open/nvidia-uvm/uvm_prefetch_budget.h').read_text().replace('#include "nvtypes.h"','').replace('static inline', 'static inline __attribute__((unused))')
-    code=PRELUDE.replace('/* VAB classifier */',header+'\n#define UVM_ASSERT assert\n'+budget)
+    refault=(ROOT / 'kernel-open/nvidia-uvm/uvm_prefetch_refault.h').read_text().replace('#include "nvtypes.h"','').replace('static inline', 'static inline __attribute__((unused))')
+    code=PRELUDE.replace('/* VAB classifier */',header+'\n#define UVM_ASSERT assert\n'+budget+refault)
     pmm_header = (ROOT / 'kernel-open/nvidia-uvm/uvm_pmm_gpu.h').read_text()
     stats_end = pmm_header.index('} uvm_pmm_gpu_vab_stats_t;') + len('} uvm_pmm_gpu_vab_stats_t;')
     stats = pmm_header[pmm_header.rfind('typedef struct', 0, stats_end):stats_end]

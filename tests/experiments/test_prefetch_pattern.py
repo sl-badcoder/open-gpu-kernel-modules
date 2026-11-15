@@ -77,6 +77,7 @@ typedef struct {
     struct { uvm_prefetch_budget_t budget; uvm_prefetch_pattern_t patterns; } eager_eviction;
 } uvm_pmm_gpu_t;
 static bool uvm_perf_speculative_prefetch_sparse_enable = true;
+static bool uvm_perf_prefetch_refault_enable;
 static void uvm_spin_lock(int *lock) { assert(!*lock); *lock=1; }
 static void uvm_spin_unlock(int *lock) { assert(*lock); *lock=0; }
 #define NV_GETTIME() 1

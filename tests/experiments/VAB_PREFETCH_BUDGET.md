@@ -1,5 +1,10 @@
 # Rapid-return ratio prefetch experiment
 
+On `experiment/refault-distance-admission`, the new policy is enabled by default
+and overrides sparse learning. See [REFAULT_DISTANCE_ADMISSION.md](REFAULT_DISTANCE_ADMISSION.md)
+for that branch’s controls and comparison procedure. This document describes
+the retained rapid-return controller and the preceding sparse experiment.
+
 Branch: `615.71.09/experiment/rapid-return-ratio`, based on
 `615.71.09/experiment/vab-prefetch-budget` at `6e0e809f`.
 
@@ -96,6 +101,11 @@ co-demand observations are required before a good streak can grow the window.
 There is no sequential-growth path, elapsed-time growth credit, or reward for
 copy completion. At the cap, a good batch changes neither size nor generation.
 
+The following probe sizes describe the legacy contiguous/sparse walker. Refault
+mode charges only one additional neighbor: its probe is 2 MiB, permits a 2 MiB
+cap/request, and reopens at 2 MiB. The same cooldown, maturity and evidence rules
+apply in both modes.
+
 OFF has no normal speculative populations to observe. After older reservations
 drain, admit at most one **4 MiB probe** (trigger plus neighbor) at a time, no sooner
 than **3T after entering OFF**, then **3T after each probe completes**. With T=20 ms,
@@ -183,7 +193,7 @@ All these parameters are set at module load and read-only afterward.
 | `uvm_perf_speculative_prefetch_recovery_return_percent` | 25 | Low-return cutoff for recovery; clamped below the backoff threshold. |
 | `uvm_perf_speculative_prefetch_bad_batches` | 2 | Consecutive high-return batches required before shrinking. |
 | `uvm_perf_speculative_prefetch_good_batches` | 3 | Consecutive low-return batches required before growing. |
-| `uvm_perf_speculative_prefetch_sparse_enable` | 1 | Select the sparse 4 MiB walker within 64 MiB tiles and require sparse co-demand evidence before recovery; 0 selects the contiguous walker. |
+| `uvm_perf_speculative_prefetch_sparse_enable` | 1 on base branch; 0 on refault branch | Select the sparse 4 MiB walker within 64 MiB tiles and require sparse co-demand evidence before recovery; 0 selects the contiguous walker. |
 
 The previous `uvm_perf_speculative_prefetch_quiet_ms`,
 `uvm_perf_speculative_prefetch_backoff_ms`, and

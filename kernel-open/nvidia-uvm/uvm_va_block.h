@@ -117,6 +117,9 @@ typedef struct
     NvU64 speculative_evicted_ns;
     NvU64 speculative_cohort;
 
+    // Migration-distance episode follows this virtual allocation, not a root.
+    uvm_prefetch_refault_block_t refault;
+
     // Array of naturally-aligned chunks. Each chunk has the largest possible
     // size which can fit within the block, so they are not uniform size.
     //

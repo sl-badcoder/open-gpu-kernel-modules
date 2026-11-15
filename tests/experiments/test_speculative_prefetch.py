@@ -15,6 +15,7 @@ PRELUDE = r'''
 #include <string.h>
 typedef unsigned long long NvU64; typedef unsigned short NvU16;
 typedef int NV_STATUS;
+typedef struct { int marker; } uvm_prefetch_refault_block_t;
 #define NV_OK 0
 #define UVM_SIZE_1MB (1ULL << 20)
 #define UVM_VA_BLOCK_SIZE (2ULL << 20)
@@ -27,7 +28,7 @@ typedef int NV_STATUS;
 #define UVM_DBG_PRINT(...) do {} while(0)
 struct mm_struct { int unused; };
 typedef struct { int lock; } uvm_va_space_t;
-typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; } uvm_va_block_gpu_state_t;
+typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; uvm_prefetch_refault_block_t refault; } uvm_va_block_gpu_state_t;
 typedef struct { int unused; } uvm_pmm_gpu_t;
 typedef struct { NvU64 bytes; NvU64 generation; } uvm_prefetch_reservation_t;
 typedef struct { int id; uvm_pmm_gpu_t pmm; } uvm_gpu_t;
@@ -38,7 +39,7 @@ typedef struct {
 } uvm_va_block_t;
 struct uvm_va_range_managed_struct {
  struct { uvm_va_space_t *va_space; } va_range;
- NvU64 start; size_t count; uvm_va_block_t *blocks[64];
+ NvU64 start; NvU64 cpu_prefetch_range_id; bool cpu_access_counter_policy; size_t count; uvm_va_block_t *blocks[64];
 };
 typedef struct { int unused; } uvm_va_block_context_t;
 typedef struct { int unused; } uvm_tracker_t;
@@ -50,6 +51,8 @@ static long long uvm_cpu_preferred_prefetch_retries, uvm_cpu_preferred_prefetche
 static void atomic64_inc(long long *p) {++*p;}
 static void atomic64_add(NvU64 n,long long *p) {*p+=(long long)n;}
 static bool enabled, supported, alloc_fail, trigger_resident;
+static bool refault_enabled;
+static unsigned refault_neighbor_count;
 static NvU64 grant, requested, reserved, transferred;
 static bool completed_success;
 static NvU64 reservation_generation = 17;
@@ -76,6 +79,10 @@ static NvU64 uvm_pmm_gpu_prefetch_feedback_window_ns(void) {return 20*NSEC_PER_M
 static void uvm_pmm_gpu_prefetch_pressure_pause(uvm_pmm_gpu_t *p) {(void)p;++pressure_pauses;}
 static void uvm_pmm_gpu_prefetch_return(uvm_pmm_gpu_t *p,NvU64 cohort,NvU64 t) {(void)p;assert(t==now);if (cohort) {assert(cohort==42);++feedback_quick;}}
 static void uvm_pmm_gpu_prefetch_allocation_failure(uvm_pmm_gpu_t *p) {(void)p;++feedback_capacity;}
+static bool uvm_pmm_gpu_refault_enabled(void) { return refault_enabled; }
+static unsigned uvm_pmm_gpu_refault_neighbors(uvm_pmm_gpu_t *p, NvU64 range_id, NvU64 address) { (void)p; assert(range_id == range.cpu_prefetch_range_id); assert(address == blocks[trigger_slot].start); return refault_neighbor_count; }
+static void uvm_pmm_gpu_refault_evict(uvm_pmm_gpu_t *p, uvm_prefetch_refault_block_t *state) { (void)p; assert(state); }
+static void __attribute__((unused)) uvm_pmm_gpu_refault_population(uvm_pmm_gpu_t *p, NvU64 range_id, NvU64 address) { (void)p; assert(range_id == range.cpu_prefetch_range_id); assert(address < range.count * UVM_VA_BLOCK_SIZE); }
 static bool uvm_processor_mask_test(unsigned *p,int id) {(void)id;return *p;}
 static bool uvm_processor_mask_test_and_clear_atomic(unsigned *p,int id) {(void)id;bool old=*p;*p=0;return old;}
 static bool uvm_processor_mask_test_and_set_atomic(unsigned *p,int id) {(void)id;bool old=*p;*p=1;return old;}
@@ -116,6 +123,7 @@ static void reset(void) {
  space.lock=1;range.va_range.va_space=&space;range.count=8;
  for(size_t i=0;i<8;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
  enabled=supported=true;alloc_fail=trigger_resident=false;grant=4*UVM_SIZE_1MB;requested=reserved=transferred=0;
+ refault_enabled=false;refault_neighbor_count=0;range.cpu_prefetch_range_id=77;range.cpu_access_counter_policy=true;
  calls=begin_calls=end_calls=waits=capacity_at=error_at=wait_error=0;
  watermark_at=-1;watermark_calls=feedback_quick=feedback_capacity=pressure_pauses=0;
  trigger_slot=4;
@@ -202,6 +210,26 @@ int main(void) {
  uvm_cpu_block_policy_prefetch_on_signal(&blocks[32],&gpu,&mm,0xffff);
  assert(calls==32 && visited[0]==32 && visited[1]==33);
  for(int i=0;i<calls;++i)assert(visited[i]>=32 && visited[i]<64);
+ // Refault admission copies only additional neighbors. The demand trigger
+ // itself is never copied speculatively, and the 64MiB tile bounds neighbors.
+ reset();range.count=64;
+ for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
+ trigger_slot=31; refault_enabled=true; refault_neighbor_count=2; grant=4*UVM_SIZE_1MB;
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[31],&gpu,&mm,0);
+ assert(requested==4*UVM_SIZE_1MB && calls==2 && visited[0]==30 && visited[1]==29);
+ assert(transferred==grant && completed_success && !reserved);
+ // At the beginning of a tile only forward neighbors are legal.
+ reset();range.count=64;
+ for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
+ trigger_slot=0; refault_enabled=true; refault_neighbor_count=4; grant=8*UVM_SIZE_1MB;
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[0],&gpu,&mm,0);
+ assert(calls==4 && visited[0]==1 && visited[1]==2 && visited[2]==3 && visited[3]==4);
+ // An empty admission makes no reservation and performs no speculative copy.
+ reset();range.count=64;
+ for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
+ trigger_slot=32; refault_enabled=true; refault_neighbor_count=0; grant=8*UVM_SIZE_1MB;
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[32],&gpu,&mm,0);
+ assert(!begin_calls && !end_calls && !reserved && !calls);
  puts("Production prefetch walker: bounded copies, trigger order, retry, balanced failures, waits and churn feedback passed.");
  return 0;
 }

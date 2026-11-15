@@ -61,6 +61,7 @@
 #include "uvm_vab.h"
 #include "uvm_prefetch_budget.h"
 #include "uvm_prefetch_pattern.h"
+#include "uvm_prefetch_refault.h"
 #include "nv_uvm_user_types.h"
 #if UVM_IS_CONFIG_HMM() || defined(CONFIG_PCI_P2PDMA)
 #include <linux/memremap.h>
@@ -235,6 +236,20 @@ typedef struct {
     NvU64 prefetch_unretired_returns;
     NvU64 prefetch_ready_blocks;
     NvU64 prefetch_ready_returns;
+    NvU64 prefetch_refault_enabled;
+    NvU64 prefetch_refault_short_percent;
+    NvU64 prefetch_refault_max_neighbors;
+    NvU64 prefetch_refault_capacity_bytes;
+    NvU64 prefetch_refault_demand_bytes;
+    NvU64 prefetch_refault_evictions;
+    NvU64 prefetch_refault_returns;
+    NvU64 prefetch_refault_short_returns;
+    NvU64 prefetch_refault_last_distance_bytes;
+    NvU64 prefetch_refault_replacements;
+    NvU64 prefetch_refault_plans;
+    NvU64 prefetch_refault_paused;
+    NvU64 prefetch_refault_growths;
+    NvU64 prefetch_refault_reductions;
     NvU64 prefetch_sparse_enabled;
     NvU64 prefetch_recovery_return_percent;
     NvU64 prefetch_bad_batches;
@@ -490,6 +505,7 @@ typedef struct uvm_pmm_gpu_struct
         // Fixed-size, per-GPU co-demand history. Keys use range lifetime IDs;
         // entries never retain VA range/block pointers. Protected by list_lock.
         uvm_prefetch_pattern_t patterns;
+        uvm_prefetch_refault_t refault;
         bool active;
         bool recovering_watermark;
         bool stopping;
@@ -723,6 +739,15 @@ void uvm_pmm_gpu_prefetch_allocation_failure(uvm_pmm_gpu_t *pmm);
 void uvm_pmm_gpu_prefetch_pressure_pause(uvm_pmm_gpu_t *pmm);
 NvU64 uvm_pmm_gpu_prefetch_feedback_window_ns(void);
 bool uvm_pmm_gpu_speculative_prefetch_enabled(void);
+// Episode state is owned by a locked VA block; wrappers also acquire list_lock.
+bool uvm_pmm_gpu_refault_enabled(void);
+void uvm_pmm_gpu_refault_demand(uvm_pmm_gpu_t *pmm, uvm_prefetch_refault_block_t *state,
+                                NvU64 range_id, NvU64 address, NvU64 moved_bytes,
+                                unsigned buffer_index, NvU64 batch_id, bool valid, bool returned_page);
+void uvm_pmm_gpu_refault_evict(uvm_pmm_gpu_t *pmm, uvm_prefetch_refault_block_t *state);
+void uvm_pmm_gpu_refault_population(uvm_pmm_gpu_t *pmm, NvU64 range_id, NvU64 address);
+unsigned uvm_pmm_gpu_refault_neighbors(uvm_pmm_gpu_t *pmm, NvU64 range_id, NvU64 address);
+
 // Observe a valid remote-demand region and return a sparse virtual-region mask.
 // Zero requests the legacy contiguous walker. Other masks describe 4MiB regions
 // within the triggering address's absolute 64MiB tile, including the trigger.

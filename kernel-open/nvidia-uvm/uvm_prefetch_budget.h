@@ -20,6 +20,8 @@ typedef struct {
     bool backoff_enabled;
     bool recovery_enabled;
     bool locality_enabled;
+    // Refault mode reserves only neighbors; legacy requests charge the trigger.
+    bool neighbor_only;
 } uvm_prefetch_budget_config_t;
 
 typedef struct {
@@ -77,6 +79,11 @@ typedef struct {
     NvU64 holds;
     uvm_prefetch_cohort_t cohorts[UVM_PREFETCH_COHORT_COUNT];
 } uvm_prefetch_budget_t;
+
+static inline NvU64 uvm_prefetch_budget_probe_bytes(const uvm_prefetch_budget_config_t *config)
+{
+    return (config->neighbor_only ? 1 : 2) * UVM_PREFETCH_BUDGET_QUANTUM;
+}
 
 static inline NvU64 uvm_prefetch_budget_limit(NvU64 bytes)
 {
@@ -148,11 +155,10 @@ static inline void uvm_prefetch_budget_recover(uvm_prefetch_budget_t *budget,
     if (!config->backoff_enabled || !config->recovery_enabled ||
         !budget->initialized || budget->window_bytes >= limit)
         return;
-    // An OFF window can only have fresh evidence from neighbor probes. A 2MiB
-    // hard cap cannot probe a neighbor and must not reopen from stale evidence.
-    if (!budget->window_bytes && limit < 2 * UVM_PREFETCH_BUDGET_QUANTUM)
+    // OFF needs room for one real neighbor (plus the trigger in legacy mode).
+    if (!budget->window_bytes && limit < uvm_prefetch_budget_probe_bytes(config))
         return;
-    increase = budget->window_bytes ? UVM_PREFETCH_BUDGET_QUANTUM : 2 * UVM_PREFETCH_BUDGET_QUANTUM;
+    increase = budget->window_bytes ? UVM_PREFETCH_BUDGET_QUANTUM : uvm_prefetch_budget_probe_bytes(config);
     if (increase > limit - budget->window_bytes)
         increase = limit - budget->window_bytes;
     budget->window_bytes += increase;
@@ -335,8 +341,8 @@ static inline NvU64 uvm_prefetch_budget_reserve(uvm_prefetch_budget_t *budget,
     if (!budget->window_bytes) {
         // No growth from silence. A bounded probe collects new ratio evidence.
         if (!config->backoff_enabled || !config->recovery_enabled || budget->reserved_bytes ||
-            now < budget->next_probe_ns || limit < 2 * UVM_PREFETCH_BUDGET_QUANTUM ||
-            requested < 2 * UVM_PREFETCH_BUDGET_QUANTUM)
+            now < budget->next_probe_ns || limit < uvm_prefetch_budget_probe_bytes(config) ||
+            requested < uvm_prefetch_budget_probe_bytes(config))
             goto denied;
         probe = true;
     }
@@ -349,12 +355,12 @@ static inline NvU64 uvm_prefetch_budget_reserve(uvm_prefetch_budget_t *budget,
         uvm_prefetch_budget_pressure_pause(budget);
         goto denied;
     }
-    ceiling = probe ? 2 * UVM_PREFETCH_BUDGET_QUANTUM : budget->window_bytes - budget->reserved_bytes;
+    ceiling = probe ? uvm_prefetch_budget_probe_bytes(config) : budget->window_bytes - budget->reserved_bytes;
     grant = requested < ceiling ? requested : ceiling;
     if (grant > headroom)
         grant = headroom;
     grant = uvm_prefetch_budget_limit(grant);
-    if (!grant || (probe && grant < 2 * UVM_PREFETCH_BUDGET_QUANTUM))
+    if (!grant || (probe && grant < uvm_prefetch_budget_probe_bytes(config)))
         goto denied;
     budget->reserved_bytes += grant;
     if (budget->reserved_bytes > budget->peak_bytes)
