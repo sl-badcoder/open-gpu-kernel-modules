@@ -101,6 +101,27 @@ add phase markers in the vLLM benchmark; that source is outside this repository.
 
 ## Comparing runs and plotting
 
+After rebuilding/reloading the module with split accounting, inspect:
+
+```bash
+grep . /sys/module/nvidia_uvm/parameters/uvm_cpu_preferred_{trigger_,neighbor_,}prefetched_bytes
+```
+
+`uvm_cpu_preferred_trigger_prefetched_bytes` counts population of the triggering
+virtual block; `uvm_cpu_preferred_neighbor_prefetched_bytes` counts additional
+blocks. Both are access-counter-triggered CPU-policy prefetch. Trigger bytes
+include unaccessed pages brought in with that block, not just requested pages.
+These do not count the separate native demand/refault/fault-service path.
+At quiescence their sum equals `uvm_cpu_preferred_prefetched_bytes`. Sequential
+reads while callbacks update the counters can briefly disagree. They share the
+existing total counter's residency-accounting semantics, not PCIe wire bytes.
+Each callback accumulates locally, then adds the two counters; there is no
+per-page atomic update or additional polling. No feature-enable flag is needed.
+
+The monitor captures these automatically in snapshots/CSVs and recognizes them
+as cumulative counters for interval rates. Use before/after differences; reloading
+the module resets them. Old reports cannot be split retroactively.
+
 Compare completed tokens per second alongside demand bytes/token, speculative
 bytes/token, short-return fraction, eviction counts, and PCIe RX/TX. Use actual
 completed token counts from `benchmark.json`, rather than requested tokens. Keep
@@ -118,8 +139,8 @@ run = "results/ember-adaptive/YOUR-RUN-DIRECTORY"
 df = pd.read_csv(f"{run}/samples.csv")
 gpu = "GPU-8289d291-5c6b-39a8-3b15-1854938bbc3e"
 metrics = {
-    f"vab/{gpu}/0/prefetch_refault_demand_bytes": "Demand GiB/s",
-    "module/uvm_cpu_preferred_prefetched_bytes": "CPU-policy prefetch GiB/s",
+    "module/uvm_cpu_preferred_trigger_prefetched_bytes": "Trigger-block GiB/s",
+    "module/uvm_cpu_preferred_neighbor_prefetched_bytes": "Neighbor GiB/s",
 }
 for metric, label in metrics.items():
     rows = df[df.metric == metric]

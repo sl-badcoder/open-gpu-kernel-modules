@@ -135,7 +135,12 @@ quiescent snapshot interval. They are decisions, not unique regions or successfu
 copies. Use differences, not lifetime totals. `uvm_cpu_preferred_prefetched_bytes`
 now includes both the trigger and neighbors in the legacy CPU-policy path; do not
 label all of it speculative bytes. Keep checking PCIe RX/TX and completed tokens.
-Admission-off counters remain zero. With refault disabled its demand-distance byte
+`uvm_cpu_preferred_trigger_prefetched_bytes` and
+`uvm_cpu_preferred_neighbor_prefetched_bytes` expose that split directly. Their
+quiescent sum equals the total; the monitor captures both, including delta rates.
+Trigger-block bytes can include pages beyond those accessed by the notification.
+Admission decision counters remain zero when admission is off; the split byte
+counters still record CPU-policy prefetch. With refault disabled its demand-distance byte
 counter is no longer a measure of this path.
 
 If immediate grants dominate, the experiment is mostly below its configured

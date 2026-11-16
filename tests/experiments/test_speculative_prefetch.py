@@ -50,6 +50,7 @@ static NvU64 now = 1000000000ULL;
 static unsigned uvm_cpu_preferred_prefetch_chunk_mb;
 static long long uvm_cpu_preferred_prefetch_capacity_stops, uvm_cpu_preferred_range_prefetches;
 static long long uvm_cpu_preferred_prefetch_retries, uvm_cpu_preferred_prefetched_bytes;
+static long long uvm_cpu_preferred_trigger_prefetched_bytes, uvm_cpu_preferred_neighbor_prefetched_bytes;
 static void atomic64_inc(long long *p) {++*p;}
 static void atomic64_add(NvU64 n,long long *p) {*p+=(long long)n;}
 static bool enabled, supported, alloc_fail, trigger_resident;
@@ -135,16 +136,20 @@ static void reset(void) {
  uvm_cpu_preferred_prefetch_chunk_mb=64;
  uvm_cpu_preferred_prefetch_capacity_stops=uvm_cpu_preferred_range_prefetches=0; pressure=false; pressure_after_copies=0;
  uvm_cpu_preferred_prefetch_retries=uvm_cpu_preferred_prefetched_bytes=0;
+ uvm_cpu_preferred_trigger_prefetched_bytes=uvm_cpu_preferred_neighbor_prefetched_bytes=0;
 }
-static void run(void){uvm_cpu_block_policy_prefetch_on_signal(&blocks[trigger_slot],&gpu,&mm,0);}
+static void run(void){uvm_cpu_block_policy_prefetch_on_signal(&blocks[trigger_slot],&gpu,&mm,0);
+ assert(uvm_cpu_preferred_prefetched_bytes==uvm_cpu_preferred_trigger_prefetched_bytes+uvm_cpu_preferred_neighbor_prefetched_bytes);}
 int main(void) {
  // Actual production loop: range clamps request; grant truncates it; trigger is first.
  reset();run();assert(requested==16*UVM_SIZE_1MB && calls==2 && visited[0]==4 && visited[1]==3);
+ assert(uvm_cpu_preferred_trigger_prefetched_bytes==UVM_VA_BLOCK_SIZE && uvm_cpu_preferred_neighbor_prefetched_bytes==UVM_VA_BLOCK_SIZE);
  // Counter pressure admits only the triggering block, even when a learned
  // region mask requests additional neighbors.
  reset(); pressure=true; grant=2*UVM_SIZE_1MB; run();
  assert(calls==1 && visited[0]==4 && transferred==UVM_VA_BLOCK_SIZE);
  assert(end_calls==1 && completed_success && transferred==grant && !reserved);
+ assert(uvm_cpu_preferred_trigger_prefetched_bytes==UVM_VA_BLOCK_SIZE && !uvm_cpu_preferred_neighbor_prefetched_bytes);
  reset();pressure=true;grant=2*UVM_SIZE_1MB;
  uvm_cpu_block_policy_prefetch_on_signal(&blocks[4],&gpu,&mm,0x12);
  assert(calls==1 && visited[0]==4 && requested==UVM_VA_BLOCK_SIZE);
@@ -155,6 +160,7 @@ int main(void) {
  reset();grant=8*UVM_SIZE_1MB;trigger_slot=7;run();assert(calls==4 && visited[0]==7 && visited[1]==4 && visited[2]==5 && visited[3]==6);
  // A resident triggering block does not prevent neighboring transfers.
  reset();trigger_resident=true;run();assert(calls==2 && transferred==UVM_VA_BLOCK_SIZE);
+ assert(!uvm_cpu_preferred_trigger_prefetched_bytes && uvm_cpu_preferred_neighbor_prefetched_bytes==UVM_VA_BLOCK_SIZE);
  // Sparse neighbor blocks consume no bytes and do not instantiate new blocks.
  reset();range.blocks[3]=NULL;run();assert(calls==1 && transferred==UVM_VA_BLOCK_SIZE && end_calls==1);
  // Transient denial retries, permanent disable never admits or sets retry.
@@ -233,6 +239,7 @@ int main(void) {
  uvm_cpu_block_policy_prefetch_on_signal(&blocks[31],&gpu,&mm,0);
  assert(requested==4*UVM_SIZE_1MB && calls==2 && visited[0]==30 && visited[1]==29);
  assert(transferred==grant && completed_success && !reserved);
+ assert(!uvm_cpu_preferred_trigger_prefetched_bytes && (NvU64)uvm_cpu_preferred_neighbor_prefetched_bytes==grant);
  // At the beginning of a tile only forward neighbors are legal.
  reset();range.count=64;
  for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}

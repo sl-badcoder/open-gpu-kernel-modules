@@ -30,6 +30,15 @@ class MonitorTest(unittest.TestCase):
         self.assertTrue(reset["reset_detected"])
         self.assertIsNone(reset["change"])
 
+    def test_split_byte_counters_have_rates(self):
+        for part in ("trigger", "neighbor"):
+            key = f"module/uvm_cpu_preferred_{part}_prefetched_bytes"
+            row = monitor.differences({"monotonic_s": 10, "metrics": {key: 4096}},
+                                      {"monotonic_s": 12, "metrics": {key: 12288}})[0]
+            self.assertEqual(row["kind"], "counter")
+            self.assertEqual(row["change"], 8192)
+            self.assertEqual(row["per_second"], 4096)
+
     def test_run_collects_changes_and_preserves_child_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

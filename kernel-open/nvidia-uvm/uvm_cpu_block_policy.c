@@ -38,6 +38,8 @@ static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_retries = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetched_bytes = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_trigger_prefetched_bytes = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_neighbor_prefetched_bytes = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
 static bool uvm_perf_access_counter_admission_enable = true;
 static unsigned uvm_perf_access_counter_admission_pressure_percent = 95;
@@ -151,6 +153,10 @@ module_param_cb(uvm_cpu_preferred_prefetch_retries, &atomic64_count_ops, &uvm_cp
 MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_retries, "Number of capacity-stopped managed allocation prefetches retried.");
 module_param_cb(uvm_cpu_preferred_prefetched_bytes, &atomic64_count_ops, &uvm_cpu_preferred_prefetched_bytes, S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_prefetched_bytes, "Number of bytes moved by access-counter-guided managed allocation chunk prefetches.");
+module_param_cb(uvm_cpu_preferred_trigger_prefetched_bytes, &atomic64_count_ops, &uvm_cpu_preferred_trigger_prefetched_bytes, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_trigger_prefetched_bytes, "Prefetch bytes attributed to the triggering VA block, including its unaccessed pages; subset of prefetched_bytes.");
+module_param_cb(uvm_cpu_preferred_neighbor_prefetched_bytes, &atomic64_count_ops, &uvm_cpu_preferred_neighbor_prefetched_bytes, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_neighbor_prefetched_bytes, "Prefetch bytes attributed to additional VA blocks; subset of prefetched_bytes.");
 module_param_cb(uvm_cpu_preferred_prefetch_capacity_stops, &atomic64_count_ops, &uvm_cpu_preferred_prefetch_capacity_stops, S_IRUGO);
 MODULE_PARM_DESC(uvm_cpu_preferred_prefetch_capacity_stops, "Number of managed allocation prefetches stopped when free VRAM was exhausted.");
 
@@ -399,6 +405,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     size_t sparse_count = 0;
     NvU64 chunk_bytes;
     NvU64 prefetched_bytes = 0;
+    NvU64 trigger_prefetched_bytes = 0;
     NvU64 reserved_bytes = 0;
     uvm_prefetch_reservation_t reservation = {0};
     unsigned prefetch_chunk_mb = READ_ONCE(uvm_cpu_preferred_prefetch_chunk_mb);
@@ -567,6 +574,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         uvm_va_block_t *va_block;
         NV_STATUS status;
         bool capacity_stop;
+        NvU64 bytes_before;
 
         if (block_index > 0 && uvm_cpu_block_policy_counter_pressure(gpu)) {
             capacity_stopped = true;
@@ -607,6 +615,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         if (!va_block)
             continue;
 
+        bytes_before = prefetched_bytes;
         status = prefetch_block(va_block,
                                 gpu,
                                 mm,
@@ -616,6 +625,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                 &reservation,
                                 &capacity_stop,
                                 candidate_index != trigger_index);
+        if (candidate_index == trigger_index)
+            trigger_prefetched_bytes += prefetched_bytes - bytes_before;
         if (capacity_stop) {
             atomic64_inc(&uvm_cpu_preferred_prefetch_capacity_stops);
             capacity_stopped = true;
@@ -634,6 +645,8 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     }
 
     atomic64_add(prefetched_bytes, &uvm_cpu_preferred_prefetched_bytes);
+    atomic64_add(trigger_prefetched_bytes, &uvm_cpu_preferred_trigger_prefetched_bytes);
+    atomic64_add(prefetched_bytes - trigger_prefetched_bytes, &uvm_cpu_preferred_neighbor_prefetched_bytes);
 
     // Keep completed attempts one-shot, but re-arm capacity-stopped attempts.
     // The started bit remains set so signals are cheap while usage is still
