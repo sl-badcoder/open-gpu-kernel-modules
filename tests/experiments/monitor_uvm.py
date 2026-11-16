@@ -24,6 +24,11 @@ GPU_FIELDS = ("uuid", "name", "memory.total", "memory.used", "memory.free",
 COUNTERS = set("""samples dump_errors pm_skips rising_bits falling_bits unchanged_samples
 selected_hot selected_cold selected_unknown background_roots_freed background_failures
 selection_changes selection_fallbacks background_hot_skips background_unknown_skips
+replacement_requests replacement_freed_roots replacement_accessed_roots
+replacement_unknown_recency_roots replacement_selection_ns replacement_drain_ns
+turnover_population_bytes turnover_trigger_population_bytes turnover_repopulated_bytes
+turnover_evicted_bytes turnover_short_quarter_bytes turnover_short_half_bytes
+turnover_short_budget_bytes turnover_evaluations turnover_epoch_pauses
 prefetch_admissions prefetch_denials prefetch_backoffs prefetch_quick_returns
 prefetch_capacity_stops prefetch_pressure_pauses prefetch_allocation_failures
 prefetch_prefetched_blocks prefetch_ratio_evaluations prefetch_discarded_blocks
@@ -321,14 +326,15 @@ def main(argv=None):
                 observed_writer.writerows(observed_rows)
             delta = {r["metric"]: r["change"] for r in observed_rows if r["kind"] == "counter"}
             ratios = {}
-            for key in delta:
-                if not key.endswith("/prefetch_refault_returns"):
-                    continue
-                prefix = key.rsplit("/", 1)[0] + "/"
+            prefixes = {key.rsplit("/", 1)[0] + "/" for key in delta if key.startswith("vab/")}
+            for prefix in sorted(prefixes):
                 for name, numerator, denominator in (
                     ("short_return_fraction", "prefetch_refault_short_returns", "prefetch_refault_returns"),
                     ("refault_pause_fraction", "prefetch_refault_paused", "prefetch_refault_plans"),
-                    ("hot_skip_visits_per_freed_root", "background_hot_skips", "background_roots_freed")):
+                    ("hot_skip_visits_per_freed_root", "background_hot_skips", "background_roots_freed"),
+                    ("turnover_repopulation_fraction", "turnover_repopulated_bytes", "turnover_population_bytes"),
+                    ("turnover_short_quarter_fraction", "turnover_short_quarter_bytes", "turnover_trigger_population_bytes"),
+                    ("turnover_short_budget_fraction", "turnover_short_budget_bytes", "turnover_trigger_population_bytes")):
                     n, d = delta.get(prefix + numerator), delta.get(prefix + denominator)
                     ratios[prefix + name] = n / d if n is not None and d is not None and d > 0 else None
             write_json(out / "summary.json", {

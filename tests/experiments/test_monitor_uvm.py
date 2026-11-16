@@ -39,6 +39,19 @@ class MonitorTest(unittest.TestCase):
             self.assertEqual(row["change"], 8192)
             self.assertEqual(row["per_second"], 4096)
 
+    def test_replacement_counters_and_gauges(self):
+        counters = ("turnover_trigger_population_bytes", "turnover_repopulated_bytes",
+                    "turnover_short_quarter_bytes", "replacement_selection_ns",
+                    "replacement_freed_roots", "turnover_epoch_pauses")
+        gauges = ("turnover_resident_bytes", "replacement_pending_roots",
+                  "turnover_request_stride", "turnover_last_population_bytes",
+                  "turnover_epoch_roots_used", "turnover_epoch_roots_limit")
+        for name in counters + gauges:
+            key = "vab/GPU/0/" + name
+            row = monitor.differences({"monotonic_s": 0, "metrics": {key: 4}},
+                                      {"monotonic_s": 2, "metrics": {key: 8}})[0]
+            self.assertEqual(row["per_second"], 2 if name in counters else None)
+
     def test_run_collects_changes_and_preserves_child_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -50,6 +63,7 @@ class MonitorTest(unittest.TestCase):
             vab.parent.mkdir(parents=True)
             vab.write_text("linear_base 0x400000\nusage_percent 90\n"
                            "prefetch_refault_returns 10\nprefetch_refault_short_returns 5\n"
+                           "turnover_trigger_population_bytes 100\nturnover_short_quarter_bytes 10\n"
                            "access_bits 00000001 00000002\n")
             def fake_command(args, timeout=5):
                 query = next((a.split("=", 1)[1] for a in args if a.startswith("--query-gpu=")), None)
@@ -61,7 +75,8 @@ class MonitorTest(unittest.TestCase):
                 return {"returncode": 0, "stdout": output + "\n", "stderr": ""}
             out = root / "results"
             program = ("from pathlib import Path; import time; "
-                       f"Path({str(vab)!r}).write_text('prefetch_refault_returns 30\\nprefetch_refault_short_returns 15\\n'); "
+                       f"Path({str(vab)!r}).write_text('prefetch_refault_returns 30\\nprefetch_refault_short_returns 15\\n"
+                       "turnover_trigger_population_bytes 500\\nturnover_short_quarter_bytes 210\\n'); "
                        "time.sleep(0.35); "
                        f"Path({str(counter)!r}).write_text('500'); "
                        f"Path({str(vab)!r}).unlink(); "
@@ -83,6 +98,7 @@ class MonitorTest(unittest.TestCase):
             self.assertEqual(observed["change"], 20)
             self.assertGreater(observed["observation_span_s"], 0)
             self.assertEqual(summary["derived"]["vab/GPU-test/0/short_return_fraction"], 0.5)
+            self.assertEqual(summary["derived"]["vab/GPU-test/0/turnover_short_quarter_fraction"], 0.5)
             self.assertIn("benchmark output", (out / "benchmark.log").read_text())
             before = json.loads((out / "before.json").read_text())
             self.assertEqual(before["metrics"]["vab/GPU-test/0/linear_base"], 0x400000)

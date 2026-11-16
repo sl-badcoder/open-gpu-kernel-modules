@@ -1,5 +1,9 @@
 # Monitored vLLM experiments
 
+For the optional request-driven replacement policy and its turnover counters,
+see [PREFETCH_REPLACEMENT.md](PREFETCH_REPLACEMENT.md). This monitor records the
+new fields automatically and reports short-return byte fractions in the summary.
+
 Run the wrapper from your vLLM fork's working directory (the directory containing
 `.venv` and `benchmarks/benchmark_uvm.py`):
 

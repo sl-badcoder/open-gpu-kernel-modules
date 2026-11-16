@@ -191,6 +191,13 @@ static unsigned uvm_perf_eager_eviction_interval_ms = 25;
 static unsigned uvm_perf_eager_eviction_batch_count = 16;
 // Fixed completion grace, independent of access heat or migration history.
 static unsigned uvm_perf_vab_min_residency_ms = 100;
+static bool uvm_perf_prefetch_replacement_enable;
+static bool uvm_perf_prefetch_turnover_enable = true;
+
+bool uvm_pmm_gpu_prefetch_turnover_enabled(void)
+{
+    return uvm_perf_prefetch_turnover_enable || uvm_perf_prefetch_replacement_enable;
+}
 static unsigned uvm_perf_speculative_prefetch_limit_mb = 32;
 static unsigned uvm_perf_speculative_prefetch_reserve_mb = 64;
 static bool uvm_perf_speculative_prefetch_backoff_enable = false;
@@ -234,6 +241,12 @@ MODULE_PARM_DESC(uvm_perf_speculative_prefetch_churn_ms, "Each rapid-return obse
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_return_percent, "Mature speculative block rapid-return percentage triggering backoff (default 50; clamped to 1..100).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_min_blocks, "Minimum mature speculative blocks per ratio decision (default 32; minimum 1).");
 module_param(uvm_perf_vab_min_residency_ms, uint, S_IRUGO);
+module_param(uvm_perf_prefetch_replacement_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_prefetch_replacement_enable,
+                 "Experimental request-driven cold-root replacement with turnover-limited reclaim (default false; requires eager eviction).");
+module_param(uvm_perf_prefetch_turnover_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_prefetch_turnover_enable,
+                 "Account CPU-policy logical-page eviction and repopulation distances (default true; implied by replacement).");
 MODULE_PARM_DESC(uvm_perf_vab_min_residency_ms, "Minimum completed residency before VAB background selection (default 100 ms).");
 
 module_param(uvm_perf_eager_eviction_enable, bool, S_IRUGO);
@@ -1821,7 +1834,8 @@ bool uvm_pmm_gpu_counter_admission_pressure(uvm_pmm_gpu_t *pmm, unsigned high)
     bool pressure;
     uvm_spin_lock(&pmm->list_lock);
     pressure = eager_eviction_usage_percent(pmm) >= high ||
-               pmm->eager_eviction.recovering_watermark || pmm->eager_eviction.active;
+               (!uvm_perf_prefetch_replacement_enable && pmm->eager_eviction.recovering_watermark) ||
+               pmm->eager_eviction.active;
     uvm_spin_unlock(&pmm->list_lock);
     return pressure;
 }
@@ -1833,6 +1847,9 @@ static bool eager_eviction_prefetch_blocked_locked(uvm_pmm_gpu_t *pmm)
     unsigned usage = eager_eviction_usage_percent(pmm);
 
     uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    if (uvm_perf_prefetch_replacement_enable)
+        return pmm->eager_eviction.active;
 
     if (usage >= high)
         pmm->eager_eviction.recovering_watermark = true;
@@ -2018,6 +2035,7 @@ NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
 {
     uvm_prefetch_budget_config_t config = speculative_prefetch_config();
     bool blocked;
+    bool request_reclaim = false;
     NvU64 granted = 0;
 
     memset(reservation, 0, sizeof(*reservation));
@@ -2030,6 +2048,19 @@ NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
                                                requested_bytes, free_bytes, NV_GETTIME(), reservation);
         if (granted)
             ++pmm->eager_eviction.prefetch_count;
+        else if (uvm_perf_prefetch_replacement_enable && eager_eviction_supported(pmm)) {
+            NvU64 needed = config.demand_reserve_bytes + pmm->eager_eviction.budget.reserved_bytes +
+                           UVM_CHUNK_SIZE_MAX;
+            // A denial of the speculative byte limit is not a space shortage.
+            if (free_bytes < needed) {
+                NvU64 roots = DIV_ROUND_UP_ULL(needed - free_bytes, UVM_CHUNK_SIZE_MAX);
+                unsigned limit = clamp(uvm_perf_eager_eviction_batch_count, 1U, 16U);
+                pmm->eager_eviction.replacement_roots =
+                    max(pmm->eager_eviction.replacement_roots, (unsigned)min(roots, (NvU64)limit));
+                ++pmm->eager_eviction.replacement_requests;
+                request_reclaim = true;
+            }
+        }
     }
     else {
         ++pmm->eager_eviction.budget.denials;
@@ -2039,7 +2070,7 @@ NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
     }
     uvm_spin_unlock(&pmm->list_lock);
 
-    if (blocked)
+    if ((blocked && !uvm_perf_prefetch_replacement_enable) || request_reclaim)
         eager_eviction_schedule(pmm, 0);
 
     return granted;
@@ -2058,7 +2089,9 @@ void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm,
     uvm_prefetch_budget_complete(&pmm->eager_eviction.budget, &config, reservation,
                                  transferred_bytes, success, NV_GETTIME());
     --pmm->eager_eviction.prefetch_count;
-    resume_recovery = !pmm->eager_eviction.prefetch_count && pmm->eager_eviction.recovering_watermark;
+    resume_recovery = !pmm->eager_eviction.prefetch_count &&
+                      (uvm_perf_prefetch_replacement_enable ? pmm->eager_eviction.replacement_roots != 0 :
+                                                             pmm->eager_eviction.recovering_watermark);
     uvm_spin_unlock(&pmm->list_lock);
 
     if (resume_recovery && !READ_ONCE(pmm->eager_eviction.stopping))
@@ -2072,6 +2105,9 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_ro
     uvm_gpu_root_chunk_t *root_chunk;
     uvm_vab_snapshot_t snapshot;
     bool vab_only;
+    bool recency_known = false, accessed = false;
+    bool account = uvm_pmm_gpu_prefetch_turnover_enabled();
+    NvU64 selection_started, selection_elapsed, last_access_ns;
 
     uvm_gpu_vab_get_snapshot(uvm_pmm_to_gpu(pmm)->parent, &snapshot);
     vab_only = snapshot.eviction_enabled && snapshot.valid && snapshot.linear_base != ~0ULL;
@@ -2085,10 +2121,24 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_ro
         return false;
     }
 
+    selection_started = account ? NV_GETTIME() : 0;
     root_chunk = vab_pick_root(pmm, &snapshot, vab_only);
+    if (account) {
+        selection_elapsed = NV_GETTIME() - selection_started;
+        uvm_spin_lock(&pmm->list_lock);
+        pmm->eager_eviction.selection_ns += selection_elapsed;
+        uvm_spin_unlock(&pmm->list_lock);
+    }
     if (!root_chunk) {
         uvm_mutex_unlock(&pmm->lock);
         return false;
+    }
+
+    if (account && root_chunk->vab_ready_ns) {
+        recency_known = uvm_gpu_vab_get_recency(uvm_pmm_to_gpu(pmm)->parent, &snapshot,
+                                               root_chunk->chunk.address, UVM_CHUNK_SIZE_MAX,
+                                               root_chunk->vab_ready_ns, &last_access_ns);
+        accessed = recency_known && last_access_ns > root_chunk->vab_ready_ns;
     }
 
     status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
@@ -2099,6 +2149,15 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_ro
         ++pmm->vab_stats.background_failures;
         uvm_spin_unlock(&pmm->list_lock);
         return false;
+    }
+
+    if (account) {
+        uvm_spin_lock(&pmm->list_lock);
+        if (accessed)
+            ++pmm->eager_eviction.replacement_accessed_roots;
+        if (!recency_known)
+            ++pmm->eager_eviction.replacement_unknown_recency_roots;
+        uvm_spin_unlock(&pmm->list_lock);
     }
 
     // Keep the root pinned until the caller drains the submitted batch.
@@ -2132,14 +2191,65 @@ static unsigned eager_eviction_batch(uvm_pmm_gpu_t *pmm, unsigned limit, unsigne
         // Drain successful submissions even if selecting a later root failed.
         // free_root_chunk waits for each root's tracker before releasing VRAM.
         for (i = 0; i < count; ++i) {
+            bool account = uvm_pmm_gpu_prefetch_turnover_enabled();
+            NvU64 drain_started = account ? NV_GETTIME() : 0;
             free_root_chunk(pmm, pending[i], FREE_ROOT_CHUNK_MODE_DEFAULT);
             uvm_spin_lock(&pmm->list_lock);
             ++pmm->vab_stats.background_roots_freed;
+            if (account)
+                pmm->eager_eviction.drain_ns += NV_GETTIME() - drain_started;
             uvm_spin_unlock(&pmm->list_lock);
         }
     }
 
     return submitted;
+}
+
+static void replacement_eviction_work(uvm_pmm_gpu_t *pmm, unsigned batch_count)
+{
+    uvm_prefetch_budget_config_t config = speculative_prefetch_config();
+    uvm_vab_snapshot_t snapshot;
+    NvU64 free_bytes, needed, roots;
+    unsigned limit, evicted;
+
+    // Cache lock is never taken under the PMM list lock. sampled_ns is the
+    // existing hardware sampling epoch, not a new control timer.
+    uvm_gpu_vab_get_snapshot(uvm_pmm_to_gpu(pmm)->parent, &snapshot);
+    uvm_spin_lock(&pmm->list_lock);
+    if (pmm->eager_eviction.prefetch_count || !pmm->eager_eviction.replacement_roots) {
+        uvm_spin_unlock(&pmm->list_lock);
+        return;
+    }
+    free_bytes = READ_ONCE(pmm->pma_stats->numFreePages64k) * (NvU64)UVM_PAGE_SIZE_64K;
+    needed = config.demand_reserve_bytes + UVM_CHUNK_SIZE_MAX;
+    if (free_bytes >= needed) {
+        pmm->eager_eviction.replacement_roots = 0;
+        uvm_spin_unlock(&pmm->list_lock);
+        return;
+    }
+    roots = DIV_ROUND_UP_ULL(needed - free_bytes, UVM_CHUNK_SIZE_MAX);
+    limit = min(pmm->eager_eviction.replacement_roots, min(batch_count, 16U));
+    limit = min(limit, (unsigned)min(roots, 16ULL));
+    limit = uvm_prefetch_replacement_limit(&pmm->eager_eviction.replacement,
+                                           snapshot.valid ? snapshot.sampled_ns : 0,
+                                           limit, UVM_CHUNK_SIZE_MAX);
+    if (!limit) {
+        uvm_spin_unlock(&pmm->list_lock);
+        return;
+    }
+    pmm->eager_eviction.active = true;
+    uvm_spin_unlock(&pmm->list_lock);
+
+    // Zero disables the legacy low-watermark stop. The explicit limit bounds
+    // reclaim to the observed shortage, rather than draining to a percentage.
+    evicted = eager_eviction_batch(pmm, limit, 0);
+
+    uvm_spin_lock(&pmm->list_lock);
+    pmm->eager_eviction.replacement_roots -= min(evicted, pmm->eager_eviction.replacement_roots);
+    pmm->eager_eviction.replacement_freed_roots += evicted;
+    uvm_prefetch_replacement_consume(&pmm->eager_eviction.replacement, evicted);
+    pmm->eager_eviction.active = false;
+    uvm_spin_unlock(&pmm->list_lock);
 }
 
 static void vab_prepare_roots(uvm_pmm_gpu_t *pmm)
@@ -2205,6 +2315,12 @@ static void eager_eviction_work_impl(struct work_struct *work)
 
     vab_prepare_roots(pmm);
     if (!eager_eviction_supported(pmm)) {
+        eager_eviction_schedule(pmm, delay);
+        return;
+    }
+
+    if (uvm_perf_prefetch_replacement_enable) {
+        replacement_eviction_work(pmm, batch_count);
         eager_eviction_schedule(pmm, delay);
         return;
     }
@@ -3710,6 +3826,33 @@ void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
     stats->prefetch_initialized = pmm->eager_eviction.budget.initialized;
     stats->prefetch_off = pmm->eager_eviction.budget.initialized && !pmm->eager_eviction.budget.window_bytes;
     stats->prefetch_pressure_pauses = pmm->eager_eviction.budget.pressure_pauses;
+    stats->replacement_enabled = uvm_perf_prefetch_replacement_enable;
+    stats->turnover_enabled = uvm_pmm_gpu_prefetch_turnover_enabled();
+    stats->replacement_pending_roots = pmm->eager_eviction.replacement_roots;
+    stats->replacement_requests = pmm->eager_eviction.replacement_requests;
+    stats->replacement_freed_roots = pmm->eager_eviction.replacement_freed_roots;
+    stats->replacement_accessed_roots = pmm->eager_eviction.replacement_accessed_roots;
+    stats->replacement_unknown_recency_roots = pmm->eager_eviction.replacement_unknown_recency_roots;
+    stats->replacement_selection_ns = pmm->eager_eviction.selection_ns;
+    stats->replacement_drain_ns = pmm->eager_eviction.drain_ns;
+    stats->turnover_population_bytes = pmm->eager_eviction.replacement.population_bytes;
+    stats->turnover_resident_bytes = pmm->eager_eviction.replacement.resident_bytes;
+    stats->turnover_repopulated_bytes = pmm->eager_eviction.replacement.repopulated_bytes;
+    stats->turnover_evicted_bytes = pmm->eager_eviction.replacement.evicted_bytes;
+    stats->turnover_short_quarter_bytes = pmm->eager_eviction.replacement.short_quarter_bytes;
+    stats->turnover_short_half_bytes = pmm->eager_eviction.replacement.short_half_bytes;
+    stats->turnover_short_budget_bytes = pmm->eager_eviction.replacement.short_budget_bytes;
+    stats->turnover_evaluations = pmm->eager_eviction.replacement.evaluations;
+    stats->turnover_request_stride = pmm->eager_eviction.replacement.request_stride;
+    stats->turnover_window_population_bytes = pmm->eager_eviction.replacement.window_population_bytes;
+    stats->turnover_window_short_quarter_bytes = pmm->eager_eviction.replacement.window_short_quarter_bytes;
+    stats->turnover_window_budget_bytes = pmm->eager_eviction.replacement.window_budget_bytes;
+    stats->turnover_epoch_pauses = pmm->eager_eviction.replacement.epoch_pauses;
+    stats->turnover_trigger_population_bytes = pmm->eager_eviction.replacement.trigger_population_bytes;
+    stats->turnover_last_population_bytes = pmm->eager_eviction.replacement.last_population_bytes;
+    stats->turnover_last_short_quarter_bytes = pmm->eager_eviction.replacement.last_short_quarter_bytes;
+    stats->turnover_epoch_roots_limit = pmm->eager_eviction.replacement.epoch_roots_limit;
+    stats->turnover_epoch_roots_used = pmm->eager_eviction.replacement.epoch_roots_used;
     stats->prefetch_allocation_failures = pmm->eager_eviction.budget.allocation_failures;
     stats->prefetch_prefetched_blocks = pmm->eager_eviction.budget.prefetched_blocks;
     stats->prefetch_mature_blocks = pmm->eager_eviction.budget.mature_blocks;

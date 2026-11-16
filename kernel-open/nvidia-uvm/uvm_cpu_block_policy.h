@@ -25,6 +25,7 @@
 
 #include "uvm_common.h"
 #include "uvm_forward_decl.h"
+#include "uvm_va_block_types.h"
 
 bool uvm_cpu_block_policy_enabled(void);
 bool uvm_cpu_block_policy_counter_admission_enabled(void);
@@ -43,6 +44,9 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                              struct mm_struct *mm,
                                              NvU16 region_mask);
 void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
+void uvm_cpu_block_policy_record_eviction(uvm_va_block_t *va_block, uvm_gpu_t *gpu,
+                                          const uvm_page_mask_t *pages);
+void uvm_cpu_block_policy_forget_population(uvm_va_block_t *va_block, uvm_gpu_t *gpu);
 void uvm_cpu_block_policy_record_promotion(void);
 
 #endif

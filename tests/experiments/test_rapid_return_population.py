@@ -34,6 +34,14 @@ typedef struct { int lock; uvm_tracker_t tracker; uvm_va_block_gpu_state_t state
 typedef struct { NvU64 generation; } uvm_prefetch_reservation_t;
 typedef struct { unsigned unused; } uvm_pmm_gpu_t;
 typedef struct { int id; uvm_pmm_gpu_t pmm; } uvm_gpu_t;
+// Population turnover accounting is implemented by the surrounding policy;
+// this focused extraction supplies a typed no-op so prefetch_block can be
+// tested without pulling in the full kernel accounting state.
+static void __attribute__((unused)) uvm_cpu_block_policy_record_population(uvm_va_block_t *b,
+                                                    uvm_gpu_t *g,
+                                                    uvm_va_block_context_t *c,
+                                                    bool neighbor)
+{ (void)b; (void)g; (void)c; (void)neighbor; }
 static uvm_page_mask_t cpu, resident, thrashing, changed;
 static bool has_cpu, fail_allocation;
 static NV_STATUS resident_status, map_status, tracker_status;

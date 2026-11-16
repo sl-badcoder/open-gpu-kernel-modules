@@ -71,7 +71,7 @@ typedef struct { uvm_gpu_chunk_t chunk; NvU64 vab_generation,vab_ready_generatio
 typedef struct { int dummy; } uvm_parent_gpu_t;
 typedef struct { uvm_parent_gpu_t *parent; struct { NvU64 size; } mem_info; } uvm_gpu_t;
 static uvm_gpu_t mock_gpu;
-typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; uvm_prefetch_refault_t refault; struct {NvU64 events, confirmations, replacements, predictions, learned_predictions, expirations;} patterns; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
+typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; uvm_prefetch_refault_t refault; uvm_prefetch_replacement_state_t replacement; unsigned replacement_roots; NvU64 replacement_requests, replacement_freed_roots, replacement_accessed_roots, replacement_unknown_recency_roots, selection_ns, drain_ns; struct {NvU64 events, confirmations, replacements, predictions, learned_predictions, expirations;} patterns; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
 static uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *p) {(void)p; return &mock_gpu;}
 static uvm_vab_snapshot_t mock_snapshot;
 static unsigned snapshot_calls;
@@ -201,7 +201,8 @@ def main():
     header=(ROOT / 'kernel-open/nvidia-uvm/uvm_vab.h').read_text().replace('#include "nvtypes.h"','')
     budget=(ROOT / 'kernel-open/nvidia-uvm/uvm_prefetch_budget.h').read_text().replace('#include "nvtypes.h"','').replace('static inline', 'static inline __attribute__((unused))')
     refault=(ROOT / 'kernel-open/nvidia-uvm/uvm_prefetch_refault.h').read_text().replace('#include "nvtypes.h"','').replace('static inline', 'static inline __attribute__((unused))')
-    code=PRELUDE.replace('/* VAB classifier */',header+'\n#define UVM_ASSERT assert\n'+budget+refault)
+    replacement=(ROOT / 'kernel-open/nvidia-uvm/uvm_prefetch_replacement.h').read_text().replace('static inline', 'static inline __attribute__((unused))')
+    code=PRELUDE.replace('/* VAB classifier */',header+'\n#define UVM_ASSERT assert\n'+budget+refault+replacement)
     pmm_header = (ROOT / 'kernel-open/nvidia-uvm/uvm_pmm_gpu.h').read_text()
     stats_end = pmm_header.index('} uvm_pmm_gpu_vab_stats_t;') + len('} uvm_pmm_gpu_vab_stats_t;')
     stats = pmm_header[pmm_header.rfind('typedef struct', 0, stats_end):stats_end]
@@ -210,6 +211,9 @@ def main():
         code += re.search(r'static unsigned uvm_perf_speculative_prefetch_' + parameter + r' = \d+;', source).group(0) + '\n'
     for parameter in ('backoff_enable', 'recovery_enable', 'sparse_enable'):
         code += re.search(r'static bool uvm_perf_speculative_prefetch_' + parameter + r' = (?:true|false);', source).group(0) + '\n'
+    code += re.search(r'static bool uvm_perf_prefetch_replacement_enable;', source).group(0) + '\n'
+    code += re.search(r'static bool uvm_perf_prefetch_turnover_enable = (?:true|false);', source).group(0) + '\n'
+    code += 'static bool uvm_pmm_gpu_prefetch_turnover_enabled(void) { return uvm_perf_prefetch_turnover_enable || uvm_perf_prefetch_replacement_enable; }\n'
     code += function(source, 'uvm_pmm_gpu_prefetch_feedback_window_ns')
     code += function(source, 'speculative_prefetch_config')
     for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):

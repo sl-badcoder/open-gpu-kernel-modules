@@ -62,6 +62,7 @@
 #include "uvm_prefetch_budget.h"
 #include "uvm_prefetch_pattern.h"
 #include "uvm_prefetch_refault.h"
+#include "uvm_prefetch_replacement.h"
 #include "nv_uvm_user_types.h"
 #if UVM_IS_CONFIG_HMM() || defined(CONFIG_PCI_P2PDMA)
 #include <linux/memremap.h>
@@ -210,6 +211,33 @@ typedef struct {
     NvU64 prefetch_initialized;
     NvU64 prefetch_off;
     NvU64 prefetch_pressure_pauses;
+    NvU64 replacement_enabled;
+    NvU64 turnover_enabled;
+    NvU64 replacement_pending_roots;
+    NvU64 replacement_requests;
+    NvU64 replacement_freed_roots;
+    NvU64 replacement_accessed_roots;
+    NvU64 replacement_unknown_recency_roots;
+    NvU64 replacement_selection_ns;
+    NvU64 replacement_drain_ns;
+    NvU64 turnover_population_bytes;
+    NvU64 turnover_resident_bytes;
+    NvU64 turnover_repopulated_bytes;
+    NvU64 turnover_evicted_bytes;
+    NvU64 turnover_short_quarter_bytes;
+    NvU64 turnover_short_half_bytes;
+    NvU64 turnover_short_budget_bytes;
+    NvU64 turnover_evaluations;
+    NvU64 turnover_request_stride;
+    NvU64 turnover_window_population_bytes;
+    NvU64 turnover_window_short_quarter_bytes;
+    NvU64 turnover_window_budget_bytes;
+    NvU64 turnover_epoch_pauses;
+    NvU64 turnover_trigger_population_bytes;
+    NvU64 turnover_last_population_bytes;
+    NvU64 turnover_last_short_quarter_bytes;
+    NvU64 turnover_epoch_roots_limit;
+    NvU64 turnover_epoch_roots_used;
     NvU64 prefetch_allocation_failures;
     NvU64 prefetch_prefetched_blocks;
     NvU64 prefetch_mature_blocks;
@@ -506,6 +534,15 @@ typedef struct uvm_pmm_gpu_struct
         // entries never retain VA range/block pointers. Protected by list_lock.
         uvm_prefetch_pattern_t patterns;
         uvm_prefetch_refault_t refault;
+        uvm_prefetch_replacement_state_t replacement;
+        // Coalesced shortage, never an unbounded queue of notification requests.
+        unsigned replacement_roots;
+        NvU64 replacement_requests;
+        NvU64 replacement_freed_roots;
+        NvU64 replacement_accessed_roots;
+        NvU64 replacement_unknown_recency_roots;
+        NvU64 selection_ns;
+        NvU64 drain_ns;
         bool active;
         bool recovering_watermark;
         bool stopping;
@@ -518,6 +555,8 @@ typedef struct uvm_pmm_gpu_struct
 
     bool pma_address_cache_initialized;
 } uvm_pmm_gpu_t;
+
+bool uvm_pmm_gpu_prefetch_turnover_enabled(void);
 
 // Return containing GPU
 uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *pmm);

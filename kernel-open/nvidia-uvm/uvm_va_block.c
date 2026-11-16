@@ -1435,6 +1435,7 @@ uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get_alloc(uvm_va_block_t *block
 
 error:
     uvm_kvfree(gpu_state->chunks);
+    uvm_cpu_block_policy_forget_population(block, gpu);
     kmem_cache_free(g_uvm_va_block_gpu_state_cache, gpu_state);
     block->gpus[uvm_id_gpu_index(gpu->id)] = NULL;
 
@@ -10651,6 +10652,11 @@ static void block_split_gpu(uvm_va_block_t *existing, uvm_va_block_t *new, uvm_g
     }
 
     block_split_page_mask(&existing_gpu_state->evicted, existing_pages, &new_gpu_state->evicted, new_pages);
+    block_split_page_mask(&existing_gpu_state->replacement_live, existing_pages,
+                          &new_gpu_state->replacement_live, new_pages);
+    block_split_page_mask(&existing_gpu_state->replacement_evicted, existing_pages,
+                          &new_gpu_state->replacement_evicted, new_pages);
+    new_gpu_state->replacement_eviction_stamp = existing_gpu_state->replacement_eviction_stamp;
 }
 
 NV_STATUS uvm_va_block_split(uvm_va_block_t *existing_va_block,
@@ -13014,6 +13020,7 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     uvm_service_block_context_t *service_context;
     uvm_va_block_context_t *block_context;
     uvm_page_mask_t *pages_to_evict;
+    uvm_page_mask_t population_before_eviction;
     uvm_va_block_test_t *va_block_test = uvm_va_block_get_test(va_block);
     uvm_va_space_t *va_space = uvm_va_block_get_va_space_maybe_dead(va_block);
     struct mm_struct *mm;
@@ -13098,6 +13105,7 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                      uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE));
     uvm_page_mask_and(pages_to_evict, pages_to_evict, &block_context->scratch_page_mask);
     pages_evicted = !uvm_page_mask_empty(pages_to_evict);
+    uvm_page_mask_and(&population_before_eviction, pages_to_evict, &gpu_state->resident);
     uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
 
     if (uvm_va_block_is_hmm(va_block)) {
@@ -13137,6 +13145,13 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     }
     if (status != NV_OK)
         goto out;
+
+    if (!uvm_va_block_is_hmm(va_block)) {
+        // Exclude discarded/unbacked pages. Account residency relinquished by
+        // this successful eviction, not the root's nominal physical size.
+        uvm_page_mask_andnot(&population_before_eviction, &population_before_eviction, &gpu_state->resident);
+        uvm_cpu_block_policy_record_eviction(va_block, gpu, &population_before_eviction);
+    }
 
     if (pages_evicted)
         uvm_cpu_block_policy_rearm_on_eviction(va_block, gpu);

@@ -275,6 +275,85 @@ bool uvm_cpu_block_policy_should_promote_on_fault(uvm_va_block_t *va_block, uvm_
            should_handle_gpu_signal(va_block, gpu);
 }
 
+static void uvm_cpu_block_policy_record_population(uvm_va_block_t *va_block,
+                                                   uvm_gpu_t *gpu,
+                                                   uvm_va_block_context_t *block_context,
+                                                   bool speculative_neighbor)
+{
+    uvm_va_block_gpu_state_t *state;
+    uvm_prefetch_replacement_state_t *stats = &gpu->pmm.eager_eviction.replacement;
+    const uvm_page_mask_t *changed = &block_context->make_resident.pages_changed_residency;
+    uvm_page_mask_t scratch;
+    NvU64 moved, returned, already_live, distance, budget;
+
+    if (!uvm_pmm_gpu_prefetch_turnover_enabled())
+        return;
+    uvm_assert_mutex_locked(&va_block->lock);
+    state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    if (!state)
+        return;
+    moved = (NvU64)uvm_page_mask_weight(changed) * PAGE_SIZE;
+    if (!moved)
+        return;
+    uvm_page_mask_and(&scratch, changed, &state->replacement_evicted);
+    returned = (NvU64)uvm_page_mask_weight(&scratch) * PAGE_SIZE;
+    uvm_page_mask_and(&scratch, changed, &state->replacement_live);
+    already_live = (NvU64)uvm_page_mask_weight(&scratch) * PAGE_SIZE;
+    uvm_spin_lock(&gpu->pmm.list_lock);
+    distance = stats->population_bytes - state->replacement_eviction_stamp;
+    budget = max(stats->resident_bytes, UVM_PREFETCH_REPLACEMENT_MIN_BATCH_BYTES);
+    uvm_prefetch_replacement_record_population(stats, moved, returned, distance, budget,
+                                               !speculative_neighbor);
+    // Other residency paths may have moved a tracked page without this hook.
+    // Do not count it as an additional live page if it is populated again.
+    stats->resident_bytes -= min(stats->resident_bytes, already_live);
+    uvm_spin_unlock(&gpu->pmm.list_lock);
+    uvm_page_mask_or(&state->replacement_live, &state->replacement_live, changed);
+    uvm_page_mask_andnot(&state->replacement_evicted, &state->replacement_evicted, changed);
+}
+
+void uvm_cpu_block_policy_record_eviction(uvm_va_block_t *va_block, uvm_gpu_t *gpu,
+                                          const uvm_page_mask_t *pages)
+{
+    uvm_va_block_gpu_state_t *state;
+    uvm_page_mask_t tracked;
+    NvU64 bytes, live_bytes;
+
+    if (!uvm_pmm_gpu_prefetch_turnover_enabled() || !va_block->managed_range ||
+        !va_block->managed_range->cpu_access_counter_policy || uvm_page_mask_empty(pages))
+        return;
+    uvm_assert_mutex_locked(&va_block->lock);
+    state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    if (!state)
+        return;
+    bytes = (NvU64)uvm_page_mask_weight(pages) * PAGE_SIZE;
+    uvm_page_mask_and(&tracked, pages, &state->replacement_live);
+    live_bytes = (NvU64)uvm_page_mask_weight(&tracked) * PAGE_SIZE;
+    uvm_spin_lock(&gpu->pmm.list_lock);
+    if (uvm_page_mask_empty(&state->replacement_evicted))
+        state->replacement_eviction_stamp = gpu->pmm.eager_eviction.replacement.population_bytes;
+    uvm_prefetch_replacement_record_eviction(&gpu->pmm.eager_eviction.replacement, bytes, live_bytes);
+    uvm_spin_unlock(&gpu->pmm.list_lock);
+    uvm_page_mask_or(&state->replacement_evicted, &state->replacement_evicted, pages);
+    uvm_page_mask_andnot(&state->replacement_live, &state->replacement_live, pages);
+}
+
+void uvm_cpu_block_policy_forget_population(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+{
+    uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    NvU64 bytes;
+    if (!state)
+        return;
+    bytes = (NvU64)uvm_page_mask_weight(&state->replacement_live) * PAGE_SIZE;
+    if (bytes) {
+        uvm_spin_lock(&gpu->pmm.list_lock);
+        gpu->pmm.eager_eviction.replacement.resident_bytes -=
+            min(bytes, gpu->pmm.eager_eviction.replacement.resident_bytes);
+        uvm_spin_unlock(&gpu->pmm.list_lock);
+    }
+    uvm_page_mask_zero(&state->replacement_live);
+}
+
 static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
                                 uvm_gpu_t *gpu,
                                 struct mm_struct *mm,
@@ -337,6 +416,7 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
     if (status == NV_OK) {
         NvU64 moved = (NvU64)uvm_page_mask_weight(&block_context->make_resident.pages_changed_residency) * PAGE_SIZE;
         *prefetched_bytes += moved;
+        uvm_cpu_block_policy_record_population(va_block, gpu, block_context, speculative_neighbor);
         if (moved && speculative_neighbor) {
             uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
             UVM_ASSERT(gpu_state);

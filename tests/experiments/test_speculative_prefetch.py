@@ -46,6 +46,14 @@ struct uvm_va_range_managed_struct {
 typedef struct { int unused; } uvm_va_block_context_t;
 typedef struct { int unused; } uvm_tracker_t;
 #define UVM_TRACKER_INIT() {0}
+// The production walker records successful population through this hook. Keep
+// the extraction harness independent of the accounting implementation while
+// preserving the call site's type checking.
+static void __attribute__((unused)) uvm_cpu_block_policy_record_population(uvm_va_block_t *b,
+                                                    uvm_gpu_t *g,
+                                                    uvm_va_block_context_t *c,
+                                                    bool neighbor)
+{ (void)b; (void)g; (void)c; (void)neighbor; }
 static NvU64 now = 1000000000ULL;
 static unsigned uvm_cpu_preferred_prefetch_chunk_mb;
 static long long uvm_cpu_preferred_prefetch_capacity_stops, uvm_cpu_preferred_range_prefetches;

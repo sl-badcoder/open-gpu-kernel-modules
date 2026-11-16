@@ -123,6 +123,14 @@ typedef struct
 
     uvm_counter_admission_region_t counter_admission;
 
+    // Controlled CPU-policy population history, under the VA-block lock.
+    // Separate masks make partial evictions/returns byte accurate. One stamp
+    // for the oldest outstanding eviction conservatively overestimates the
+    // distance of later partial evictions (never invents a short return).
+    uvm_page_mask_t replacement_live;
+    uvm_page_mask_t replacement_evicted;
+    NvU64 replacement_eviction_stamp;
+
     // Array of naturally-aligned chunks. Each chunk has the largest possible
     // size which can fit within the block, so they are not uniform size.
     //
