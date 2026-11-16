@@ -32,13 +32,20 @@
 static atomic64_t cpu_prefetch_next_range_id = ATOMIC64_INIT(0);
 
 static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
-static unsigned uvm_cpu_preferred_block_promotion_enable __read_mostly = 1;
+static unsigned uvm_cpu_preferred_block_promotion_enable __read_mostly = 0;
 static unsigned uvm_cpu_preferred_prefetch_chunk_mb __read_mostly = 64;
 static atomic64_t uvm_cpu_preferred_block_promotions = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_retries = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetched_bytes = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
+static bool uvm_perf_access_counter_admission_enable = true;
+static unsigned uvm_perf_access_counter_admission_pressure_percent = 95;
+static atomic64_t uvm_cpu_preferred_admission_requests = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_admission_deferred = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_admission_low_pressure = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_admission_repeated = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_admission_state_failures = ATOMIC64_INIT(0);
 
 static int promotion_count_get(char *buffer, const struct kernel_param *kp)
 {
@@ -64,6 +71,67 @@ static int atomic64_count_get(char *buffer, const struct kernel_param *kp)
 static const struct kernel_param_ops atomic64_count_ops = {
     .get = atomic64_count_get,
 };
+
+module_param(uvm_perf_access_counter_admission_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_admission_enable,
+                 "Pressure-aware admission before CPU-preferred counter promotion (default true). Disables legacy refault path.");
+module_param(uvm_perf_access_counter_admission_pressure_percent, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_admission_pressure_percent,
+                 "PMA usage percentage requiring reaccess after a completed counter clear (default 95, clamped 1..100).");
+module_param_cb(uvm_cpu_preferred_admission_requests, &atomic64_count_ops, &uvm_cpu_preferred_admission_requests, S_IRUGO);
+module_param_cb(uvm_cpu_preferred_admission_deferred, &atomic64_count_ops, &uvm_cpu_preferred_admission_deferred, S_IRUGO);
+module_param_cb(uvm_cpu_preferred_admission_low_pressure, &atomic64_count_ops, &uvm_cpu_preferred_admission_low_pressure, S_IRUGO);
+module_param_cb(uvm_cpu_preferred_admission_repeated, &atomic64_count_ops, &uvm_cpu_preferred_admission_repeated, S_IRUGO);
+module_param_cb(uvm_cpu_preferred_admission_state_failures, &atomic64_count_ops, &uvm_cpu_preferred_admission_state_failures, S_IRUGO);
+
+bool uvm_cpu_block_policy_counter_admission_enabled(void)
+{
+    return uvm_perf_access_counter_admission_enable;
+}
+
+bool uvm_cpu_block_policy_counter_pressure(uvm_gpu_t *gpu)
+{
+    return uvm_cpu_block_policy_counter_admission_enabled() &&
+           uvm_pmm_gpu_counter_admission_pressure(&gpu->pmm,
+               clamp(uvm_perf_access_counter_admission_pressure_percent, 1U, 100U));
+}
+
+bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu,
+                                       NvU32 buffer, NvU64 submitted, NvU64 fresh)
+{
+    uvm_va_block_gpu_state_t *state;
+    bool pressure;
+    bool admitted;
+
+    uvm_assert_mutex_locked(&va_block->lock);
+    if (!uvm_cpu_block_policy_counter_admission_enabled() || uvm_va_block_is_hmm(va_block) ||
+        !va_block->managed_range ||
+        !uvm_cpu_block_policy_should_service_4k(va_block->managed_range, gpu))
+        return true;
+
+    atomic64_inc(&uvm_cpu_preferred_admission_requests);
+    pressure = uvm_cpu_block_policy_counter_pressure(gpu);
+    state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    if (!pressure) {
+        if (state)
+            state->counter_admission.pending = false;
+        atomic64_inc(&uvm_cpu_preferred_admission_low_pressure);
+        return true;
+    }
+    if (!state)
+        state = uvm_va_block_gpu_state_get_alloc(va_block, gpu);
+    if (!state) {
+        atomic64_inc(&uvm_cpu_preferred_admission_state_failures);
+        atomic64_inc(&uvm_cpu_preferred_admission_deferred);
+        return false;
+    }
+    admitted = uvm_counter_admission_decide(&state->counter_admission, true, buffer, submitted, fresh);
+    if (admitted)
+        atomic64_inc(&uvm_cpu_preferred_admission_repeated);
+    else
+        atomic64_inc(&uvm_cpu_preferred_admission_deferred);
+    return admitted;
+}
 
 /**
  * Introduced module params + description
@@ -396,6 +464,13 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     chunk_block_count = (chunk_bytes + UVM_VA_BLOCK_SIZE - 1) / UVM_VA_BLOCK_SIZE;
     chunk_block_count = min(chunk_block_count, block_count);
 
+    // An admitted high-pressure report may populate its trigger, but must not
+    // pull in neighbors which have not supplied their own admission evidence.
+    if (uvm_cpu_block_policy_counter_pressure(gpu)) {
+        chunk_block_count = min_t(size_t, chunk_block_count, 1);
+        region_mask = 0;
+    }
+
     if (refault_mode) {
         unsigned neighbors = uvm_pmm_gpu_refault_neighbors(&gpu->pmm,
                                                           managed_range->cpu_prefetch_range_id,
@@ -492,6 +567,11 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         uvm_va_block_t *va_block;
         NV_STATUS status;
         bool capacity_stop;
+
+        if (block_index > 0 && uvm_cpu_block_policy_counter_pressure(gpu)) {
+            capacity_stopped = true;
+            break;
+        }
 
         if (refault_mode || region_mask) {
             candidate_index = sparse_indices[block_index];
@@ -591,6 +671,8 @@ void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t 
     uvm_assert_mutex_locked(&va_block->lock);
 
     gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    if (gpu_state)
+        gpu_state->counter_admission.pending = false;
     if (gpu_state && va_block->managed_range && va_block->managed_range->cpu_access_counter_policy)
         uvm_pmm_gpu_refault_evict(&gpu->pmm, &gpu_state->refault);
     if (gpu_state && gpu_state->speculative_prefetch_ns) {

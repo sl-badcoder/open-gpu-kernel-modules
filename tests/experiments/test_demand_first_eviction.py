@@ -59,6 +59,7 @@ static unsigned uvm_perf_vab_min_residency_ms=100;
 static unsigned uvm_perf_speculative_prefetch_limit_mb=32;
 static unsigned uvm_perf_speculative_prefetch_reserve_mb=64;
 static bool uvm_perf_prefetch_refault_enable=false;
+static bool uvm_pmm_gpu_refault_enabled(void) { return uvm_perf_prefetch_refault_enable; }
 static unsigned uvm_perf_prefetch_refault_short_percent=25;
 static unsigned uvm_perf_prefetch_refault_max_neighbors=1;
 #define NSEC_PER_MSEC 1000000ULL
@@ -186,7 +187,7 @@ int main(void){
  mock_now=100*NSEC_PER_MSEC; // T=20ms: tick1 ready; tick5 still young.
  uvm_prefetch_budget_t before=p.eager_eviction.budget;
  uvm_pmm_gpu_vab_stats(&p,&mock_snapshot,&stats);
- assert(stats.prefetch_backoff_enabled==1 && stats.prefetch_recovery_enabled==1);
+ assert(stats.prefetch_backoff_enabled==0 && stats.prefetch_recovery_enabled==0);
  assert(stats.prefetch_unretired_blocks==36 && stats.prefetch_unretired_returns==17);
  assert(stats.prefetch_ready_blocks==32 && stats.prefetch_ready_returns==16);
  assert(!memcmp(&before,&p.eager_eviction.budget,sizeof(before)));

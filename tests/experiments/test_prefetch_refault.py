@@ -180,6 +180,8 @@ static uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *p) {(void)p;return &gpu;}
 static void uvm_spin_lock(int *l) {assert(!*l);*l=1;}
 static void uvm_spin_unlock(int *l) {assert(*l);*l=0;}
 static bool uvm_perf_prefetch_refault_enable=true;
+static bool counter_admission;
+static bool uvm_cpu_block_policy_counter_admission_enabled(void) { return counter_admission; }
 static unsigned uvm_perf_prefetch_refault_short_percent=25;
 static unsigned uvm_perf_prefetch_refault_max_neighbors=1;
 '''
@@ -222,6 +224,12 @@ int main(void) {
     uvm_pmm_gpu_refault_demand(&p,&block[0],7,0,4096,0,99,true,true);
     uvm_pmm_gpu_refault_population(&p,7,0);
     assert(p.eager_eviction.refault.demand_bytes==clock && !block[0].evicted && !p.list_lock);
+    uvm_perf_prefetch_refault_enable=true;
+    counter_admission=true;
+    assert(!uvm_pmm_gpu_refault_enabled());
+    uvm_pmm_gpu_refault_evict(&p,&block[0]);
+    uvm_pmm_gpu_refault_demand(&p,&block[0],7,0,4096,0,100,true,true);
+    assert(p.eager_eviction.refault.demand_bytes==clock && !block[0].evicted);
     return 0;
 }
 '''

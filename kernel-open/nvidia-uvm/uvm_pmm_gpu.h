@@ -719,6 +719,7 @@ void uvm_pmm_gpu_mark_root_chunk_discarded(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *
 // high watermark, until recovery reaches low, or during an eviction batch.
 // A true result also kicks the background eviction worker.
 bool uvm_pmm_gpu_eager_eviction_watermark_reached(uvm_pmm_gpu_t *pmm);
+bool uvm_pmm_gpu_counter_admission_pressure(uvm_pmm_gpu_t *pmm, unsigned high);
 
 // Return a byte reservation (zero denies) outside the eager eviction phase,
 // bounded by the per-GPU adaptive cap and free capacity minus demand reserve.

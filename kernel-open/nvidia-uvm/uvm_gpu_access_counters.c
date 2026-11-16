@@ -379,8 +379,12 @@ static NV_STATUS access_counter_clear_notifications(uvm_gpu_t *gpu,
     uvm_access_counter_clear_op_t clear_op;
 
     clear_op = gpu->parent->host_hal->access_counter_query_clear_op(gpu->parent, notification_start, num_notifications);
-    if (clear_op == UVM_ACCESS_COUNTER_CLEAR_OP_ALL)
-        return access_counter_clear_all(gpu, access_counters);
+    if (clear_op == UVM_ACCESS_COUNTER_CLEAR_OP_ALL) {
+        status = access_counter_clear_all(gpu, access_counters);
+        if (status == NV_OK && uvm_cpu_block_policy_counter_admission_enabled())
+            ++access_counters->admission.submitted;
+        return status;
+    }
 
     UVM_ASSERT(clear_op == UVM_ACCESS_COUNTER_CLEAR_OP_TARGETED);
 
@@ -397,7 +401,10 @@ static NV_STATUS access_counter_clear_notifications(uvm_gpu_t *gpu,
     for (i = 0; i < num_notifications; i++)
         gpu->parent->host_hal->access_counter_clear_targeted(&push, notification_start[i]);
 
-    return access_counters_push_end(&push, UVM_ACCESS_COUNTER_CLEAR_OP_TARGETED);
+    status = access_counters_push_end(&push, UVM_ACCESS_COUNTER_CLEAR_OP_TARGETED);
+    if (status == NV_OK && uvm_cpu_block_policy_counter_admission_enabled())
+        ++access_counters->admission.submitted;
+    return status;
 }
 
 bool uvm_parent_gpu_access_counters_pending(uvm_parent_gpu_t *parent_gpu, NvU32 index)
@@ -619,6 +626,15 @@ static NV_STATUS access_counters_take_ownership(uvm_gpu_t *gpu, NvU32 index, con
     // flush old notifications. This will update the cached_put pointer.
     access_counters->cached_get = UVM_GPU_READ_ONCE(*access_counters->rm_info.pAccessCntrBufferGet);
     access_counter_buffer_flush_locked(access_counters, UVM_GPU_BUFFER_FLUSH_MODE_UPDATE_PUT);
+
+    // Ownership reset has waited for clear completion and discarded old ring
+    // entries. Preserve monotonically increasing serials across reconfiguration.
+    if (uvm_cpu_block_policy_counter_admission_enabled()) {
+        ++access_counters->admission.submitted;
+        access_counters->admission.fresh = access_counters->admission.submitted;
+        access_counters->admission.batch_fresh = access_counters->admission.fresh;
+        access_counters->admission.fencing = false;
+    }
 
     access_counters->current_config.threshold = config->threshold;
 
@@ -848,6 +864,7 @@ static void access_counter_buffer_flush_locked(uvm_access_counter_buffer_t *acce
     NvU32 get;
     NvU32 put;
     uvm_spin_loop_t spin;
+    NvU32 consumed = 0;
 
     UVM_ASSERT(uvm_sem_is_locked(&parent_gpu->isr.access_counters[notif_buf_index].service_lock));
 
@@ -867,6 +884,7 @@ static void access_counter_buffer_flush_locked(uvm_access_counter_buffer_t *acce
         }
 
         parent_gpu->access_counter_buffer_hal->entry_clear_valid(access_counters, get);
+        ++consumed;
         ++get;
         if (get == access_counters->max_notifications)
             get = 0;
@@ -874,6 +892,8 @@ static void access_counter_buffer_flush_locked(uvm_access_counter_buffer_t *acce
 
 done:
     write_get(access_counters, get);
+    if (uvm_cpu_block_policy_counter_admission_enabled())
+        uvm_counter_admission_consumed(&access_counters->admission, consumed);
 }
 
 void uvm_parent_gpu_access_counter_buffer_flush(uvm_parent_gpu_t *parent_gpu)
@@ -960,6 +980,31 @@ typedef enum
     NOTIFICATION_FETCH_MODE_ALL,
 } notification_fetch_mode_t;
 
+static bool counter_admission_prepare_fetch(uvm_access_counter_buffer_t *access_counters)
+{
+    uvm_counter_admission_buffer_t *admission = &access_counters->admission;
+    uvm_parent_gpu_t *parent = access_counters->parent_gpu;
+    bool completed = false;
+    NvU32 queued = 0;
+
+    if (!uvm_cpu_block_policy_counter_admission_enabled() || !admission->tracking)
+        return false;
+
+    if (!admission->fencing && admission->submitted > admission->fresh) {
+        uvm_mutex_lock(&parent->access_counters.clear_tracker_lock);
+        completed = uvm_tracker_is_completed(&parent->access_counters.clear_tracker);
+        uvm_mutex_unlock(&parent->access_counters.clear_tracker_lock);
+        if (completed) {
+            NvU32 put = UVM_GPU_READ_ONCE(*access_counters->rm_info.pAccessCntrBufferPut);
+            access_counters->cached_put = put;
+            queued = (put + access_counters->max_notifications - access_counters->cached_get) %
+                         access_counters->max_notifications;
+        }
+    }
+    uvm_counter_admission_prepare(admission, completed, queued);
+    return completed;
+}
+
 static NvU32 fetch_access_counter_buffer_entries(uvm_access_counter_buffer_t *access_counters,
                                                  notification_fetch_mode_t fetch_mode)
 {
@@ -972,15 +1017,17 @@ static NvU32 fetch_access_counter_buffer_entries(uvm_access_counter_buffer_t *ac
     uvm_access_counter_buffer_entry_t *notification_cache;
     uvm_spin_loop_t spin;
     NvU32 last_instance_ptr_idx = 0;
+    bool put_refreshed;
 
     UVM_ASSERT(uvm_sem_is_locked(&parent_gpu->isr.access_counters[notif_buf_index].service_lock));
 
+    put_refreshed = counter_admission_prepare_fetch(access_counters);
     notification_cache = batch_context->notification_cache;
 
     get = access_counters->cached_get;
 
     // Read put pointer from GPU and cache it
-    if (get == access_counters->cached_put) {
+    if (get == access_counters->cached_put && !put_refreshed) {
         access_counters->cached_put = UVM_GPU_READ_ONCE(*access_counters->rm_info.pAccessCntrBufferPut);
     }
 
@@ -1036,6 +1083,9 @@ static NvU32 fetch_access_counter_buffer_entries(uvm_access_counter_buffer_t *ac
 
 done:
     write_get(access_counters, get);
+
+    if (uvm_cpu_block_policy_counter_admission_enabled())
+        uvm_counter_admission_consumed(&access_counters->admission, notification_index);
 
     return notification_index;
 }
@@ -1182,6 +1232,7 @@ static NV_STATUS service_va_block_locked(uvm_gpu_t *gpu,
                                          uvm_va_block_retry_t *va_block_retry,
                                          uvm_service_block_context_t *service_context,
                                          uvm_page_mask_t *accessed_pages,
+                                         bool allow_cpu_promotion,
                                          bool *did_migrate)
 {
     NV_STATUS status = NV_OK;
@@ -1192,8 +1243,8 @@ static NV_STATUS service_va_block_locked(uvm_gpu_t *gpu,
     const uvm_page_mask_t *residency_mask;
     const bool hmm_migratable = true;
     uvm_processor_id_t processor = gpu ? gpu->id : UVM_ID_CPU;
-    const bool promote_full_block = gpu && uvm_cpu_block_policy_should_promote(va_block, gpu);
-    const bool migrate_accessed_pages = gpu && uvm_pmm_gpu_refault_enabled() &&
+    const bool promote_full_block = allow_cpu_promotion && gpu && uvm_cpu_block_policy_should_promote(va_block, gpu);
+    const bool migrate_accessed_pages = allow_cpu_promotion && gpu && uvm_pmm_gpu_refault_enabled() &&
                                            !uvm_va_block_is_hmm(va_block) && va_block->managed_range &&
                                            uvm_cpu_block_policy_should_service_4k(va_block->managed_range, gpu);
 
@@ -1410,6 +1461,7 @@ static NV_STATUS service_notification_va_block_helper(struct mm_struct *mm,
                                                       uvm_va_block_t *va_block,
                                                       uvm_gpu_t *gpu,
                                                       uvm_access_counter_service_batch_context_t *batch_context,
+                                                      bool allow_cpu_promotion,
                                                       bool *did_migrate)
 {
     uvm_va_block_retry_t va_block_retry;
@@ -1433,6 +1485,7 @@ static NV_STATUS service_notification_va_block_helper(struct mm_struct *mm,
                                                              &va_block_retry,
                                                              service_context,
                                                              accessed_pages,
+                                                             allow_cpu_promotion,
                                                              did_migrate));
 }
 
@@ -1533,6 +1586,8 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     NV_STATUS flags_status;
     bool did_migrate = false;
     bool has_accessed_pages;
+    bool allow_cpu_promotion = true;
+    NvU64 admission_clear_serial = 0;
     NvU16 region_mask = 0;
     uvm_page_mask_t cpu_before;
     bool refault_mode = false;
@@ -1632,7 +1687,24 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
                                                    va_block->start, access_counters->index,
                                                    batch_context->batch_id, demand_mask);
     }
-    status = service_notification_va_block_helper(mm, va_block, gpu, batch_context, &did_migrate);
+    // Gate the optional CPU-policy movement BEFORE either full-block promotion
+    // or the queued range prefetch. Native residency/thrashing decisions remain
+    // intact, and deferred notifications still take the normal clear path.
+    if (has_accessed_pages && !is_hmm) {
+        allow_cpu_promotion = uvm_cpu_block_policy_admit_counter(va_block, gpu,
+                                                               access_counters->index,
+                                                               access_counters->admission.submitted,
+                                                               access_counters->admission.batch_fresh);
+        if (!allow_cpu_promotion) {
+            uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+            if (state && state->counter_admission.pending &&
+                state->counter_admission.buffer == access_counters->index)
+                admission_clear_serial = state->counter_admission.clear_serial;
+            access_counters->admission.tracking = true;
+        }
+    }
+    status = service_notification_va_block_helper(mm, va_block, gpu, batch_context,
+                                                  allow_cpu_promotion, &did_migrate);
     if (refault_mode) {
         uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
         const uvm_page_mask_t *local = state ? &state->resident : NULL;
@@ -1669,7 +1741,20 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     if ((status == NV_OK) && (flags_status != NV_OK))
         status = flags_status;
 
-    if (status == NV_OK && prefetch_queue && has_accessed_pages)
+    // A failed service/clear must not leave a pending observation which some
+    // unrelated successful clear could accidentally turn into repeat evidence.
+    if (!allow_cpu_promotion && status != NV_OK) {
+        uvm_va_block_gpu_state_t *state;
+        uvm_mutex_lock(&va_block->lock);
+        state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+        if (state && state->counter_admission.pending &&
+            state->counter_admission.buffer == access_counters->index &&
+            state->counter_admission.clear_serial == admission_clear_serial)
+            state->counter_admission.pending = false;
+        uvm_mutex_unlock(&va_block->lock);
+    }
+
+    if (status == NV_OK && prefetch_queue && has_accessed_pages && allow_cpu_promotion)
         demand_first_prefetch_queue_push(prefetch_queue, va_block, gpu, mm, region_mask);
 
     return status;

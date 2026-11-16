@@ -80,11 +80,14 @@ static int gpu_resident_mask, cpu_resident_mask, hint_type, preferred;
 static bool eligibility=true;
 static int service_calls, service_destination_mask, service_pages;
 static int refault_mode;
+static bool full_promotion;
+static bool allow_cpu_promotion = true;
 static bool uvm_pmm_gpu_refault_enabled(void) { return refault_mode; }
 static bool uvm_cpu_block_policy_should_service_4k(managed_range_t *r, uvm_gpu_t *g) { return eligibility && r && r->cpu_access_counter_policy && g; }
+static bool __attribute__((unused)) uvm_cpu_block_policy_admit_counter(uvm_va_block_t *b, uvm_gpu_t *g, int buffer, NvU64 submitted, NvU64 fresh) { (void)b;(void)g;(void)buffer;(void)submitted;(void)fresh; return allow_cpu_promotion; }
 static bool uvm_parent_gpu_is_coherent(int p) { (void)p; return false; }
 static bool uvm_va_block_is_hmm(uvm_va_block_t *b) { return b->managed_cpu == 2; }
-static bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *b, uvm_gpu_t *g) { (void)b; (void)g; return false; }
+static bool uvm_cpu_block_policy_should_promote(uvm_va_block_t *b, uvm_gpu_t *g) { (void)b; (void)g; return full_promotion; }
 static int uvm_hmm_find_vma(int mm, int *vma, NvU64 a) { (void)mm;(void)vma;(void)a; return NV_OK; }
 static int uvm_hmm_find_policy_vma_and_outer(uvm_va_block_t *b, int *vma, int first, const uvm_va_policy_t **p, int *outer) { (void)b;(void)vma;(void)first;(void)p;*outer=PAGES_PER_UVM_VA_BLOCK;return NV_OK; }
 static int uvm_va_block_region(int a, int b) { return (a << 16) | b; }
@@ -114,19 +117,30 @@ static void init_ctx(uvm_va_block_t *b, uvm_service_block_context_t *c, block_ct
  b->mapped=2;b->resident=1;b->start=0;b->managed_cpu=1;
  static managed_range_t range={1};b->managed_range=&range;
  gpu_resident_mask=0;cpu_resident_mask=0xf;service_calls=0;service_pages=0;
- hint_type=UVM_PERF_THRASHING_HINT_TYPE_NONE;preferred=UVM_ID_CPU;eligibility=true;
+ hint_type=UVM_PERF_THRASHING_HINT_TYPE_NONE;preferred=UVM_ID_CPU;eligibility=true;full_promotion=false;
 }
 int main(void) {
  uvm_gpu_t gpu={.id=1};uvm_va_block_t b;uvm_service_block_context_t c;block_ctx_t bc;
  uvm_va_block_retry_t retry;bool migrated=false;int accessed;
  (void)uvm_pmm_gpu_refault_enabled;(void)uvm_cpu_block_policy_should_service_4k;(void)UVM_ID_IS_CPU;
- init_ctx(&b,&c,&bc);accessed=5;refault_mode=0;
- assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,&migrated)==NV_OK);
+ init_ctx(&b,&c,&bc);accessed=5;refault_mode=0;allow_cpu_promotion=true;
+ assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,allow_cpu_promotion,&migrated)==NV_OK);
  assert(!service_calls && !gpu_resident_mask && cpu_resident_mask==0xf);
+ // A denied admission must suppress either optional override, including a
+ // previously enabled full-block or legacy refault promotion feature.
+ init_ctx(&b,&c,&bc);accessed=5;refault_mode=1;
+ assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,false,&migrated)==NV_OK);
+ assert(!service_calls && !gpu_resident_mask && cpu_resident_mask==0xf);
+ init_ctx(&b,&c,&bc);accessed=5;refault_mode=0;full_promotion=true;
+ assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,false,&migrated)==NV_OK);
+ assert(!service_calls && !gpu_resident_mask && cpu_resident_mask==0xf);
+ init_ctx(&b,&c,&bc);accessed=5;full_promotion=true;
+ assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,true,&migrated)==NV_OK);
+ assert(service_pages==0xf && gpu_resident_mask==0xf);
  // The actual production loop must migrate exactly demanded pages, never the
  // untouched pages2/4 of this toy block. Full-block promotion remains disabled.
- init_ctx(&b,&c,&bc);accessed=5;refault_mode=1;
- assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,&migrated)==NV_OK);
+ init_ctx(&b,&c,&bc);accessed=5;refault_mode=1;allow_cpu_promotion=true;
+ assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,allow_cpu_promotion,&migrated)==NV_OK);
  assert(service_calls==1 && service_pages==5 && gpu_resident_mask==5 && cpu_resident_mask==10);
  assert(service_destination_mask==2 && migrated);
  // Actual resulting residency feeds the production distance/aging policy.
@@ -149,7 +163,7 @@ int main(void) {
  // Native thrashing choices retain precedence over the experiment.
  for(int hint=UVM_PERF_THRASHING_HINT_TYPE_THROTTLE;hint<=UVM_PERF_THRASHING_HINT_TYPE_PIN;hint++) {
   init_ctx(&b,&c,&bc);accessed=5;hint_type=hint;
-  assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,&migrated)==NV_OK);
+  assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,allow_cpu_promotion,&migrated)==NV_OK);
   assert(!gpu_resident_mask && cpu_resident_mask==0xf);
   assert(c.thrashing_pin_count==(hint==UVM_PERF_THRASHING_HINT_TYPE_PIN?2:0));
  }
@@ -161,12 +175,12 @@ int main(void) {
   if(excluded==1)eligibility=false;
   if(excluded==2)preferred=2;
   if(excluded==3)b.managed_range=NULL;
-  assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,&migrated)==NV_OK);
+  assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,allow_cpu_promotion,&migrated)==NV_OK);
   assert(!gpu_resident_mask && cpu_resident_mask==0xf);
  }
  // A stale notification for a GPU-resident page must not migrate it twice.
  init_ctx(&b,&c,&bc);accessed=3;gpu_resident_mask=1;cpu_resident_mask=14;b.resident=3;
- assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,&migrated)==NV_OK);
+ assert(service_va_block_locked(&gpu,&b,&retry,&c,&accessed,allow_cpu_promotion,&migrated)==NV_OK);
  assert(service_pages==2 && gpu_resident_mask==3 && cpu_resident_mask==12);
  return 0;
 }

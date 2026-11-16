@@ -36,7 +36,9 @@ prefetch_pattern_confirmations prefetch_pattern_replacements prefetch_pattern_pr
 prefetch_pattern_learned_predictions prefetch_pattern_expirations prefetch_recoveries
 prefetch_probes uvm_cpu_preferred_block_promotions uvm_cpu_preferred_range_prefetches
 uvm_cpu_preferred_prefetch_retries uvm_cpu_preferred_prefetched_bytes
-uvm_cpu_preferred_prefetch_capacity_stops""".split())
+uvm_cpu_preferred_prefetch_capacity_stops uvm_cpu_preferred_admission_requests
+uvm_cpu_preferred_admission_deferred uvm_cpu_preferred_admission_low_pressure
+uvm_cpu_preferred_admission_repeated uvm_cpu_preferred_admission_state_failures""".split())
 
 
 def value(text):
@@ -154,7 +156,9 @@ def differences(before, after):
 
 
 def write_json(path, data):
-    path.write_text(json.dumps(data, indent=2) + "\n")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2) + "\n")
+    temporary.replace(path)
 
 
 def main(argv=None):
@@ -170,6 +174,7 @@ def main(argv=None):
         parser.error("Provide a command after -- and an interval >= 0.1 seconds")
     out = args.output_dir
     out.mkdir(parents=True, exist_ok=False)  # Never overwrite another experiment.
+    write_json(out / "run_status.json", {"state": "starting", "monitor_pid": os.getpid()})
     metadata = {"command": child_args, "cwd": os.getcwd(), "gpu": args.gpu,
                 "interval_seconds": args.interval, "host": platform.uname()._asdict(),
                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
@@ -196,6 +201,7 @@ def main(argv=None):
     dmon = child = copier = None
     exit_code = 1
     old_sigterm = signal.getsignal(signal.SIGTERM)
+    old_sigint = signal.getsignal(signal.SIGINT)
     def interrupted(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
@@ -210,6 +216,9 @@ def main(argv=None):
         observed = {}
         def record(item):
             nonlocal previous
+            # A checkpoint is a measurement during the run, never a fabricated
+            # after snapshot. It remains useful if the monitor is killed abruptly.
+            write_json(out / "last_sample.json", item)
             samples.write(json.dumps(item) + "\n")
             samples.flush()
             deltas = {r["metric"]: r for r in differences(previous, item)} if previous else {}
@@ -242,6 +251,8 @@ def main(argv=None):
             print(f"Telemetry: {out.resolve()}", flush=True)
             child = subprocess.Popen(child_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True, bufsize=1, start_new_session=True)
+            write_json(out / "run_status.json", {"state": "running", "monitor_pid": os.getpid(),
+                                                "benchmark_pid": child.pid})
             def tee():
                 for line in child.stdout:
                     log.write(line)
@@ -267,6 +278,11 @@ def main(argv=None):
             print(str(exc), file=sys.stderr)
             exit_code = 127
         finally:
+            # A second Ctrl-C must not interrupt writing the final snapshot.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            write_json(out / "run_status.json", {"state": "finalizing", "monitor_pid": os.getpid(),
+                                                "exit_code": exit_code})
             for process in (child, dmon):
                 if process is not None and process.poll() is None:
                     try:
@@ -282,8 +298,8 @@ def main(argv=None):
                 if not copier.is_alive():
                     child.stdout.close()
             after = snapshot(args.gpu, fields)
-            record(after)
             write_json(out / "after.json", after)
+            record(after)
             rows = differences(before, after)
             with (out / "changes.csv").open("w", newline="") as changes:
                 columns = ["metric", "kind", "before", "after", "change", "per_second", "reset_detected"]
@@ -324,7 +340,10 @@ def main(argv=None):
                           "Samples include model loading, warmup, all repeats, and teardown.",
                           "Byte counters describe driver bookkeeping, not measured PCIe wire bytes.",
                           "Rates use the complete before/after interval, not inference-only time."]})
+            write_json(out / "run_status.json", {"state": "finished", "monitor_pid": os.getpid(),
+                                                "exit_code": exit_code})
             signal.signal(signal.SIGTERM, old_sigterm)
+            signal.signal(signal.SIGINT, old_sigint)
     return exit_code if exit_code >= 0 else 128 - exit_code
 
 

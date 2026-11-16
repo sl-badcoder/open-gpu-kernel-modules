@@ -29,6 +29,7 @@
 #include "uvm_linux.h"
 #include "nv-kref.h"
 #include "uvm_common.h"
+#include "uvm_counter_admission.h"
 #include "uvm_perf_module.h"
 #include "uvm_processors.h"
 #include "uvm_lock.h"
@@ -119,6 +120,8 @@ typedef struct
 
     // Migration-distance episode follows this virtual allocation, not a root.
     uvm_prefetch_refault_block_t refault;
+
+    uvm_counter_admission_region_t counter_admission;
 
     // Array of naturally-aligned chunks. Each chunk has the largest possible
     // size which can fit within the block, so they are not uniform size.

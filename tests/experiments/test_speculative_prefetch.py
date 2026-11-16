@@ -25,10 +25,12 @@ typedef struct { int marker; } uvm_prefetch_refault_block_t;
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof((x)[0]))
 #define READ_ONCE(x) (x)
 #define min(a,b) ((a)<(b)?(a):(b))
+#define min_t(type,a,b) ((a)<(b)?(a):(b))
 #define UVM_DBG_PRINT(...) do {} while(0)
 struct mm_struct { int unused; };
 typedef struct { int lock; } uvm_va_space_t;
-typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; uvm_prefetch_refault_block_t refault; } uvm_va_block_gpu_state_t;
+typedef struct { bool pending; int buffer; NvU64 clear_serial; } counter_admission_t;
+typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; uvm_prefetch_refault_block_t refault; counter_admission_t counter_admission; } uvm_va_block_gpu_state_t;
 typedef struct { int unused; } uvm_pmm_gpu_t;
 typedef struct { NvU64 bytes; NvU64 generation; } uvm_prefetch_reservation_t;
 typedef struct { int id; uvm_pmm_gpu_t pmm; } uvm_gpu_t;
@@ -51,12 +53,14 @@ static long long uvm_cpu_preferred_prefetch_retries, uvm_cpu_preferred_prefetche
 static void atomic64_inc(long long *p) {++*p;}
 static void atomic64_add(NvU64 n,long long *p) {*p+=(long long)n;}
 static bool enabled, supported, alloc_fail, trigger_resident;
+static bool pressure;
 static bool refault_enabled;
 static unsigned refault_neighbor_count;
 static NvU64 grant, requested, reserved, transferred;
 static bool completed_success;
 static NvU64 reservation_generation = 17;
 static int calls, begin_calls, end_calls, waits, capacity_at, error_at, wait_error;
+static int pressure_after_copies;
 static int watermark_at, watermark_calls, feedback_quick, feedback_capacity;
 static int pressure_pauses;
 static size_t visited[64];
@@ -75,6 +79,7 @@ static void uvm_mutex_lock(int *p) {assert(!*p);*p=1;}
 static void uvm_mutex_unlock(int *p) {assert(*p);*p=0;}
 static void uvm_assert_mutex_locked(int *p) {assert(*p);}
 static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get(uvm_va_block_t *b,int id) {(void)id;assert(b->lock);return &b->state;}
+static bool uvm_cpu_block_policy_counter_pressure(uvm_gpu_t *g) {(void)g; return pressure || (pressure_after_copies>0 && calls>=pressure_after_copies);}
 static NvU64 uvm_pmm_gpu_prefetch_feedback_window_ns(void) {return 20*NSEC_PER_MSEC;}
 static void uvm_pmm_gpu_prefetch_pressure_pause(uvm_pmm_gpu_t *p) {(void)p;++pressure_pauses;}
 static void uvm_pmm_gpu_prefetch_return(uvm_pmm_gpu_t *p,NvU64 cohort,NvU64 t) {(void)p;assert(t==now);if (cohort) {assert(cohort==42);++feedback_quick;}}
@@ -128,14 +133,24 @@ static void reset(void) {
  watermark_at=-1;watermark_calls=feedback_quick=feedback_capacity=pressure_pauses=0;
  trigger_slot=4;
  uvm_cpu_preferred_prefetch_chunk_mb=64;
- uvm_cpu_preferred_prefetch_capacity_stops=uvm_cpu_preferred_range_prefetches=0;
+ uvm_cpu_preferred_prefetch_capacity_stops=uvm_cpu_preferred_range_prefetches=0; pressure=false; pressure_after_copies=0;
  uvm_cpu_preferred_prefetch_retries=uvm_cpu_preferred_prefetched_bytes=0;
 }
 static void run(void){uvm_cpu_block_policy_prefetch_on_signal(&blocks[trigger_slot],&gpu,&mm,0);}
 int main(void) {
  // Actual production loop: range clamps request; grant truncates it; trigger is first.
  reset();run();assert(requested==16*UVM_SIZE_1MB && calls==2 && visited[0]==4 && visited[1]==3);
+ // Counter pressure admits only the triggering block, even when a learned
+ // region mask requests additional neighbors.
+ reset(); pressure=true; grant=2*UVM_SIZE_1MB; run();
+ assert(calls==1 && visited[0]==4 && transferred==UVM_VA_BLOCK_SIZE);
  assert(end_calls==1 && completed_success && transferred==grant && !reserved);
+ reset();pressure=true;grant=2*UVM_SIZE_1MB;
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[4],&gpu,&mm,0x12);
+ assert(calls==1 && visited[0]==4 && requested==UVM_VA_BLOCK_SIZE);
+ reset();grant=8*UVM_SIZE_1MB;pressure_after_copies=1;run();
+ assert(calls==1 && visited[0]==4 && end_calls==1 && completed_success);
+ assert(blocks[4].gpu_prefetch_retry && !reserved);
  reset();grant=8*UVM_SIZE_1MB;run();assert(calls==4 && visited[0]==4 && visited[1]==2 && visited[2]==3 && visited[3]==5);
  reset();grant=8*UVM_SIZE_1MB;trigger_slot=7;run();assert(calls==4 && visited[0]==7 && visited[1]==4 && visited[2]==5 && visited[3]==6);
  // A resident triggering block does not prevent neighboring transfers.

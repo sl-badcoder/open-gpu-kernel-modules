@@ -32,6 +32,7 @@
 #include "uvm_linux.h"
 #include "nv-kref.h"
 #include "uvm_common.h"
+#include "uvm_counter_admission.h"
 #include "ctrl2080mc.h"
 #include "uvm_forward_decl.h"
 #include "uvm_processors.h"
@@ -532,6 +533,9 @@ struct uvm_access_counter_buffer_struct
     // Cached value of the GPU GET register to minimize the round-trips
     // over PCIe
     NvU32 cached_get;
+
+    // Nonblocking completed-clear / old-notification fence for admission.
+    uvm_counter_admission_buffer_t admission;
 
     // Cached value of the GPU PUT register to minimize the round-trips over
     // PCIe

@@ -172,6 +172,7 @@
 #include "uvm_kvmalloc.h"
 #include "uvm_va_space.h"
 #include "uvm_va_block.h"
+#include "uvm_cpu_block_policy.h"
 #include "uvm_va_range.h"
 #include "uvm_test.h"
 #include "uvm_linux.h"
@@ -192,20 +193,20 @@ static unsigned uvm_perf_eager_eviction_batch_count = 16;
 static unsigned uvm_perf_vab_min_residency_ms = 100;
 static unsigned uvm_perf_speculative_prefetch_limit_mb = 32;
 static unsigned uvm_perf_speculative_prefetch_reserve_mb = 64;
-static bool uvm_perf_speculative_prefetch_backoff_enable = true;
-static bool uvm_perf_speculative_prefetch_recovery_enable = true;
+static bool uvm_perf_speculative_prefetch_backoff_enable = false;
+static bool uvm_perf_speculative_prefetch_recovery_enable = false;
 static unsigned uvm_perf_speculative_prefetch_churn_ms = 20;
 static unsigned uvm_perf_speculative_prefetch_return_percent = 50;
 static unsigned uvm_perf_speculative_prefetch_min_blocks = 32;
 static bool uvm_perf_speculative_prefetch_sparse_enable = false;
-static bool uvm_perf_prefetch_refault_enable = true;
+static bool uvm_perf_prefetch_refault_enable = false;
 static unsigned uvm_perf_prefetch_refault_short_percent = 25;
 static unsigned uvm_perf_prefetch_refault_max_neighbors = 1;
 module_param(uvm_perf_prefetch_refault_max_neighbors, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_prefetch_refault_max_neighbors, "Maximum extra 2MiB blocks per refault-admission attempt (default 1, max 31; zero disables extra copies).");
 module_param(uvm_perf_prefetch_refault_enable, bool, S_IRUGO);
 module_param(uvm_perf_prefetch_refault_short_percent, uint, S_IRUGO);
-MODULE_PARM_DESC(uvm_perf_prefetch_refault_enable, "Use migration-distance admission and local neighbor sizing (default true). Overrides sparse learning.");
+MODULE_PARM_DESC(uvm_perf_prefetch_refault_enable, "Legacy refault path (default false). Inactive while counter admission is enabled.");
 MODULE_PARM_DESC(uvm_perf_prefetch_refault_short_percent, "Short return distance as percentage of GPU capacity in intervening demand migration bytes (default 25, clamped 1..100).");
 static unsigned uvm_perf_speculative_prefetch_recovery_return_percent = 25;
 static unsigned uvm_perf_speculative_prefetch_bad_batches = 2;
@@ -227,8 +228,8 @@ module_param(uvm_perf_speculative_prefetch_return_percent, uint, S_IRUGO);
 module_param(uvm_perf_speculative_prefetch_min_blocks, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_limit_mb, "Per-GPU speculative bytes in flight, in MiB (default 32, rounded down to 2MiB; values below 2 disable speculation).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_reserve_mb, "Free PMA capacity reserved from speculative admission, in MiB (default 64).");
-MODULE_PARM_DESC(uvm_perf_speculative_prefetch_backoff_enable, "Enable rapid-return adaptive backoff (default true). False keeps the fixed cap, headroom checks and ratio accounting without reducing the window.");
-MODULE_PARM_DESC(uvm_perf_speculative_prefetch_recovery_enable, "Recover by 2MiB after sustained low-return and, in sparse mode, repeated-locality evidence; bounded OFF probes (default true). Requires backoff_enable.");
+MODULE_PARM_DESC(uvm_perf_speculative_prefetch_backoff_enable, "Enable rapid-return adaptive backoff (default false). False keeps the fixed cap, headroom checks and ratio accounting without reducing the window.");
+MODULE_PARM_DESC(uvm_perf_speculative_prefetch_recovery_enable, "Recover by 2MiB after sustained low-return and, in sparse mode, repeated-locality evidence; bounded OFF probes (default false). Requires backoff_enable.");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_churn_ms, "Each rapid-return observation interval, not a polling timer (default 20 ms; minimum 1).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_return_percent, "Mature speculative block rapid-return percentage triggering backoff (default 50; clamped to 1..100).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_min_blocks, "Minimum mature speculative blocks per ratio decision (default 32; minimum 1).");
@@ -1815,6 +1816,16 @@ static unsigned eager_eviction_usage_percent(uvm_pmm_gpu_t *pmm)
     return eager_eviction_usage_percent_pending(pmm, 0);
 }
 
+bool uvm_pmm_gpu_counter_admission_pressure(uvm_pmm_gpu_t *pmm, unsigned high)
+{
+    bool pressure;
+    uvm_spin_lock(&pmm->list_lock);
+    pressure = eager_eviction_usage_percent(pmm) >= high ||
+               pmm->eager_eviction.recovering_watermark || pmm->eager_eviction.active;
+    uvm_spin_unlock(&pmm->list_lock);
+    return pressure;
+}
+
 // list_lock serializes recovery state and admission to either migration phase.
 static bool eager_eviction_prefetch_blocked_locked(uvm_pmm_gpu_t *pmm)
 {
@@ -1868,8 +1879,8 @@ static uvm_prefetch_budget_config_t speculative_prefetch_config(void)
                                           config.return_percent - 1);
     config.bad_batches = max(uvm_perf_speculative_prefetch_bad_batches, 1U);
     config.good_batches = max(uvm_perf_speculative_prefetch_good_batches, 1U);
-    config.locality_enabled = uvm_perf_speculative_prefetch_sparse_enable && !uvm_perf_prefetch_refault_enable;
-    config.neighbor_only = uvm_perf_prefetch_refault_enable;
+    config.locality_enabled = uvm_perf_speculative_prefetch_sparse_enable && !uvm_pmm_gpu_refault_enabled();
+    config.neighbor_only = uvm_pmm_gpu_refault_enabled();
     return config;
 }
 
@@ -1880,7 +1891,7 @@ bool uvm_pmm_gpu_speculative_prefetch_enabled(void)
 
 bool uvm_pmm_gpu_refault_enabled(void)
 {
-    return uvm_perf_prefetch_refault_enable;
+    return uvm_perf_prefetch_refault_enable && !uvm_cpu_block_policy_counter_admission_enabled();
 }
 
 static uvm_prefetch_refault_config_t prefetch_refault_config(uvm_pmm_gpu_t *pmm)
@@ -1897,7 +1908,7 @@ void uvm_pmm_gpu_refault_demand(uvm_pmm_gpu_t *pmm, uvm_prefetch_refault_block_t
                                 unsigned buffer_index, NvU64 batch_id, bool valid, bool returned_page)
 {
     uvm_prefetch_refault_config_t config;
-    if (!uvm_perf_prefetch_refault_enable)
+    if (!uvm_pmm_gpu_refault_enabled())
         return;
     config = prefetch_refault_config(pmm);
     uvm_spin_lock(&pmm->list_lock);
@@ -1908,7 +1919,7 @@ void uvm_pmm_gpu_refault_demand(uvm_pmm_gpu_t *pmm, uvm_prefetch_refault_block_t
 
 void uvm_pmm_gpu_refault_evict(uvm_pmm_gpu_t *pmm, uvm_prefetch_refault_block_t *state)
 {
-    if (!uvm_perf_prefetch_refault_enable)
+    if (!uvm_pmm_gpu_refault_enabled())
         return;
     uvm_spin_lock(&pmm->list_lock);
     uvm_prefetch_refault_evict(&pmm->eager_eviction.refault, state);
@@ -1918,7 +1929,7 @@ void uvm_pmm_gpu_refault_evict(uvm_pmm_gpu_t *pmm, uvm_prefetch_refault_block_t 
 void uvm_pmm_gpu_refault_population(uvm_pmm_gpu_t *pmm, NvU64 range_id, NvU64 address)
 {
     uvm_prefetch_refault_config_t config;
-    if (!uvm_perf_prefetch_refault_enable)
+    if (!uvm_pmm_gpu_refault_enabled())
         return;
     config = prefetch_refault_config(pmm);
     uvm_spin_lock(&pmm->list_lock);
@@ -1930,7 +1941,7 @@ unsigned uvm_pmm_gpu_refault_neighbors(uvm_pmm_gpu_t *pmm, NvU64 range_id, NvU64
 {
     unsigned neighbors;
     uvm_prefetch_refault_config_t config;
-    if (!uvm_perf_prefetch_refault_enable || !uvm_perf_prefetch_refault_max_neighbors)
+    if (!uvm_pmm_gpu_refault_enabled() || !uvm_perf_prefetch_refault_max_neighbors)
         return 0;
     config = prefetch_refault_config(pmm);
     uvm_spin_lock(&pmm->list_lock);
@@ -1946,7 +1957,7 @@ NvU16 uvm_pmm_gpu_prefetch_pattern(uvm_pmm_gpu_t *pmm, NvU64 range_id, NvU64 add
     bool confirmed;
     uvm_prefetch_budget_config_t config;
 
-    if (!uvm_perf_speculative_prefetch_sparse_enable || uvm_perf_prefetch_refault_enable)
+    if (!uvm_perf_speculative_prefetch_sparse_enable || uvm_pmm_gpu_refault_enabled())
         return 0;
 
     config = speculative_prefetch_config();
@@ -3717,7 +3728,7 @@ void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
     stats->prefetch_min_blocks = config.min_blocks;
     stats->prefetch_backoff_enabled = config.backoff_enabled;
     stats->prefetch_recovery_enabled = config.backoff_enabled && config.recovery_enabled;
-    stats->prefetch_refault_enabled = uvm_perf_prefetch_refault_enable;
+    stats->prefetch_refault_enabled = uvm_pmm_gpu_refault_enabled();
     stats->prefetch_refault_max_neighbors = min(uvm_perf_prefetch_refault_max_neighbors, UVM_REFAULT_MAX_WINDOW);
     stats->prefetch_refault_short_percent = min(max(uvm_perf_prefetch_refault_short_percent, 1U), 100U);
     stats->prefetch_refault_capacity_bytes = uvm_pmm_to_gpu(pmm)->mem_info.size;

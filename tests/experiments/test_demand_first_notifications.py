@@ -48,6 +48,7 @@ static bool __attribute__((unused)) uvm_pmm_gpu_refault_enabled(void) { return f
 static void __attribute__((unused)) uvm_pmm_gpu_refault_demand(int *p, NvU64 r, NvU64 a, NvU64 bytes, unsigned b, NvU64 batch, bool valid) { (void)p; (void)r; (void)a; (void)bytes; (void)b; (void)batch; (void)valid; }
 static int log_events[256]; static size_t log_count; static int log_event(int kind, int id) { return log_events[log_count++] = kind * 1000 + id; }
 static int current_kind;
+static bool allow_queue = true;
 static void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *b, uvm_gpu_t *g, struct mm_struct *m, NvU16 mask) { (void)g; (void)m; assert(mask==0x12); log_event(3, b->id); }
 static void preprocess_notifications(uvm_parent_gpu_t *p, batch_t *b) { (void)p; (void)b; }
 static struct mm_struct global_mm;
@@ -77,7 +78,8 @@ static NV_STATUS service_notifications_batch(uvm_gpu_va_space_t *g, struct mm_st
     if (e->demand_status != NV_OK) return e->demand_status;
     if (e->flags_status != NV_OK) return e->flags_status;
     log_event(2, e->block->id); /* notification flags */
-    demand_first_prefetch_queue_push(q, e->block, e->gpu, mm, 0x12);
+    if (allow_queue)
+        demand_first_prefetch_queue_push(q, e->block, e->gpu, mm, 0x12);
     return NV_OK;
 }
 '''
@@ -93,6 +95,11 @@ int main(void) {
     reset(); items[0].e.demand_status=NV_OK; items[0].e.flags_status=8; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[0].e},1); assert(service_notifications(&a)==8 && log_count==1);
     reset(); for (int i=0;i<9;i++) { items[i].e.kind=0; items[i].e.demand_status=NV_OK; items[i].e.flags_status=NV_OK; items[i].e.va_space=&va1; items[i].e.gpu=&gpu1; entries[i]=&items[i].e; } run(&a,entries,9); assert(service_notifications(&a)==NV_OK && log_count==27 && log_events[18]==3001 && log_events[26]==3009);
     reset(); items[0].e.kind=1; items[0].e.va_space=&va1; items[1].e.va_space=NULL; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[0].e,&items[1].e},2); assert(service_notifications(&a)==NV_OK && log_count==2 && log_events[0]==5001 && log_events[1]==4001);
+    // A denied admission still services and clears the notification, but does
+    // not enqueue speculative work. A flag-processing failure also leaves the
+    // queue empty.
+    reset(); allow_queue=false; items[0].e.kind=0; items[0].e.demand_status=NV_OK; items[0].e.flags_status=NV_OK; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[0].e},1); assert(service_notifications(&a)==NV_OK && log_count==2);
+    reset(); items[0].e.flags_status=8; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[0].e},1); assert(service_notifications(&a)==8 && log_count==1); allow_queue=true;
     return 0;
 }
 '''
@@ -118,18 +125,21 @@ typedef struct uvm_gpu_va_space_struct { uvm_va_space_t *va_space; uvm_gpu_t *gp
 typedef struct {bool cpu_access_counter_policy; NvU64 cpu_prefetch_range_id;} managed_t;
 typedef struct uvm_va_block_struct { NvU64 end; int id; int lock; NvU64 start; managed_t *managed_range;} uvm_va_block_t;
 typedef struct { int marker; } uvm_prefetch_refault_block_t;
-typedef struct { uvm_page_mask_t evicted, resident; uvm_prefetch_refault_block_t refault; } uvm_va_block_gpu_state_t;
+typedef struct { bool pending; int buffer; NvU64 clear_serial; } counter_admission_t;
+typedef struct { uvm_page_mask_t evicted, resident; uvm_prefetch_refault_block_t refault; counter_admission_t counter_admission; } uvm_va_block_gpu_state_t;
 typedef struct uvm_va_block_context_struct { int id; uvm_page_mask_t scratch_page_mask; } uvm_va_block_context_t;
 typedef struct uvm_service_block_context_struct { uvm_va_block_context_t *block_context; int access_counters_buffer_index; } uvm_service_block_context_t;
 typedef struct entry_struct { uvm_va_space_t *va_space; uvm_gpu_t *gpu; NvU64 address; int counter_value; } uvm_access_counter_buffer_entry_t;
 typedef struct batch_struct { uvm_access_counter_buffer_entry_t *notifications[4]; NvU32 num_notifications; NvU64 batch_id; uvm_page_mask_t accessed_pages; uvm_service_block_context_t block_service_context; } uvm_access_counter_service_batch_context_t;
-typedef struct access_struct { int index; uvm_access_counter_service_batch_context_t batch_service_context; } uvm_access_counter_buffer_t;
+typedef struct { NvU64 submitted; NvU64 batch_fresh; bool tracking; } admission_t;
+typedef struct access_struct { int index; admission_t admission; uvm_access_counter_service_batch_context_t batch_service_context; } uvm_access_counter_buffer_t;
 static int demand_status, flags_status, queue_count, prefetch_ids[4];
+static NvU32 last_flags;
 static unsigned observed; static NvU16 seen_demands;
 #define UVM_ID_CPU (-1)
 #define NUMA_NO_NODE (-1)
 #define PAGE_SIZE 4096
-static bool refault_mode;
+static bool refault_mode, allow_cpu_promotion = true;
 static NvU64 cpu_mask, local_mask, gpu_after_mask, refault_bytes; static unsigned local_reads; static bool refault_valid, refault_returned;
 static bool uvm_pmm_gpu_refault_enabled(void) { return refault_mode; }
 static void uvm_pmm_gpu_refault_demand(int *p, uvm_prefetch_refault_block_t *state, NvU64 r, NvU64 a, NvU64 bytes, unsigned b, NvU64 batch, bool valid, bool returned) { (void)p; assert(state); assert(r == 42 && a == 0 && b == 4 && batch == 9); refault_bytes = bytes; refault_valid = valid; refault_returned = returned; }
@@ -162,8 +172,9 @@ static void expand_notification_block(uvm_gpu_va_space_t *g, struct mm_struct *m
 static uvm_va_block_gpu_state_t gpu_state;
 static bool gpu_state_present=true;
 static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get(uvm_va_block_t *b, int id) { (void)b; (void)id; return gpu_state_present ? &gpu_state : NULL; }
-static NV_STATUS service_notification_va_block_helper(struct mm_struct *m, uvm_va_block_t *b, uvm_gpu_t *g, uvm_access_counter_service_batch_context_t *c, bool *did_migrate) { (void)m;(void)b;(void)g;(void)c; *did_migrate = demand_status == NV_OK; gpu_state.resident=gpu_after_mask; gpu_state.evicted=0; gpu_state_present=true; return demand_status; }
-static NV_STATUS notify_tools_and_process_flags(uvm_va_space_t *v, uvm_gpu_t *g, uvm_access_counter_buffer_t *a, NvU64 x, uvm_access_counter_buffer_entry_t **e, NvU32 n, NvU32 f, void *m) { (void)v;(void)g;(void)a;(void)x;(void)e;(void)n;(void)f;(void)m; return flags_status; }
+static bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *b, uvm_gpu_t *g, unsigned buffer, NvU64 submitted, NvU64 fresh) { (void)b;(void)g;(void)buffer;(void)submitted;(void)fresh; return allow_cpu_promotion; }
+static NV_STATUS service_notification_va_block_helper(struct mm_struct *m, uvm_va_block_t *b, uvm_gpu_t *g, uvm_access_counter_service_batch_context_t *c, bool allow, bool *did_migrate) { (void)m;(void)b;(void)g;(void)c; *did_migrate = demand_status == NV_OK && allow; gpu_state.resident=allow ? gpu_after_mask : 0; gpu_state.evicted=0; gpu_state_present=true; return demand_status; }
+static NV_STATUS notify_tools_and_process_flags(uvm_va_space_t *v, uvm_gpu_t *g, uvm_access_counter_buffer_t *a, NvU64 x, uvm_access_counter_buffer_entry_t **e, NvU32 n, NvU32 f, void *m) { (void)v;(void)g;(void)a;(void)x;(void)e;(void)n;(void)m; last_flags=f; return flags_status; }
 '''
     block_queue = text[text.index("#define UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY"):text.index("// Each page in a tracked physical range")]
     block_function = extract_function(text, "static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t")
@@ -172,6 +183,23 @@ int main(void) {
     uvm_va_space_t va={1,0}; uvm_gpu_t gpu={2,0}; uvm_gpu_va_space_t gva={&va,&gpu}; managed_t managed={true,42}; uvm_va_block_t block={.end=99,.id=7,.managed_range=&managed}; uvm_va_block_context_t context={0}; struct mm_struct mm={0}; demand_first_prefetch_queue_t queue={0};
     uvm_access_counter_buffer_entry_t entry={&va,&gpu,10,3}; uvm_access_counter_buffer_t access={0}; access.index=4; access.batch_service_context.batch_id=9; access.batch_service_context.notifications[0]=&entry; access.batch_service_context.num_notifications=1; access.batch_service_context.block_service_context.block_context=&context;
     NvU32 out=0;
+    // Denied managed-memory demand still clears its notification, never
+    // schedules a range copy, and enables the nonblocking freshness fence.
+    allow_cpu_promotion=false; demand_status=flags_status=NV_OK;
+    gpu_state.counter_admission=(counter_admission_t){.pending=true,.buffer=4,.clear_serial=12};
+    access.admission.submitted=80;
+    assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==NV_OK);
+    assert(!queue.count && !queue_count && last_flags==UVM_ACCESS_COUNTER_ACTION_BATCH_CLEAR);
+    assert(access.admission.tracking && gpu_state.counter_admission.pending);
+    // A failed clear cancels even an older pending serial, not just N+1.
+    flags_status=8;
+    assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==8);
+    assert(!gpu_state.counter_admission.pending && !queue.count);
+    gpu_state.counter_admission=(counter_admission_t){.pending=true,.buffer=4,.clear_serial=12};
+    demand_status=9;flags_status=NV_OK;
+    assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==9);
+    assert(!gpu_state.counter_admission.pending && !queue.count);
+    allow_cpu_promotion=true;
     demand_status=9; flags_status=NV_OK; queue_count=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==9); assert(queue.count==0 && queue_count==0); demand_first_prefetch_queue_discard(&queue);
     demand_status=NV_OK; flags_status=8; queue_count=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==8); assert(queue.count==0 && queue_count==0); demand_first_prefetch_queue_discard(&queue);
     demand_status=NV_OK; flags_status=NV_OK; queue_count=0; entry.counter_value=0; assert(service_notifications_in_block(&gva,&mm,&access,&block,NULL,0,&out,&queue)==NV_OK); assert(queue.count==0);
