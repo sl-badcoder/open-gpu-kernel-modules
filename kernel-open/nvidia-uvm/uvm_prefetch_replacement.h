@@ -149,6 +149,29 @@ static inline void uvm_prefetch_replacement_record_eviction(
         s->resident_bytes -= tracked_live_bytes;
 }
 
+// Logical GPU-state destruction is not eviction. Remove its live accounting
+// without inventing transferred bytes, and do not carry a previous workload's
+// control window/allowance into a fresh empty resident set.
+static inline void uvm_prefetch_replacement_forget_live(
+    uvm_prefetch_replacement_state_t *s, NvU64 bytes)
+{
+    s->resident_bytes = bytes >= s->resident_bytes ? 0 : s->resident_bytes - bytes;
+    if (s->resident_bytes)
+        return;
+    s->window_population_bytes = 0;
+    s->window_repopulated_bytes = 0;
+    s->window_short_quarter_bytes = 0;
+    s->window_short_half_bytes = 0;
+    s->window_short_budget_bytes = 0;
+    s->window_budget_bytes = 0;
+    s->last_population_bytes = 0;
+    s->last_short_quarter_bytes = 0;
+    s->request_stride = 1;
+    s->epoch_stamp = 0;
+    s->epoch_roots_used = 0;
+    s->epoch_roots_limit = 0;
+}
+
 // Bound eager reclamation in throttled mode. sampled_ns is an event/sample
 // epoch supplied by the caller; repeated calls in one epoch do not replenish
 // the quota. A zero timestamp intentionally grants no throttled quota.

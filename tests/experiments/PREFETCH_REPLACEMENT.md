@@ -89,6 +89,13 @@ A single oldest outstanding eviction stamp is kept per block, rather than a
 stamp per page. Later partial evictions can therefore have their distance
 conservatively overestimated. This can miss short returns; it does not falsely
 shorten them. Histories disappear when the logical block/GPU state is destroyed.
+Normal GPU-state destruction removes tracked live bytes. When the last tracked
+resident bytes disappear, the incomplete control window and VAB-epoch allowance
+reset while cumulative movement counters remain intact. This prevents one
+finished workload from inflating the next workload's residency normalization.
+After a standalone run exits, `turnover_resident_bytes` should return to its
+before-run value (usually zero); concurrent managed workloads can retain bytes.
+
 Accounting follows residency bookkeeping after successful submission, not DMA
 completion or measured PCIe wire bytes. Failed operations are not reconstructed.
 
@@ -165,6 +172,7 @@ python3 tests/experiments/test_replacement_integration.py
 python3 tests/experiments/test_replacement_worker.py
 python3 tests/experiments/test_replacement_requests.py
 python3 tests/experiments/test_pmm_cached_roots.py
+python3 tests/experiments/test_turnover_lifecycle.py
 python3 tests/experiments/test_demand_first_eviction.py
 python3 tests/experiments/test_monitor_uvm.py
 ```

@@ -345,10 +345,9 @@ void uvm_cpu_block_policy_forget_population(uvm_va_block_t *va_block, uvm_gpu_t 
     if (!state)
         return;
     bytes = (NvU64)uvm_page_mask_weight(&state->replacement_live) * PAGE_SIZE;
-    if (bytes) {
+    if (bytes || uvm_pmm_gpu_prefetch_turnover_enabled()) {
         uvm_spin_lock(&gpu->pmm.list_lock);
-        gpu->pmm.eager_eviction.replacement.resident_bytes -=
-            min(bytes, gpu->pmm.eager_eviction.replacement.resident_bytes);
+        uvm_prefetch_replacement_forget_live(&gpu->pmm.eager_eviction.replacement, bytes);
         uvm_spin_unlock(&gpu->pmm.list_lock);
     }
     uvm_page_mask_zero(&state->replacement_live);

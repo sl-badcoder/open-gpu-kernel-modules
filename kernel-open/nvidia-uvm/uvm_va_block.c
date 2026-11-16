@@ -9124,6 +9124,7 @@ static void block_destroy_gpu_state(uvm_va_block_t *block, uvm_va_block_context_
     block_gpu_unmap_phys_all_cpu_pages(block, gpu);
     uvm_processor_mask_clear(&block->evicted_gpus, id);
 
+    uvm_cpu_block_policy_forget_population(block, gpu);
     kmem_cache_free(g_uvm_va_block_gpu_state_cache, gpu_state);
     block->gpus[uvm_id_gpu_index(id)] = NULL;
 }
