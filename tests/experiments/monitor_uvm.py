@@ -62,7 +62,22 @@ def snapshot(gpu, gpu_fields=GPU_FIELDS):
               "monotonic_s": started, "metrics": {}, "raw": {}, "errors": {}}
     metrics = result["metrics"]
     paths = sorted((ROOT / "sys/module/nvidia_uvm/parameters").glob("*"))
-    paths += sorted((ROOT / "proc/driver/nvidia-uvm/gpus").glob("*/*/vab"))
+    gpu_dir = ROOT / "proc/driver/nvidia-uvm/gpus"
+    # scandir reports permission errors which Path.glob can silently suppress.
+    # Canonical UUID directories avoid duplicate readings through GPU symlinks.
+    try:
+        with os.scandir(gpu_dir) as entries:
+            parents = sorted(Path(e.path) for e in entries if e.is_dir(follow_symlinks=False))
+        result["vab_gpu_directories"] = [p.name for p in parents]
+        for parent in parents:
+            try:
+                with os.scandir(parent) as entries:
+                    paths += sorted(Path(e.path) / "vab" for e in entries
+                                    if e.is_dir(follow_symlinks=False) and e.name.isdigit())
+            except OSError as exc:
+                result["errors"][str(parent)] = str(exc)
+    except OSError as exc:
+        result["errors"][str(gpu_dir)] = str(exc)
     paths += [ROOT / "proc/meminfo", ROOT / "proc/vmstat", ROOT / "proc/loadavg",
               ROOT / "proc/stat"]
     for path in paths:
@@ -97,7 +112,9 @@ def snapshot(gpu, gpu_fields=GPU_FIELDS):
                     suffix = "_kib" if len(fields) == 3 and fields[2] == "kB" else ""
                     metrics["host/" + path.name + "/" + fields[0] + suffix] = value(fields[1])
     if not any(k.startswith("vab/") for k in metrics):
-        result["errors"]["vab"] = "No readable VAB statistics found"
+        result["errors"]["vab"] = (
+            "No readable VAB statistics now; GPU entries may appear only while a CUDA/UVM "
+            "context is registered. Discovery/read errors, if any, are recorded separately.")
     if not any(k.startswith("module/") for k in metrics):
         result["errors"]["module"] = "No readable nvidia_uvm module parameters found"
     query = command(["nvidia-smi", "-i", gpu,
@@ -190,12 +207,19 @@ def main(argv=None):
         writer.writerow(["timestamp_utc", "elapsed_s", "collection_seconds", "metric", "value",
                          "counter_change", "counter_per_second", "reset_detected"])
         previous = None
+        observed = {}
         def record(item):
             nonlocal previous
             samples.write(json.dumps(item) + "\n")
             samples.flush()
             deltas = {r["metric"]: r for r in differences(previous, item)} if previous else {}
             for key, val in sorted(item["metrics"].items()):
+                if isinstance(val, (int, float)):
+                    reading = {"monotonic_s": item["monotonic_s"], "metrics": {key: val}}
+                    if key not in observed:
+                        observed[key] = [reading, reading]
+                    else:
+                        observed[key][1] = reading
                 change = deltas.get(key, {})
                 is_counter = change.get("kind") == "counter"
                 writer.writerow([item["timestamp_utc"], item["monotonic_s"] - before["monotonic_s"],
@@ -266,7 +290,19 @@ def main(argv=None):
                 delta_writer = csv.DictWriter(changes, fieldnames=columns)
                 delta_writer.writeheader()
                 delta_writer.writerows(rows)
-            delta = {r["metric"]: r["change"] for r in rows if r["kind"] == "counter"}
+            observed_rows = []
+            for key, (first, last) in sorted(observed.items()):
+                row = differences(first, last)[0]
+                row["first_seen_elapsed_s"] = first["monotonic_s"] - before["monotonic_s"]
+                row["last_seen_elapsed_s"] = last["monotonic_s"] - before["monotonic_s"]
+                row["observation_span_s"] = last["monotonic_s"] - first["monotonic_s"]
+                observed_rows.append(row)
+            with (out / "observed_changes.csv").open("w", newline="") as changes:
+                observed_writer = csv.DictWriter(changes, fieldnames=columns + [
+                    "first_seen_elapsed_s", "last_seen_elapsed_s", "observation_span_s"])
+                observed_writer.writeheader()
+                observed_writer.writerows(observed_rows)
+            delta = {r["metric"]: r["change"] for r in observed_rows if r["kind"] == "counter"}
             ratios = {}
             for key in delta:
                 if not key.endswith("/prefetch_refault_returns"):
@@ -281,8 +317,10 @@ def main(argv=None):
             write_json(out / "summary.json", {
                 "exit_code": exit_code, "snapshot_span_seconds": after["monotonic_s"] - before["monotonic_s"],
                 "pcie_sampler_exit_code": dmon.returncode if dmon else None,
-                "changes": rows, "derived": ratios,
+                "changes": rows, "observed_changes": observed_rows, "derived": ratios,
+                "vab_seen": any(k.startswith("vab/") for k in observed),
                 "notes": ["Counters are driver-wide, not exclusive to this process.",
+                          "Observed changes use first/last available readings; check their coverage times.",
                           "Samples include model loading, warmup, all repeats, and teardown.",
                           "Byte counters describe driver bookkeeping, not measured PCIe wire bytes.",
                           "Rates use the complete before/after interval, not inference-only time."]})
