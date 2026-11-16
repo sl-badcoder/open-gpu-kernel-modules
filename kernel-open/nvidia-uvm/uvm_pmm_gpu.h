@@ -212,6 +212,10 @@ typedef struct {
     NvU64 prefetch_off;
     NvU64 prefetch_pressure_pauses;
     NvU64 replacement_enabled;
+    NvU64 replacement_cached_free_bytes;
+    NvU64 replacement_usable_free_bytes;
+    NvU64 background_cached_root_releases;
+    NvU64 background_allocated_root_releases;
     NvU64 turnover_enabled;
     NvU64 replacement_pending_roots;
     NvU64 replacement_requests;
@@ -503,6 +507,9 @@ typedef struct uvm_pmm_gpu_struct
         // Updates are protected by 'list_lock', but it can be queried outside
         // of the critical section.
         long pinned_count;
+        // Whole USER roots available in PMM free lists, excluding roots
+        // already selected for eviction. Maintained under list_lock.
+        NvU64 cached_free_root_count;
     } root_chunks;
 
     // Lock protecting PMA allocation, freeing and eviction
@@ -543,6 +550,8 @@ typedef struct uvm_pmm_gpu_struct
         NvU64 replacement_unknown_recency_roots;
         NvU64 selection_ns;
         NvU64 drain_ns;
+        NvU64 cached_root_releases;
+        NvU64 allocated_root_releases;
         bool active;
         bool recovering_watermark;
         bool stopping;

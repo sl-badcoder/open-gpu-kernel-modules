@@ -42,10 +42,12 @@ class MonitorTest(unittest.TestCase):
     def test_replacement_counters_and_gauges(self):
         counters = ("turnover_trigger_population_bytes", "turnover_repopulated_bytes",
                     "turnover_short_quarter_bytes", "replacement_selection_ns",
-                    "replacement_freed_roots", "turnover_epoch_pauses")
+                    "replacement_freed_roots", "turnover_epoch_pauses",
+                    "background_cached_root_releases", "background_allocated_root_releases")
         gauges = ("turnover_resident_bytes", "replacement_pending_roots",
                   "turnover_request_stride", "turnover_last_population_bytes",
-                  "turnover_epoch_roots_used", "turnover_epoch_roots_limit")
+                  "turnover_epoch_roots_used", "turnover_epoch_roots_limit",
+                  "replacement_cached_free_bytes", "replacement_usable_free_bytes")
         for name in counters + gauges:
             key = "vab/GPU/0/" + name
             row = monitor.differences({"monotonic_s": 0, "metrics": {key: 4}},

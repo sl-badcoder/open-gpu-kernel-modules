@@ -18,17 +18,20 @@ typedef uint64_t NvU64; typedef unsigned NvU32;
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define min(a,b) ((a)<(b)?(a):(b))
 #define max(a,b) ((a)>(b)?(a):(b))
+#define clamp(a,b,c) min(max(a,b),c)
 #define DIV_ROUND_UP_ULL(n,d) (((n)+(d)-1)/(d))
 #define READ_ONCE(x) (x)
-typedef struct { NvU64 demand_reserve_bytes; } uvm_prefetch_budget_config_t;
+typedef struct { NvU64 demand_reserve_bytes, limit_bytes; } uvm_prefetch_budget_config_t;
 typedef struct { NvU64 sampled_ns; bool valid; } uvm_vab_snapshot_t;
 typedef struct { uvm_prefetch_replacement_state_t replacement; int list_lock; NvU64 replacement_roots, replacement_freed_roots; unsigned prefetch_count; bool active; } eager_t;
 typedef struct { NvU64 numFreePages64k; } pma_stats_t;
-typedef struct { eager_t eager_eviction; pma_stats_t *pma_stats; int list_lock; } uvm_pmm_gpu_t;
+typedef struct { eager_t eager_eviction; pma_stats_t *pma_stats; int list_lock; struct {NvU64 cached_free_root_count;} root_chunks; } uvm_pmm_gpu_t;
 typedef struct { int unused; } uvm_parent_gpu_t;
-typedef struct { uvm_parent_gpu_t *parent; } uvm_gpu_t;
+typedef struct { uvm_parent_gpu_t *parent; struct {struct {bool enabled;} numa;} mem_info; } uvm_gpu_t;
 static uvm_gpu_t mock_gpu; static pma_stats_t stats;
-static uvm_prefetch_budget_config_t config = {.demand_reserve_bytes = 4ULL << 20};
+static uvm_prefetch_budget_config_t config = {.demand_reserve_bytes = 4ULL << 20, .limit_bytes=32ULL<<20};
+static bool uvm_perf_prefetch_replacement_enable=true;
+static NvU64 uvm_prefetch_budget_limit(NvU64 n) {return n-n%UVM_CHUNK_SIZE_MAX;}
 static unsigned batch_calls, batch_limit, batch_low, batch_result;
 static NvU64 sample_epoch = 123;
 static uvm_prefetch_budget_config_t speculative_prefetch_config(void) { return config; }
@@ -36,19 +39,20 @@ static uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *p) { (void)p; return &mock_gpu; 
 static void uvm_gpu_vab_get_snapshot(uvm_parent_gpu_t *p, uvm_vab_snapshot_t *s) { (void)p; s->valid=true; s->sampled_ns=sample_epoch; }
 static void uvm_spin_lock(int *l) { assert(!*l); *l=1; }
 static void uvm_spin_unlock(int *l) { assert(*l); *l=0; }
+static void uvm_assert_spinlock_locked(int *l) {assert(*l);}
 static unsigned eager_eviction_batch(uvm_pmm_gpu_t *p, unsigned limit, unsigned low)
 { assert(p->eager_eviction.active && !p->list_lock); assert(batch_result<=limit); ++batch_calls; batch_limit=limit; batch_low=low; return batch_result; }
 '''
 CASES = r'''
 static uvm_pmm_gpu_t p;
-static void reset(void) { memset(&p,0,sizeof(p)); memset(&stats,0,sizeof(stats)); p.pma_stats=&stats; batch_calls=batch_limit=batch_low=batch_result=0; p.eager_eviction.replacement_roots=4; p.eager_eviction.replacement.request_stride=1; }
+static void reset(void) { memset(&p,0,sizeof(p)); memset(&stats,0,sizeof(stats)); p.pma_stats=&stats; batch_calls=batch_limit=batch_low=batch_result=0;config.demand_reserve_bytes=4ULL<<20; p.eager_eviction.replacement_roots=4; p.eager_eviction.replacement.request_stride=1; }
 int main(void)
 {
- reset(); stats.numFreePages64k=128; replacement_eviction_work(&p,8); assert(!batch_calls && p.eager_eviction.replacement_roots==0);
+ reset(); stats.numFreePages64k=512; replacement_eviction_work(&p,8); assert(!batch_calls && p.eager_eviction.replacement_roots==0);
  reset(); p.eager_eviction.prefetch_count=1; replacement_eviction_work(&p,8); assert(!batch_calls);
- reset(); stats.numFreePages64k=0; batch_result=2; replacement_eviction_work(&p,8); assert(batch_calls==1 && batch_limit==3 && batch_low==0); assert(p.eager_eviction.replacement_freed_roots==2 && p.eager_eviction.replacement_roots==2 && !p.eager_eviction.active);
+ reset(); stats.numFreePages64k=0; batch_result=2; replacement_eviction_work(&p,8); assert(batch_calls==1 && batch_limit==4 && batch_low==0); assert(p.eager_eviction.replacement_freed_roots==2 && p.eager_eviction.replacement_roots==2 && !p.eager_eviction.active);
  reset(); p.eager_eviction.replacement_roots=0; replacement_eviction_work(&p,8); assert(!batch_calls);
- reset(); stats.numFreePages64k=0; p.eager_eviction.replacement_roots=16; batch_result=3; replacement_eviction_work(&p,64); assert(batch_limit==3 && p.eager_eviction.replacement_freed_roots==3 && p.eager_eviction.replacement_roots==13);
+ reset(); stats.numFreePages64k=0; p.eager_eviction.replacement_roots=16; batch_result=16; replacement_eviction_work(&p,64); assert(batch_limit==16 && p.eager_eviction.replacement_freed_roots==16 && p.eager_eviction.replacement_roots==0);
  reset(); p.eager_eviction.replacement_roots=16; config.demand_reserve_bytes=64ULL<<20; batch_result=16; replacement_eviction_work(&p,64); assert(batch_limit==16 && !p.eager_eviction.replacement_roots);
  reset(); batch_result=1; replacement_eviction_work(&p,1); assert(batch_limit==1 && p.eager_eviction.replacement_roots==3);
  reset(); batch_result=0; replacement_eviction_work(&p,8); assert(batch_calls==1 && p.eager_eviction.replacement_roots==4 && !p.eager_eviction.active && !p.eager_eviction.replacement.epoch_roots_used);
@@ -56,6 +60,8 @@ int main(void)
  replacement_eviction_work(&p,8); assert(batch_limit==1 && p.eager_eviction.replacement.epoch_roots_used==1);
  replacement_eviction_work(&p,8); assert(batch_calls==1 && !p.eager_eviction.active);
  ++sample_epoch; replacement_eviction_work(&p,8); assert(batch_calls==2 && p.eager_eviction.replacement_roots==2);
+ reset(); stats.numFreePages64k=32; p.root_chunks.cached_free_root_count=32;
+ replacement_eviction_work(&p,8); assert(!batch_calls&&!p.eager_eviction.replacement_roots);
  assert(!p.list_lock);
  puts("Production replacement worker: request bounds, mutual exclusion, failure and epoch quota passed.");
  return 0;
@@ -67,9 +73,12 @@ def main():
     replacement = (ROOT / 'kernel-open/nvidia-uvm/uvm_prefetch_replacement.h').read_text()
     # The extraction only needs the worker; the replacement helpers are pasted
     # before it so the quota/consume calls are compiled as production code.
-    code = PRELUDE.replace('typedef struct { uvm_prefetch_replacement_state_t replacement;', 'typedef struct { uvm_prefetch_replacement_state_t replacement;')
-    code = code.replace('typedef struct { NvU64 demand_reserve_bytes;', replacement + '\ntypedef struct { NvU64 demand_reserve_bytes;')
-    code += function(source, 'replacement_eviction_work') + CASES
+    code = PRELUDE.replace('typedef struct { NvU64 demand_reserve_bytes, limit_bytes;',
+                           replacement + '\ntypedef struct { NvU64 demand_reserve_bytes, limit_bytes;')
+    for name in ('prefetch_cached_free_bytes_locked', 'prefetch_free_bytes_locked',
+                 'replacement_refill_bytes', 'replacement_eviction_work'):
+        code += function(source, name)
+    code += CASES
     with tempfile.TemporaryDirectory(prefix='replacement-worker-') as directory:
         c=Path(directory)/'test.c'; binary=Path(directory)/'test'; c.write_text(code)
         subprocess.run(['cc','-std=c11','-O1','-Wall','-Wextra','-Werror','-Wno-unused-function','-fsanitize=address,undefined','-g',str(c),'-o',str(binary)],check=True)

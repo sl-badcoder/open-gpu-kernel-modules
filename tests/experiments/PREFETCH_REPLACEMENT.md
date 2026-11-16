@@ -42,13 +42,23 @@ The replacement policy has its own byte-based hysteresis described below.
 A successfully admitted access-counter callback first tries the existing bounded
 population reservation. If it fails because there is less than the configured
 reserve plus outstanding reservations plus one 2 MiB population quantum, it
-records a coalesced reclaim request. Failure of the speculative inflight limit
+records a coalesced reclaim request. In replacement mode, usable free bytes
+include PMA-free memory plus whole USER roots cached by PMM. The cache count is
+maintained under the existing list lock, with no free-list scan per notification.
+NUMA roots are not credited because external page references can prevent reuse.
+Failure of the speculative inflight limit
 alone never requests eviction. Requests retain no VA-block pointer.
 
 The worker rechecks current headroom. It reclaims at most the space needed for
-one population quantum above the reserve, bounded by the configured eviction
-batch and a hard 16-root pass limit. It uses the existing VAB-cold picker and
-minimum-residency protection. It does not drain to the low watermark. Population
+a bounded refill window above the reserve: the lesser of the configured
+speculative byte limit and eviction batch, with a hard 16-root limit (32 MiB
+with the default settings). This avoids a worker round trip per 2 MiB copy.
+Outstanding reservations are still subtracted and the inflight byte cap remains
+unchanged. It uses the existing VAB-cold picker and
+minimum-residency protection. Request-driven reclaim skips already-free cached
+roots: returning them to PMA does not increase combined usable headroom. Native
+mandatory eviction and legacy eager recovery retain cache draining. It does not
+drain to the low watermark. Population
 submissions and background reclaim remain mutually exclusive. Native mandatory
 PMA/demand eviction remains unchanged.
 
@@ -106,6 +116,13 @@ capture new `/proc/driver/nvidia-uvm/gpus/GPU-.../0/vab` fields. No additional
 monitor command is needed. Important values:
 
 * `replacement_enabled`, `turnover_enabled`: effective experiment settings.
+* `replacement_cached_free_bytes`: usable whole USER roots in PMM's cache.
+* `replacement_usable_free_bytes`: headroom source before reserve/reservation
+  subtraction (combined PMA/cache bytes in replacement mode, PMA-only in baseline).
+* `background_cached_root_releases`, `background_allocated_root_releases`:
+  successful background releases selected from already-free cache versus allocated
+  roots. Allocated roots can include unused VA backing; use eviction-byte counters
+  for the managed-residency scope. Replacement mode should not release cached roots.
 * `turnover_population_bytes`, `turnover_trigger_population_bytes`,
   `turnover_repopulated_bytes`, `turnover_evicted_bytes`: cumulative residency
   bookkeeping, not PCIe bytes. Repopulation total includes neighbors.
@@ -147,6 +164,7 @@ python3 tests/experiments/test_prefetch_replacement.py
 python3 tests/experiments/test_replacement_integration.py
 python3 tests/experiments/test_replacement_worker.py
 python3 tests/experiments/test_replacement_requests.py
+python3 tests/experiments/test_pmm_cached_roots.py
 python3 tests/experiments/test_demand_first_eviction.py
 python3 tests/experiments/test_monitor_uvm.py
 ```

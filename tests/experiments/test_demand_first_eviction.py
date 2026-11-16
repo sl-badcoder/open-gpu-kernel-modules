@@ -8,7 +8,8 @@ import tempfile
 ROOT = Path(__file__).parents[2]
 
 def function(source, name):
-    match = re.search(r"^(?:static [^\n]*|void |NvU64 )\b" + name + r"\(", source, re.M)
+    match = re.search(r"^(?:static [^\n]*|void |NvU64 )\b" + name +
+                      r"\([^;{]*\)\s*\{", source, re.M)
     if match is None:
         raise ValueError(name)
     start = match.start()
@@ -41,6 +42,7 @@ typedef int NV_STATUS;
 #define PMM_CONTEXT_DEFAULT 0
 #define UVM_PMM_GPU_MEMORY_TYPE_USER 0
 #define UVM_PMM_GPU_CHUNK_STATE_ALLOCATED 1
+#define UVM_PMM_GPU_CHUNK_STATE_FREE 0
 #define UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT 2
 #define UVM_CHUNK_SIZE_MAX 2097152
 #define UVM_PMM_LIST_NO_ZERO 0
@@ -71,7 +73,7 @@ typedef struct { uvm_gpu_chunk_t chunk; NvU64 vab_generation,vab_ready_generatio
 typedef struct { int dummy; } uvm_parent_gpu_t;
 typedef struct { uvm_parent_gpu_t *parent; struct { NvU64 size; } mem_info; } uvm_gpu_t;
 static uvm_gpu_t mock_gpu;
-typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; uvm_prefetch_refault_t refault; uvm_prefetch_replacement_state_t replacement; unsigned replacement_roots; NvU64 replacement_requests, replacement_freed_roots, replacement_accessed_roots, replacement_unknown_recency_roots, selection_ns, drain_ns; struct {NvU64 events, confirmations, replacements, predictions, learned_predictions, expirations;} patterns; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
+typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; uvm_prefetch_refault_t refault; uvm_prefetch_replacement_state_t replacement; unsigned replacement_roots; NvU64 replacement_requests, replacement_freed_roots, replacement_accessed_roots, replacement_unknown_recency_roots, selection_ns, drain_ns, cached_root_releases, allocated_root_releases; struct {NvU64 events, confirmations, replacements, predictions, learned_predictions, expirations;} patterns; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
 static uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *p) {(void)p; return &mock_gpu;}
 static uvm_vab_snapshot_t mock_snapshot;
 static unsigned snapshot_calls;
@@ -107,6 +109,8 @@ static void chunk_start_eviction(uvm_pmm_gpu_t *p,uvm_gpu_chunk_t *c) {
 static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *p,uvm_gpu_root_chunk_t *r,int context) {
     assert(p->lock && !p->list_lock && r->chunk.claimed && context==PMM_CONTEXT_DEFAULT);++evictions;return fail_at && evictions==fail_at ? 1 : migration_status;
 }
+static NvU64 prefetch_cached_free_bytes_locked(uvm_pmm_gpu_t *p) {(void)p;return 0;}
+static NvU64 prefetch_free_bytes_locked(uvm_pmm_gpu_t *p) {(void)p;return 0;}
 static unsigned eager_eviction_usage_percent(uvm_pmm_gpu_t *p) {(void)p;return mock_usage;}
 static unsigned eager_eviction_usage_percent_pending(uvm_pmm_gpu_t *p,unsigned pending) {(void)p;return mock_usage-pending;}
 static void free_root_chunk(uvm_pmm_gpu_t *p,uvm_gpu_root_chunk_t *r,int mode) {assert(!p->lock && !p->list_lock && r->chunk.claimed && mode==0);++freed;--mock_usage;}
@@ -119,6 +123,7 @@ static void reset(void){
  memset(&p,0,sizeof(p));memset(roots,0,sizeof(roots));memset(&mock_snapshot,0,sizeof(mock_snapshot));
  mock_now=1000000000ULL;uvm_perf_vab_min_residency_ms=100;
  visits=evictions=freed=fail_at=0;mock_usage=100;migration_status=0;snapshot_calls=0;
+ uvm_perf_prefetch_replacement_enable=false;
  memset(mock_recency,0,sizeof(mock_recency));mock_recency_race=false;
  mock_snapshot.valid=true;mock_snapshot.eviction_enabled=true;mock_snapshot.lru_enabled=true;
  mock_snapshot.sampled_ns=mock_now;mock_snapshot.linear_base=0;mock_snapshot.granularity=5;
@@ -173,6 +178,14 @@ int main(void){
  uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[3]);uvm_mutex_unlock(&p.lock);
  uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[2]);uvm_mutex_unlock(&p.lock);
  uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[1]);uvm_mutex_unlock(&p.lock);
+ // Replacement must skip cached roots, while mandatory demand can drain them.
+ reset();add(0,2);p.free_list[0].first=&roots[3].chunk;roots[3].chunk.state=0;
+ uvm_perf_prefetch_replacement_enable=true;
+ assert(eager_eviction_one(&p,&out)&&out==&roots[0]);
+ assert(p.eager_eviction.allocated_root_releases==1&&!p.eager_eviction.cached_root_releases);
+ uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[3]);uvm_mutex_unlock(&p.lock);
+ reset();p.free_list[0].first=&roots[3].chunk;roots[3].chunk.state=0;
+ assert(eager_eviction_one(&p,&out)&&out==&roots[3]&&p.eager_eviction.cached_root_releases==1);
  // Completed frees and failures are counted separately; batches stop at low.
  reset();for(unsigned i=0;i<5;++i)add(i,2);
  assert(eager_eviction_batch(&p,16,98)==2&&p.vab_stats.background_roots_freed==2);

@@ -24,6 +24,7 @@ GPU_FIELDS = ("uuid", "name", "memory.total", "memory.used", "memory.free",
 COUNTERS = set("""samples dump_errors pm_skips rising_bits falling_bits unchanged_samples
 selected_hot selected_cold selected_unknown background_roots_freed background_failures
 selection_changes selection_fallbacks background_hot_skips background_unknown_skips
+background_cached_root_releases background_allocated_root_releases
 replacement_requests replacement_freed_roots replacement_accessed_roots
 replacement_unknown_recency_roots replacement_selection_ns replacement_drain_ns
 turnover_population_bytes turnover_trigger_population_bytes turnover_repopulated_bytes

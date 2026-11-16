@@ -431,6 +431,10 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
                    "refault_distance_admission" : "rapid_return_locality_hysteresis");
     seq_printf(s, "prefetch_backoff_enabled %llu\n", roots.prefetch_backoff_enabled);
     seq_printf(s, "replacement_enabled %llu\n", roots.replacement_enabled);
+    seq_printf(s, "replacement_cached_free_bytes %llu\n", roots.replacement_cached_free_bytes);
+    seq_printf(s, "replacement_usable_free_bytes %llu\n", roots.replacement_usable_free_bytes);
+    seq_printf(s, "background_cached_root_releases %llu\n", roots.background_cached_root_releases);
+    seq_printf(s, "background_allocated_root_releases %llu\n", roots.background_allocated_root_releases);
     seq_printf(s, "turnover_enabled %llu\n", roots.turnover_enabled);
     seq_printf(s, "replacement_pending_roots %llu\n", roots.replacement_pending_roots);
     seq_printf(s, "replacement_requests %llu\n", roots.replacement_requests);
