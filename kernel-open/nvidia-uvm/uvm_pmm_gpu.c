@@ -191,6 +191,7 @@ static unsigned uvm_perf_eager_eviction_interval_ms = 25;
 static unsigned uvm_perf_eager_eviction_batch_count = 16;
 // Fixed completion grace, independent of access heat or migration history.
 static unsigned uvm_perf_vab_min_residency_ms = 100;
+static bool uvm_perf_prefetch_replacement_enable;
 static unsigned uvm_perf_speculative_prefetch_limit_mb = 32;
 static unsigned uvm_perf_speculative_prefetch_reserve_mb = 64;
 static bool uvm_perf_speculative_prefetch_backoff_enable = false;
@@ -234,6 +235,9 @@ MODULE_PARM_DESC(uvm_perf_speculative_prefetch_churn_ms, "Each rapid-return obse
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_return_percent, "Mature speculative block rapid-return percentage triggering backoff (default 50; clamped to 1..100).");
 MODULE_PARM_DESC(uvm_perf_speculative_prefetch_min_blocks, "Minimum mature speculative blocks per ratio decision (default 32; minimum 1).");
 module_param(uvm_perf_vab_min_residency_ms, uint, S_IRUGO);
+module_param(uvm_perf_prefetch_replacement_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_prefetch_replacement_enable,
+                 "Experimental request-driven cold-root replacement with bounded reclaim (default false; requires eager eviction).");
 MODULE_PARM_DESC(uvm_perf_vab_min_residency_ms, "Minimum completed residency before VAB background selection (default 100 ms).");
 
 module_param(uvm_perf_eager_eviction_enable, bool, S_IRUGO);
@@ -492,6 +496,11 @@ static void chunk_pin(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     // the interrupt context when called from devmem_page_free().
 
     UVM_ASSERT(chunk->state != UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
+    if (chunk_is_root_chunk(chunk) && uvm_gpu_chunk_is_user(chunk) &&
+        chunk->state == UVM_PMM_GPU_CHUNK_STATE_FREE && !root_chunk->chunk.in_eviction) {
+        UVM_ASSERT(pmm->root_chunks.cached_free_root_count > 0);
+        --pmm->root_chunks.cached_free_root_count;
+    }
     chunk->state = UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED;
 
 
@@ -538,6 +547,10 @@ static void chunk_unpin(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_pmm_gpu_
     UVM_ASSERT(new_state != UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
 
     chunk->state = new_state;
+
+    if (chunk_is_root_chunk(chunk) && uvm_gpu_chunk_is_user(chunk) &&
+        new_state == UVM_PMM_GPU_CHUNK_STATE_FREE && !root_chunk->chunk.in_eviction)
+        ++pmm->root_chunks.cached_free_root_count;
 
     if (chunk_is_root_chunk(chunk)) {
         --pmm->root_chunks.pinned_count;
@@ -1518,6 +1531,10 @@ static void chunk_start_eviction(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     UVM_ASSERT(!list_empty(&chunk->list));
 
     list_del_init(&chunk->list);
+    if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_FREE && uvm_gpu_chunk_is_user(chunk)) {
+        UVM_ASSERT(pmm->root_chunks.cached_free_root_count > 0);
+        --pmm->root_chunks.cached_free_root_count;
+    }
     uvm_gpu_chunk_set_in_eviction(chunk, true);
     ++pmm->root_chunks.in_eviction_count;
 }
@@ -1671,14 +1688,19 @@ static uvm_gpu_root_chunk_t *vab_pick_root(uvm_pmm_gpu_t *pmm, const uvm_vab_sna
 
     // Check if there are root chunks sitting in the free lists. Non-zero
     // chunks are preferred.
-    chunk = list_first_chunk(find_free_list(pmm,
+    chunk = NULL;
+    // Request-driven reclaim must increase total usable headroom. Returning
+    // an already-free PMM root to PMA merely transfers the same free bytes.
+    // Mandatory/PMA eviction and legacy eager recovery retain cache draining.
+    if (!vab_only || !uvm_perf_prefetch_replacement_enable)
+        chunk = list_first_chunk(find_free_list(pmm,
                                             UVM_PMM_GPU_MEMORY_TYPE_USER,
                                             UVM_CHUNK_SIZE_MAX,
                                             UVM_PMM_LIST_NO_ZERO));
     if (chunk)
         UVM_ASSERT(!chunk->is_zero);
 
-    if (!chunk) {
+    if (!chunk && (!vab_only || !uvm_perf_prefetch_replacement_enable)) {
         chunk = list_first_chunk(find_free_list(pmm,
                                                 UVM_PMM_GPU_MEMORY_TYPE_USER,
                                                 UVM_CHUNK_SIZE_MAX,
@@ -1821,7 +1843,8 @@ bool uvm_pmm_gpu_counter_admission_pressure(uvm_pmm_gpu_t *pmm, unsigned high)
     bool pressure;
     uvm_spin_lock(&pmm->list_lock);
     pressure = eager_eviction_usage_percent(pmm) >= high ||
-               pmm->eager_eviction.recovering_watermark || pmm->eager_eviction.active;
+               (!uvm_perf_prefetch_replacement_enable && pmm->eager_eviction.recovering_watermark) ||
+               pmm->eager_eviction.active;
     uvm_spin_unlock(&pmm->list_lock);
     return pressure;
 }
@@ -1833,6 +1856,9 @@ static bool eager_eviction_prefetch_blocked_locked(uvm_pmm_gpu_t *pmm)
     unsigned usage = eager_eviction_usage_percent(pmm);
 
     uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    if (uvm_perf_prefetch_replacement_enable)
+        return pmm->eager_eviction.active;
 
     if (usage >= high)
         pmm->eager_eviction.recovering_watermark = true;
@@ -2012,24 +2038,76 @@ void uvm_pmm_gpu_prefetch_pressure_pause(uvm_pmm_gpu_t *pmm)
     uvm_spin_unlock(&pmm->list_lock);
 }
 
+static NvU64 prefetch_cached_free_bytes_locked(uvm_pmm_gpu_t *pmm)
+{
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+    // NUMA free roots can carry elevated external page references and may
+    // not be claimable. Do not credit them without checking every root.
+    if (uvm_pmm_to_gpu(pmm)->mem_info.numa.enabled)
+        return 0;
+    return pmm->root_chunks.cached_free_root_count * (NvU64)UVM_CHUNK_SIZE_MAX;
+}
+
+static NvU64 prefetch_free_bytes_locked(uvm_pmm_gpu_t *pmm)
+{
+    NvU64 free_bytes = pmm->pma_stats ?
+                          READ_ONCE(pmm->pma_stats->numFreePages64k) * (NvU64)UVM_PAGE_SIZE_64K : 0;
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+    if (uvm_perf_prefetch_replacement_enable)
+        free_bytes += prefetch_cached_free_bytes_locked(pmm);
+    return free_bytes;
+}
+
+static NvU64 replacement_refill_bytes(const uvm_prefetch_budget_config_t *config, unsigned batch_count)
+{
+    // Refill enough for a bounded burst, rather than forcing a new worker
+    // round trip for each 2 MiB population. The inflight reservation cap is
+    // independent and remains enforced by uvm_prefetch_budget_reserve().
+    NvU64 limit = max((NvU64)UVM_CHUNK_SIZE_MAX, uvm_prefetch_budget_limit(config->limit_bytes));
+    return min(limit, (NvU64)clamp(batch_count, 1U, 16U) * UVM_CHUNK_SIZE_MAX);
+}
+
 NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
                                                NvU64 requested_bytes,
                                                uvm_prefetch_reservation_t *reservation)
 {
     uvm_prefetch_budget_config_t config = speculative_prefetch_config();
     bool blocked;
+    bool request_reclaim = false;
     NvU64 granted = 0;
 
     memset(reservation, 0, sizeof(*reservation));
     uvm_spin_lock(&pmm->list_lock);
     blocked = eager_eviction_supported(pmm) && eager_eviction_prefetch_blocked_locked(pmm);
     if (!blocked) {
-        NvU64 free_bytes = pmm->pma_stats ?
-                              READ_ONCE(pmm->pma_stats->numFreePages64k) * (NvU64)UVM_PAGE_SIZE_64K : 0;
+        NvU64 free_bytes = prefetch_free_bytes_locked(pmm);
+        NvU64 pressure_pauses = pmm->eager_eviction.budget.pressure_pauses;
         granted = uvm_prefetch_budget_reserve(&pmm->eager_eviction.budget, &config,
                                                requested_bytes, free_bytes, NV_GETTIME(), reservation);
         if (granted)
             ++pmm->eager_eviction.prefetch_count;
+        else if (uvm_perf_prefetch_replacement_enable && eager_eviction_supported(pmm) &&
+                 pmm->eager_eviction.budget.pressure_pauses != pressure_pauses) {
+            // Under list_lock, reserve increments pressure_pauses only when
+            // its headroom check rejects. OFF/window/cap policy denials must
+            // not evict data for a population which cannot be admitted.
+            NvU64 needed = config.demand_reserve_bytes + pmm->eager_eviction.budget.reserved_bytes +
+                           UVM_CHUNK_SIZE_MAX;
+            // A denial of the speculative byte limit is not a space shortage.
+            if (free_bytes < needed) {
+                unsigned limit = clamp(uvm_perf_eager_eviction_batch_count, 1U, 16U);
+                NvU64 target = config.demand_reserve_bytes + pmm->eager_eviction.budget.reserved_bytes +
+                               replacement_refill_bytes(&config, limit);
+                NvU64 roots = DIV_ROUND_UP_ULL(target - free_bytes, UVM_CHUNK_SIZE_MAX);
+                // Preserve the whole bounded shortfall, not just one work
+                // batch. Otherwise an empty reserve needs repeated denials
+                // to make progress before any population can be admitted.
+                request_reclaim = pmm->eager_eviction.replacement_roots == 0;
+                pmm->eager_eviction.replacement_roots =
+                    max(pmm->eager_eviction.replacement_roots, (unsigned)min(roots, (NvU64)0xffffffffU));
+                ++pmm->eager_eviction.replacement_requests;
+            }
+        }
     }
     else {
         ++pmm->eager_eviction.budget.denials;
@@ -2039,7 +2117,11 @@ NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
     }
     uvm_spin_unlock(&pmm->list_lock);
 
-    if (blocked)
+    // Expedite only a newly pending request. Repeated denials must not turn
+    // an unsuccessful cold scan into a busy loop between VAB samples.
+    if (request_reclaim && !READ_ONCE(pmm->eager_eviction.stopping))
+        mod_delayed_work(system_wq, &pmm->eager_eviction.work, 0);
+    else if (blocked && !uvm_perf_prefetch_replacement_enable)
         eager_eviction_schedule(pmm, 0);
 
     return granted;
@@ -2058,7 +2140,9 @@ void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm,
     uvm_prefetch_budget_complete(&pmm->eager_eviction.budget, &config, reservation,
                                  transferred_bytes, success, NV_GETTIME());
     --pmm->eager_eviction.prefetch_count;
-    resume_recovery = !pmm->eager_eviction.prefetch_count && pmm->eager_eviction.recovering_watermark;
+    resume_recovery = !pmm->eager_eviction.prefetch_count &&
+                      (uvm_perf_prefetch_replacement_enable ? pmm->eager_eviction.replacement_roots != 0 :
+                                                             pmm->eager_eviction.recovering_watermark);
     uvm_spin_unlock(&pmm->list_lock);
 
     if (resume_recovery && !READ_ONCE(pmm->eager_eviction.stopping))
@@ -2072,6 +2156,7 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_ro
     uvm_gpu_root_chunk_t *root_chunk;
     uvm_vab_snapshot_t snapshot;
     bool vab_only;
+    bool cached_root;
 
     uvm_gpu_vab_get_snapshot(uvm_pmm_to_gpu(pmm)->parent, &snapshot);
     vab_only = snapshot.eviction_enabled && snapshot.valid && snapshot.linear_base != ~0ULL;
@@ -2091,6 +2176,9 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_ro
         return false;
     }
 
+    cached_root = root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_FREE;
+
+
     status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
     uvm_mutex_unlock(&pmm->lock);
 
@@ -2100,6 +2188,13 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_ro
         uvm_spin_unlock(&pmm->list_lock);
         return false;
     }
+
+    uvm_spin_lock(&pmm->list_lock);
+    if (cached_root)
+        ++pmm->eager_eviction.cached_root_releases;
+    else
+        ++pmm->eager_eviction.allocated_root_releases;
+    uvm_spin_unlock(&pmm->list_lock);
 
     // Keep the root pinned until the caller drains the submitted batch.
     *out_root = root_chunk;
@@ -2140,6 +2235,48 @@ static unsigned eager_eviction_batch(uvm_pmm_gpu_t *pmm, unsigned limit, unsigne
     }
 
     return submitted;
+}
+
+static bool replacement_eviction_work(uvm_pmm_gpu_t *pmm, unsigned batch_count)
+{
+    uvm_prefetch_budget_config_t config = speculative_prefetch_config();
+    NvU64 free_bytes, needed, roots;
+    unsigned limit, evicted;
+    bool productive;
+
+    uvm_spin_lock(&pmm->list_lock);
+    if (pmm->eager_eviction.prefetch_count || !pmm->eager_eviction.replacement_roots) {
+        uvm_spin_unlock(&pmm->list_lock);
+        return false;
+    }
+    free_bytes = prefetch_free_bytes_locked(pmm);
+    needed = config.demand_reserve_bytes + replacement_refill_bytes(&config, batch_count);
+    if (free_bytes >= needed) {
+        pmm->eager_eviction.replacement_roots = 0;
+        uvm_spin_unlock(&pmm->list_lock);
+        return false;
+    }
+    roots = DIV_ROUND_UP_ULL(needed - free_bytes, UVM_CHUNK_SIZE_MAX);
+    limit = min(pmm->eager_eviction.replacement_roots, min(batch_count, 16U));
+    limit = min(limit, (unsigned)min(roots, 16ULL));
+    if (!limit) {
+        uvm_spin_unlock(&pmm->list_lock);
+        return false;
+    }
+    pmm->eager_eviction.active = true;
+    uvm_spin_unlock(&pmm->list_lock);
+
+    // Zero disables the legacy low-watermark stop. The explicit limit bounds
+    // reclaim to the observed shortage, rather than draining to a percentage.
+    evicted = eager_eviction_batch(pmm, limit, 0);
+
+    uvm_spin_lock(&pmm->list_lock);
+    pmm->eager_eviction.replacement_roots -= min(evicted, pmm->eager_eviction.replacement_roots);
+    pmm->eager_eviction.replacement_freed_roots += evicted;
+    productive = evicted == limit && pmm->eager_eviction.replacement_roots != 0;
+    pmm->eager_eviction.active = false;
+    uvm_spin_unlock(&pmm->list_lock);
+    return productive;
 }
 
 static void vab_prepare_roots(uvm_pmm_gpu_t *pmm)
@@ -2205,6 +2342,13 @@ static void eager_eviction_work_impl(struct work_struct *work)
 
     vab_prepare_roots(pmm);
     if (!eager_eviction_supported(pmm)) {
+        eager_eviction_schedule(pmm, delay);
+        return;
+    }
+
+    if (uvm_perf_prefetch_replacement_enable) {
+        if (replacement_eviction_work(pmm, batch_count))
+            delay = 0;
         eager_eviction_schedule(pmm, delay);
         return;
     }
@@ -2595,6 +2739,9 @@ static void init_root_chunk(uvm_pmm_gpu_t *pmm,
     chunk->state = initial_state;
     chunk->is_zero = is_zero;
     vab_root_changed(root_chunk);
+
+    if (initial_state == UVM_PMM_GPU_CHUNK_STATE_FREE && uvm_gpu_chunk_is_user(chunk))
+        ++pmm->root_chunks.cached_free_root_count;
 
     if (initial_state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED)
         ++pmm->root_chunks.pinned_count;
@@ -2988,8 +3135,11 @@ static void chunk_free_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
 
     if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED)
         chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_FREE);
-    else
+    else {
         chunk->state = UVM_PMM_GPU_CHUNK_STATE_FREE;
+        if (chunk_is_root_chunk(chunk) && uvm_gpu_chunk_is_user(chunk))
+            ++pmm->root_chunks.cached_free_root_count;
+    }
 
     chunk_update_lists_locked(pmm, chunk);
 }
@@ -3710,6 +3860,14 @@ void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
     stats->prefetch_initialized = pmm->eager_eviction.budget.initialized;
     stats->prefetch_off = pmm->eager_eviction.budget.initialized && !pmm->eager_eviction.budget.window_bytes;
     stats->prefetch_pressure_pauses = pmm->eager_eviction.budget.pressure_pauses;
+    stats->replacement_enabled = uvm_perf_prefetch_replacement_enable;
+    stats->replacement_cached_free_bytes = prefetch_cached_free_bytes_locked(pmm);
+    stats->replacement_usable_free_bytes = prefetch_free_bytes_locked(pmm);
+    stats->background_cached_root_releases = pmm->eager_eviction.cached_root_releases;
+    stats->background_allocated_root_releases = pmm->eager_eviction.allocated_root_releases;
+    stats->replacement_pending_roots = pmm->eager_eviction.replacement_roots;
+    stats->replacement_requests = pmm->eager_eviction.replacement_requests;
+    stats->replacement_freed_roots = pmm->eager_eviction.replacement_freed_roots;
     stats->prefetch_allocation_failures = pmm->eager_eviction.budget.allocation_failures;
     stats->prefetch_prefetched_blocks = pmm->eager_eviction.budget.prefetched_blocks;
     stats->prefetch_mature_blocks = pmm->eager_eviction.budget.mature_blocks;
@@ -3833,9 +3991,15 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     INIT_LIST_HEAD(&pmm->root_chunks.va_block_lazy_free);
     nv_kthread_q_item_init(&pmm->root_chunks.va_block_lazy_free_q_item, process_lazy_free_entry, pmm);
     pmm->root_chunks.pinned_count = 0;
+    pmm->root_chunks.cached_free_root_count = 0;
     pmm->root_chunks.in_eviction_count = 0;
     pmm->eager_eviction.active = false;
     pmm->eager_eviction.prefetch_count = 0;
+    pmm->eager_eviction.replacement_roots = 0;
+    pmm->eager_eviction.replacement_requests = 0;
+    pmm->eager_eviction.replacement_freed_roots = 0;
+    pmm->eager_eviction.cached_root_releases = 0;
+    pmm->eager_eviction.allocated_root_releases = 0;
     memset(&pmm->eager_eviction.budget, 0, sizeof(pmm->eager_eviction.budget));
     memset(&pmm->eager_eviction.patterns, 0, sizeof(pmm->eager_eviction.patterns));
     memset(&pmm->eager_eviction.refault, 0, sizeof(pmm->eager_eviction.refault));

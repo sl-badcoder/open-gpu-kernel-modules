@@ -42,6 +42,29 @@ uvm_cpu_preferred_admission_deferred uvm_cpu_preferred_admission_low_pressure
 uvm_cpu_preferred_admission_repeated uvm_cpu_preferred_admission_state_failures
 uvm_cpu_preferred_admission_eviction_probations uvm_cpu_preferred_admission_eviction_deferred
 uvm_cpu_preferred_admission_return_bytes""".split())
+COUNTERS.update(("background_cached_root_releases", "background_allocated_root_releases",
+                 "replacement_requests", "replacement_freed_roots"))
+RETURN_DISTANCE_BUCKETS = ("lt64m", "64m_256m", "256m_1g", "1g_4g", "ge4g")
+COUNTERS.update(f"uvm_cpu_preferred_return_{bucket}_{metric}"
+                for bucket in RETURN_DISTANCE_BUCKETS
+                for metric in ("probations", "grants", "populations", "population_bytes"))
+
+
+def return_distance_histogram(delta):
+    """Actual return bytes and events, kept separate from admission opportunities."""
+    rows = []
+    for bucket in RETURN_DISTANCE_BUCKETS:
+        row = {"bucket": bucket}
+        for metric in ("probations", "grants", "populations", "population_bytes"):
+            row[metric] = delta.get(f"module/uvm_cpu_preferred_return_{bucket}_{metric}")
+        rows.append(row)
+    if any(row[metric] is None for row in rows
+           for metric in ("probations", "grants", "populations", "population_bytes")):
+        return None
+    total = sum(row["population_bytes"] for row in rows)
+    for row in rows:
+        row["population_byte_fraction"] = row["population_bytes"] / total if total else None
+    return rows
 
 
 def value(text):
@@ -337,6 +360,7 @@ def main(argv=None):
                 "exit_code": exit_code, "snapshot_span_seconds": after["monotonic_s"] - before["monotonic_s"],
                 "pcie_sampler_exit_code": dmon.returncode if dmon else None,
                 "changes": rows, "observed_changes": observed_rows, "derived": ratios,
+                "return_distance_histogram": return_distance_histogram(delta),
                 "vab_seen": any(k.startswith("vab/") for k in observed),
                 "notes": ["Counters are driver-wide, not exclusive to this process.",
                           "Observed changes use first/last available readings; check their coverage times.",

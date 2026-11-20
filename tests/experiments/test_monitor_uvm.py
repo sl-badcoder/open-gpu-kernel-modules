@@ -14,6 +14,24 @@ import monitor_uvm as monitor
 
 
 class MonitorTest(unittest.TestCase):
+    def test_return_distance_counters_and_histogram(self):
+        before = {"monotonic_s": 10, "metrics": {}}
+        after = {"monotonic_s": 12, "metrics": {}}
+        for i, bucket in enumerate(monitor.RETURN_DISTANCE_BUCKETS):
+            for metric in ("probations", "grants", "populations", "population_bytes"):
+                key = f"module/uvm_cpu_preferred_return_{bucket}_{metric}"
+                before["metrics"][key] = 100
+                after["metrics"][key] = 100 + i * 4096
+        rows = monitor.differences(before, after)
+        self.assertTrue(all(row["kind"] == "counter" for row in rows))
+        self.assertTrue(all(row["per_second"] == row["change"] / 2 for row in rows))
+        histogram = monitor.return_distance_histogram({r["metric"]: r["change"] for r in rows})
+        self.assertEqual(histogram[4]["population_bytes"], 16384)
+        self.assertEqual(histogram[4]["population_byte_fraction"], 0.4)
+        self.assertIsNone(monitor.return_distance_histogram({}))
+        self.assertTrue(all(row["population_byte_fraction"] is None for row in
+                            monitor.return_distance_histogram({r["metric"]: 0 for r in rows})))
+
     def test_counter_reset_and_gauge(self):
         before = {"monotonic_s": 10, "metrics": {
             "vab/GPU/0/prefetch_refault_returns": 100,

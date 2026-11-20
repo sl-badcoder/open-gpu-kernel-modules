@@ -48,6 +48,7 @@ typedef struct { int unused; } uvm_tracker_t;
 #define UVM_TRACKER_INIT() {0}
 static NvU64 now = 1000000000ULL;
 static bool uvm_perf_access_counter_admission_eviction_enable=true;
+static bool uvm_perf_access_counter_admission_distance_stats_enable=false;
 static long long atomic64_read(long long *p) {return *p;}
 static bool uvm_page_mask_empty(unsigned *p) {return !*p;}
 static unsigned uvm_cpu_preferred_prefetch_chunk_mb;

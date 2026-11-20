@@ -391,6 +391,12 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
                roots.selected_hot, roots.selected_cold, roots.selected_unknown);
     seq_printf(s, "background_roots_freed %llu\nbackground_failures %llu\n",
                roots.background_roots_freed, roots.background_failures);
+    seq_printf(s, "background_cached_root_releases %llu\nbackground_allocated_root_releases %llu\n",
+               roots.background_cached_root_releases, roots.background_allocated_root_releases);
+    seq_printf(s, "replacement_enabled %llu\nreplacement_cached_free_bytes %llu\nreplacement_usable_free_bytes %llu\n",
+               roots.replacement_enabled, roots.replacement_cached_free_bytes, roots.replacement_usable_free_bytes);
+    seq_printf(s, "replacement_pending_roots %llu\nreplacement_requests %llu\nreplacement_freed_roots %llu\n",
+               roots.replacement_pending_roots, roots.replacement_requests, roots.replacement_freed_roots);
     seq_printf(s, "selection_changes %llu\nselection_fallbacks %llu\neligible_roots %llu\nreadiness_pending %llu\n",
                roots.selection_changes, roots.selection_fallbacks, roots.eligible_roots, roots.readiness_pending);
     seq_printf(s, "usage_percent %llu\nprefetch_inflight %llu\nrecovering_watermark %llu\nbackground_active %llu\n",

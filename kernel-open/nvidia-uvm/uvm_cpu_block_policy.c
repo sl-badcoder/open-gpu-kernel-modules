@@ -44,12 +44,17 @@ static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
 static bool uvm_perf_access_counter_admission_enable = true;
 static unsigned uvm_perf_access_counter_admission_pressure_percent = 95;
 static unsigned uvm_perf_access_counter_admission_observations = 2;
-static bool uvm_perf_access_counter_admission_eviction_enable = true;
+static bool uvm_perf_access_counter_admission_eviction_enable = false;
+static bool uvm_perf_access_counter_admission_distance_stats_enable = true;
 static unsigned uvm_perf_access_counter_admission_eviction_mb = 256;
 static unsigned uvm_perf_access_counter_admission_eviction_extra = 2;
 static atomic64_t uvm_cpu_preferred_admission_eviction_probations = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_admission_eviction_deferred = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_admission_return_bytes = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_return_probations[5] = { ATOMIC64_INIT(0) };
+static atomic64_t uvm_cpu_preferred_return_grants[5] = { ATOMIC64_INIT(0) };
+static atomic64_t uvm_cpu_preferred_return_populations[5] = { ATOMIC64_INIT(0) };
+static atomic64_t uvm_cpu_preferred_return_population_bytes[5] = { ATOMIC64_INIT(0) };
 static atomic64_t uvm_cpu_preferred_admission_requests = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_admission_deferred = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_admission_low_pressure = ATOMIC64_INIT(0);
@@ -92,7 +97,10 @@ MODULE_PARM_DESC(uvm_perf_access_counter_admission_observations,
                  "Base clear-separated observations under pressure (default 2, clamped 2..8).");
 module_param(uvm_perf_access_counter_admission_eviction_enable, bool, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_access_counter_admission_eviction_enable,
-                 "Extra pressure admission probation for recently completely evicted logical blocks (default true).");
+                 "Extra pressure admission probation for recently completely evicted logical blocks (default false).");
+module_param(uvm_perf_access_counter_admission_distance_stats_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_admission_distance_stats_enable,
+                 "Measure eviction-to-return population distance independently of extra probation (default true).");
 module_param(uvm_perf_access_counter_admission_eviction_mb, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_access_counter_admission_eviction_mb,
                  "GPU CPU-policy population distance in MiB defining a recent eviction (default 256; zero disables extra probation).");
@@ -102,6 +110,23 @@ MODULE_PARM_DESC(uvm_perf_access_counter_admission_eviction_extra,
 module_param_cb(uvm_cpu_preferred_admission_eviction_probations, &atomic64_count_ops, &uvm_cpu_preferred_admission_eviction_probations, S_IRUGO);
 module_param_cb(uvm_cpu_preferred_admission_eviction_deferred, &atomic64_count_ops, &uvm_cpu_preferred_admission_eviction_deferred, S_IRUGO);
 module_param_cb(uvm_cpu_preferred_admission_return_bytes, &atomic64_count_ops, &uvm_cpu_preferred_admission_return_bytes, S_IRUGO);
+
+#define UVM_RETURN_DISTANCE_COUNTERS(label, index) \
+    module_param_cb(uvm_cpu_preferred_return_##label##_probations, &atomic64_count_ops, \
+                    &uvm_cpu_preferred_return_probations[index], S_IRUGO); \
+    module_param_cb(uvm_cpu_preferred_return_##label##_grants, &atomic64_count_ops, \
+                    &uvm_cpu_preferred_return_grants[index], S_IRUGO); \
+    module_param_cb(uvm_cpu_preferred_return_##label##_populations, &atomic64_count_ops, \
+                    &uvm_cpu_preferred_return_populations[index], S_IRUGO); \
+    module_param_cb(uvm_cpu_preferred_return_##label##_population_bytes, &atomic64_count_ops, \
+                    &uvm_cpu_preferred_return_population_bytes[index], S_IRUGO)
+
+UVM_RETURN_DISTANCE_COUNTERS(lt64m, 0);
+UVM_RETURN_DISTANCE_COUNTERS(64m_256m, 1);
+UVM_RETURN_DISTANCE_COUNTERS(256m_1g, 2);
+UVM_RETURN_DISTANCE_COUNTERS(1g_4g, 3);
+UVM_RETURN_DISTANCE_COUNTERS(ge4g, 4);
+#undef UVM_RETURN_DISTANCE_COUNTERS
 module_param_cb(uvm_cpu_preferred_admission_requests, &atomic64_count_ops, &uvm_cpu_preferred_admission_requests, S_IRUGO);
 module_param_cb(uvm_cpu_preferred_admission_deferred, &atomic64_count_ops, &uvm_cpu_preferred_admission_deferred, S_IRUGO);
 module_param_cb(uvm_cpu_preferred_admission_low_pressure, &atomic64_count_ops, &uvm_cpu_preferred_admission_low_pressure, S_IRUGO);
@@ -118,6 +143,17 @@ bool uvm_cpu_block_policy_counter_pressure(uvm_gpu_t *gpu)
     return uvm_cpu_block_policy_counter_admission_enabled() &&
            uvm_pmm_gpu_counter_admission_pressure(&gpu->pmm,
                clamp(uvm_perf_access_counter_admission_pressure_percent, 1U, 100U));
+}
+
+static void counter_admission_record_return_grant(uvm_va_block_gpu_state_t *state, uvm_gpu_t *gpu)
+{
+    if (state && state->counter_admission_history.evicted &&
+        uvm_perf_access_counter_admission_distance_stats_enable) {
+        NvU64 population = (NvU64)atomic64_read(&gpu->counter_admission_population_bytes);
+        unsigned bucket = uvm_counter_admission_distance_bucket(
+                              population - state->counter_admission_history.population_at_eviction);
+        atomic64_inc(&uvm_cpu_preferred_return_grants[bucket]);
+    }
 }
 
 bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu,
@@ -137,12 +173,15 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
     atomic64_inc(&uvm_cpu_preferred_admission_requests);
     pressure = uvm_cpu_block_policy_counter_pressure(gpu);
     state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+    if (state && !uvm_page_mask_empty(&state->resident))
+        state->counter_admission_history.evicted = false;
     if (!pressure) {
         if (state) {
             state->counter_admission.pending = false;
             state->counter_admission.observations = 0;
         }
         atomic64_inc(&uvm_cpu_preferred_admission_low_pressure);
+        counter_admission_record_return_grant(state, gpu);
         return true;
     }
     if (!state)
@@ -152,16 +191,21 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
         atomic64_inc(&uvm_cpu_preferred_admission_deferred);
         return false;
     }
-    // Native/fault populations may have returned pages outside this policy.
-    if (!uvm_page_mask_empty(&state->resident))
-        state->counter_admission_history.evicted = false;
     required = clamp(uvm_perf_access_counter_admission_observations, 2U, 8U);
-    if (uvm_perf_access_counter_admission_eviction_enable &&
+    if ((uvm_perf_access_counter_admission_eviction_enable ||
+         uvm_perf_access_counter_admission_distance_stats_enable) &&
         (!state->counter_admission.pending || state->counter_admission.buffer != buffer)) {
+        NvU64 population = (NvU64)atomic64_read(&gpu->counter_admission_population_bytes);
         required = uvm_counter_admission_required(&state->counter_admission_history,
-                      (NvU64)atomic64_read(&gpu->counter_admission_population_bytes),
+                      population,
                       (NvU64)uvm_perf_access_counter_admission_eviction_mb * 1024 * 1024,
-                      required, uvm_perf_access_counter_admission_eviction_extra);
+                      required, uvm_perf_access_counter_admission_eviction_enable ?
+                                    uvm_perf_access_counter_admission_eviction_extra : 0);
+        if (uvm_perf_access_counter_admission_distance_stats_enable && state->counter_admission_history.evicted) {
+            unsigned bucket = uvm_counter_admission_distance_bucket(
+                                  population - state->counter_admission_history.population_at_eviction);
+            atomic64_inc(&uvm_cpu_preferred_return_probations[bucket]);
+        }
         if (required > clamp(uvm_perf_access_counter_admission_observations, 2U, 8U))
             atomic64_inc(&uvm_cpu_preferred_admission_eviction_probations);
     }
@@ -169,8 +213,10 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
     if (!admitted && state->counter_admission.required >
                          clamp(uvm_perf_access_counter_admission_observations, 2U, 8U))
         atomic64_inc(&uvm_cpu_preferred_admission_eviction_deferred);
-    if (admitted)
+    if (admitted) {
         atomic64_inc(&uvm_cpu_preferred_admission_repeated);
+        counter_admission_record_return_grant(state, gpu);
+    }
     else
         atomic64_inc(&uvm_cpu_preferred_admission_deferred);
     return admitted;
@@ -384,12 +430,20 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
     if (status == NV_OK) {
         NvU64 moved = (NvU64)uvm_page_mask_weight(&block_context->make_resident.pages_changed_residency) * PAGE_SIZE;
         *prefetched_bytes += moved;
-        if (moved && uvm_perf_access_counter_admission_eviction_enable) {
+        if (moved && (uvm_perf_access_counter_admission_eviction_enable ||
+                      uvm_perf_access_counter_admission_distance_stats_enable)) {
             uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+            NvU64 population = (NvU64)atomic64_add_return(moved, &gpu->counter_admission_population_bytes) - moved;
             UVM_ASSERT(state);
-            atomic64_add(moved, &gpu->counter_admission_population_bytes);
-            if (state->counter_admission_history.evicted)
+            if (state->counter_admission_history.evicted) {
                 atomic64_add(moved, &uvm_cpu_preferred_admission_return_bytes);
+                if (uvm_perf_access_counter_admission_distance_stats_enable) {
+                    unsigned bucket = uvm_counter_admission_distance_bucket(
+                                          population - state->counter_admission_history.population_at_eviction);
+                    atomic64_inc(&uvm_cpu_preferred_return_populations[bucket]);
+                    atomic64_add(moved, &uvm_cpu_preferred_return_population_bytes[bucket]);
+                }
+            }
             state->counter_admission_history.evicted = false;
         }
         if (moved && speculative_neighbor) {
@@ -743,7 +797,8 @@ void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t 
         gpu_state->counter_admission.pending = false;
     // This hook runs only after a successful eviction with pages removed.
     // Partial evictions deliberately do not create a new history episode.
-    if (gpu_state && uvm_perf_access_counter_admission_eviction_enable &&
+    if (gpu_state && (uvm_perf_access_counter_admission_eviction_enable ||
+                      uvm_perf_access_counter_admission_distance_stats_enable) &&
         va_block->managed_range && va_block->managed_range->cpu_access_counter_policy &&
         resident_evicted && uvm_page_mask_empty(&gpu_state->resident)) {
         gpu_state->counter_admission_history.evicted = true;

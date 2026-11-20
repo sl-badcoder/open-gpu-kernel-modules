@@ -13,6 +13,7 @@ PRELUDE = r'''
 #include <stdio.h>
 #include <string.h>
 typedef uint64_t NvU64;
+typedef uint32_t NvU32;
 typedef int NV_STATUS;
 typedef NvU64 uvm_page_mask_t;
 typedef int uvm_tracker_t;
@@ -28,13 +29,17 @@ typedef int uvm_tracker_t;
 struct mm_struct { int unused; };
 typedef struct { bool allow_eviction, no_eviction_allocation_failed; } uvm_va_block_retry_t;
 typedef struct { struct { uvm_page_mask_t pages_changed_residency; unsigned all_involved_processors; } make_resident; } uvm_va_block_context_t;
-typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; struct { bool evicted; } counter_admission_history; } uvm_va_block_gpu_state_t;
+typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; uvm_counter_admission_history_t counter_admission_history; } uvm_va_block_gpu_state_t;
 typedef struct { NvU64 cpu_prefetch_range_id; } managed_t;
 typedef struct { int lock; uvm_tracker_t tracker; uvm_va_block_gpu_state_t state; managed_t *managed_range; NvU64 start; } uvm_va_block_t;
 typedef struct { NvU64 generation; } uvm_prefetch_reservation_t;
 typedef struct { unsigned unused; } uvm_pmm_gpu_t;
 typedef struct { int id; uvm_pmm_gpu_t pmm; long long counter_admission_population_bytes; } uvm_gpu_t;
 static bool uvm_perf_access_counter_admission_eviction_enable=true;
+static bool uvm_perf_access_counter_admission_distance_stats_enable=false;
+static long long uvm_cpu_preferred_return_populations[5], uvm_cpu_preferred_return_population_bytes[5];
+static void atomic64_inc(long long *p) {++*p;}
+static long long atomic64_add_return(NvU64 n,long long *p) {*p+=n;return *p;}
 static long long uvm_cpu_preferred_admission_return_bytes;
 static void atomic64_add(NvU64 n,long long *p) {*p+=n;}
 static uvm_page_mask_t cpu, resident, thrashing, changed;
@@ -113,6 +118,26 @@ int main(void)
  reset(); block.state.counter_admission_history.evicted=true;
  assert(run(false)==0 && !block.state.counter_admission_history.evicted);
  assert(uvm_cpu_preferred_admission_return_bytes==PAGE_SIZE);
+ // Measure actual return distance independently of extra probation, once.
+ uvm_perf_access_counter_admission_distance_stats_enable=true;
+ uvm_perf_access_counter_admission_eviction_enable=false;
+ for (unsigned bucket=0;bucket<5;++bucket) {
+   const NvU64 distances[]={0,64ULL<<20,256ULL<<20,1ULL<<30,4ULL<<30};
+   reset();resident=0;gpu.counter_admission_population_bytes=distances[bucket]+123;
+   block.state.counter_admission_history.evicted=true;
+   block.state.counter_admission_history.population_at_eviction=123;
+   assert(run(false)==0);
+   assert(uvm_cpu_preferred_return_populations[bucket]==1);
+   assert(uvm_cpu_preferred_return_population_bytes[bucket]==PAGE_SIZE);
+   assert(gpu.counter_admission_population_bytes==(long long)(distances[bucket]+123+PAGE_SIZE));
+   assert(run(false)==0 && uvm_cpu_preferred_return_populations[bucket]==1);
+ }
+ reset();resident=0;changed=0;block.state.counter_admission_history.evicted=true;
+ assert(run(false)==0 && block.state.counter_admission_history.evicted);
+ reset();resident=0;resident_status=7;block.state.counter_admission_history.evicted=true;
+ assert(run(false)==7 && block.state.counter_admission_history.evicted);
+ uvm_perf_access_counter_admission_distance_stats_enable=false;
+ uvm_perf_access_counter_admission_eviction_enable=true;
  // One moved sparse page still counts as one neighbor population episode.
  reset(); assert(run(true)==0 && moved==PAGE_SIZE && records==1 && populations==1 && maps==1);
  assert(block.state.speculative_cohort==42 && block.state.speculative_prefetch_ns==123456789);
@@ -139,12 +164,12 @@ int main(void)
 
 def main():
     source = (ROOT / 'kernel-open/nvidia-uvm/uvm_cpu_block_policy.c').read_text()
-    code = PRELUDE + function(source, 'prefetch_block') + CASES
+    code = PRELUDE.replace("typedef int NV_STATUS;", (ROOT / "kernel-open/nvidia-uvm/uvm_counter_admission.h").read_text() + "\ntypedef int NV_STATUS;") + function(source, 'prefetch_block') + CASES
     with tempfile.TemporaryDirectory(prefix='rapid-return-population-') as directory:
         c = Path(directory) / 'test.c'
         binary = Path(directory) / 'test'
         c.write_text(code)
-        subprocess.run(['cc', '-std=c11', '-O1', '-Wall', '-Wextra', '-Werror',
+        subprocess.run(['cc', '-std=c11', '-O1', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function',
                         '-fsanitize=address,undefined', '-g', str(c), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
 

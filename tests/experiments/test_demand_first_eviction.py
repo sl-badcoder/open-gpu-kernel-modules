@@ -8,7 +8,8 @@ import tempfile
 ROOT = Path(__file__).parents[2]
 
 def function(source, name):
-    match = re.search(r"^(?:static [^\n]*|void |NvU64 )\b" + name + r"\(", source, re.M)
+    matches = re.finditer(r"^(?:static [^\n]*|void |NvU64 )\b" + name + r"\(", source, re.M)
+    match = next((m for m in matches if ';' not in source[m.start():source.index('{', m.start())]), None)
     if match is None:
         raise ValueError(name)
     start = match.start()
@@ -40,6 +41,9 @@ typedef int NV_STATUS;
 #define FREE_ROOT_CHUNK_MODE_DEFAULT 0
 #define PMM_CONTEXT_DEFAULT 0
 #define UVM_PMM_GPU_MEMORY_TYPE_USER 0
+#define UVM_PMM_GPU_CHUNK_STATE_FREE 0
+#define READ_ONCE(x) (x)
+#define UVM_PAGE_SIZE_64K 65536
 #define UVM_PMM_GPU_CHUNK_STATE_ALLOCATED 1
 #define UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT 2
 #define UVM_CHUNK_SIZE_MAX 2097152
@@ -59,6 +63,7 @@ static unsigned uvm_perf_vab_min_residency_ms=100;
 static unsigned uvm_perf_speculative_prefetch_limit_mb=32;
 static unsigned uvm_perf_speculative_prefetch_reserve_mb=64;
 static bool uvm_perf_prefetch_refault_enable=false;
+static bool uvm_perf_prefetch_replacement_enable=false;
 static bool uvm_pmm_gpu_refault_enabled(void) { return uvm_perf_prefetch_refault_enable; }
 static unsigned uvm_perf_prefetch_refault_short_percent=25;
 static unsigned uvm_perf_prefetch_refault_max_neighbors=1;
@@ -69,9 +74,9 @@ typedef struct chunk { struct { struct chunk *next; } list; bool is_zero, claime
 typedef struct { uvm_gpu_chunk_t chunk; NvU64 vab_generation,vab_ready_generation,vab_ready_ns; } uvm_gpu_root_chunk_t;
 /* VAB stats */
 typedef struct { int dummy; } uvm_parent_gpu_t;
-typedef struct { uvm_parent_gpu_t *parent; struct { NvU64 size; } mem_info; } uvm_gpu_t;
+typedef struct { uvm_parent_gpu_t *parent; struct { NvU64 size; struct {bool enabled;} numa; } mem_info; } uvm_gpu_t;
 static uvm_gpu_t mock_gpu;
-typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; } root_chunks; struct { NvU64 epoch; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; uvm_prefetch_refault_t refault; struct {NvU64 events, confirmations, replacements, predictions, learned_predictions, expirations;} patterns; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
+typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; NvU64 cached_free_root_count; } root_chunks; struct {NvU64 numFreePages64k;} *pma_stats; struct { NvU64 epoch; unsigned replacement_roots; NvU64 replacement_requests, replacement_freed_roots, cached_root_releases, allocated_root_releases; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; uvm_prefetch_refault_t refault; struct {NvU64 events, confirmations, replacements, predictions, learned_predictions, expirations;} patterns; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
 static uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *p) {(void)p; return &mock_gpu;}
 static uvm_vab_snapshot_t mock_snapshot;
 static unsigned snapshot_calls;
@@ -117,7 +122,7 @@ static uvm_pmm_gpu_t p;
 static uvm_gpu_root_chunk_t roots[6];
 static void reset(void){
  memset(&p,0,sizeof(p));memset(roots,0,sizeof(roots));memset(&mock_snapshot,0,sizeof(mock_snapshot));
- mock_now=1000000000ULL;uvm_perf_vab_min_residency_ms=100;
+ mock_now=1000000000ULL;uvm_perf_vab_min_residency_ms=100;uvm_perf_prefetch_replacement_enable=false;
  visits=evictions=freed=fail_at=0;mock_usage=100;migration_status=0;snapshot_calls=0;
  memset(mock_recency,0,sizeof(mock_recency));mock_recency_race=false;
  mock_snapshot.valid=true;mock_snapshot.eviction_enabled=true;mock_snapshot.lru_enabled=true;
@@ -173,6 +178,15 @@ int main(void){
  uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[3]);uvm_mutex_unlock(&p.lock);
  uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[2]);uvm_mutex_unlock(&p.lock);
  uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[1]);uvm_mutex_unlock(&p.lock);
+ // Request-driven background reclaim preserves cached roots but mandatory
+ // eviction still uses them; used HOT roots remain protected.
+ reset();uvm_perf_prefetch_replacement_enable=true;
+ add(0,2);p.free_list[0].first=&roots[3].chunk;
+ assert(eager_eviction_one(&p,&out)&&out==&roots[0]);
+ assert(p.free_list[0].first==&roots[3].chunk);
+ uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[3]);uvm_mutex_unlock(&p.lock);
+ reset();uvm_perf_prefetch_replacement_enable=true;add(0,2);mock_snapshot.access_bits[0]=1;
+ assert(!eager_eviction_one(&p,&out));
  // Completed frees and failures are counted separately; batches stop at low.
  reset();for(unsigned i=0;i<5;++i)add(i,2);
  assert(eager_eviction_batch(&p,16,98)==2&&p.vab_stats.background_roots_freed==2);
@@ -212,7 +226,7 @@ def main():
         code += re.search(r'static bool uvm_perf_speculative_prefetch_' + parameter + r' = (?:true|false);', source).group(0) + '\n'
     code += function(source, 'uvm_pmm_gpu_prefetch_feedback_window_ns')
     code += function(source, 'speculative_prefetch_config')
-    for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):
+    for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_one','eager_eviction_batch','prefetch_cached_free_bytes_locked','prefetch_free_bytes_locked','uvm_pmm_gpu_vab_stats'):
         code+=function(source,name)
     code+=SCENARIOS
     with tempfile.TemporaryDirectory(prefix='demand-first-eviction-') as directory:

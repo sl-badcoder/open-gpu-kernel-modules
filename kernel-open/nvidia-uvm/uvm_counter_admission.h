@@ -33,6 +33,21 @@ typedef struct
     bool evicted;
 } uvm_counter_admission_history_t;
 
+// Fixed population-distance buckets. Count actual returns separately from
+// admission opportunities: notification duplicates are not data movement.
+static inline unsigned uvm_counter_admission_distance_bucket(NvU64 distance)
+{
+    if (distance < (64ULL << 20))
+        return 0;
+    if (distance < (256ULL << 20))
+        return 1;
+    if (distance < (1ULL << 30))
+        return 2;
+    if (distance < (4ULL << 30))
+        return 3;
+    return 4;
+}
+
 static inline NvU32 uvm_counter_admission_required(uvm_counter_admission_history_t *h,
                                                   NvU64 population, NvU64 budget,
                                                   NvU32 base, NvU32 extra)

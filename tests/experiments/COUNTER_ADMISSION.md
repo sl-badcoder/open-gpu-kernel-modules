@@ -1,5 +1,9 @@
 # Counter admission experiment
 
+The latest bounded-refill experiment is documented in
+[BOUNDED_REFILL_ADMISSION.md](BOUNDED_REFILL_ADMISSION.md), including matched
+off/on settings and the return-distance histogram.
+
 For the current eviction-aware experiment and its off/on comparison, see
 [EVICTION_AWARE_ADMISSION.md](EVICTION_AWARE_ADMISSION.md). The three-observation
 settings below describe the parent experiment, whose global default was three.

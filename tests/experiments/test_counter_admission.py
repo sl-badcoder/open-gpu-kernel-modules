@@ -173,6 +173,13 @@ static void queued_count_boundary_and_wrap_abstraction(void)
 
 int main(void)
 {
+    const NvU64 edges[] = {64ULL<<20, 256ULL<<20, 1ULL<<30, 4ULL<<30};
+    assert(uvm_counter_admission_distance_bucket(0)==0);
+    for (unsigned i=0;i<4;++i) {
+        assert(uvm_counter_admission_distance_bucket(edges[i]-1)==i);
+        assert(uvm_counter_admission_distance_bucket(edges[i])==i+1);
+    }
+    assert(uvm_counter_admission_distance_bucket(UINT64_MAX)==4);
     uvm_counter_admission_history_t h = {.evicted=true, .population_at_eviction=100};
     assert(uvm_counter_admission_required(&h, 100, 64, 2, 2)==4);
     assert(uvm_counter_admission_required(&h, 163, 64, 2, 2)==4);
@@ -243,7 +250,7 @@ typedef uint64_t NvU64;
 
 
 def extract_function(text: str, name: str) -> str:
-    match = re.search(r"(?:static )?bool " + re.escape(name) + r"\(", text)
+    match = re.search(r"(?:static )?(?:bool|void) " + re.escape(name) + r"\(", text)
     if not match:
         raise ValueError(name)
     brace = text.index("{", match.start())
@@ -349,6 +356,8 @@ typedef struct { int dummy; } range_t;
 typedef struct { int lock; range_t *managed_range; } uvm_va_block_t;
 typedef struct { int id; long long counter_admission_population_bytes; } uvm_gpu_t;
 static bool uvm_perf_access_counter_admission_eviction_enable=true;
+static bool uvm_perf_access_counter_admission_distance_stats_enable=true;
+static long long uvm_cpu_preferred_return_probations[5], uvm_cpu_preferred_return_grants[5];
 static unsigned uvm_perf_access_counter_admission_eviction_mb=256, uvm_perf_access_counter_admission_eviction_extra=2;
 static long long uvm_cpu_preferred_admission_eviction_probations, uvm_cpu_preferred_admission_eviction_deferred;
 static long long atomic64_read(long long *p) {return *p;}
@@ -417,6 +426,23 @@ int main(void) {
     assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,26,26));
     assert(!state.counter_admission_history.evicted && state.counter_admission.required==2);
     state.resident=0;
+    // Instrumentation remains active with extra probation disabled.
+    uvm_perf_access_counter_admission_eviction_enable=false;
+    state.counter_admission.pending=false;
+    state.counter_admission_history.evicted=true;
+    state.counter_admission_history.population_at_eviction=0;
+    gpu.counter_admission_population_bytes=1LL<<30;
+    long long before_prob=uvm_cpu_preferred_return_probations[3];
+    long long before_grant=uvm_cpu_preferred_return_grants[3];
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,30,30));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,30,30));
+    assert(uvm_cpu_preferred_return_probations[3]==before_prob+1);
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,31,31));
+    assert(uvm_cpu_preferred_return_grants[3]==before_grant+1);
+    pressure=false;
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,32,32));
+    assert(uvm_cpu_preferred_return_grants[3]==before_grant+2);
+    pressure=true;
     have_state=false;fail_alloc=true;
     assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,17,17));
     assert(uvm_cpu_preferred_admission_state_failures==1);
@@ -434,7 +460,7 @@ def test_production_gate():
     split = "static void production_split_history(uvm_va_block_gpu_state_t *existing_gpu_state, uvm_va_block_gpu_state_t *new_gpu_state) {\n    new_gpu_state->counter_admission_history =" + split + "}\n"
     gpu_source = (ROOT / "kernel-open/nvidia-uvm/uvm_gpu.h").read_text()
     assert "counter_admission_population_bytes" in gpu_source.split("struct uvm_gpu_struct\n",1)[1].split("struct uvm_parent_gpu_struct\n",1)[0]
-    code = PRELUDE + HEADER.read_text() + GATE_STUBS + split + extract_function(
+    code = PRELUDE + HEADER.read_text() + GATE_STUBS + split + extract_function(source, "counter_admission_record_return_grant") + extract_function(
         source, "uvm_cpu_block_policy_admit_counter") + GATE_CASES
     with tempfile.TemporaryDirectory(prefix="counter-admission-gate-") as directory:
         cfile, binary = Path(directory) / "test.c", Path(directory) / "test"

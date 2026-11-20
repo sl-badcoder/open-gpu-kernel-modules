@@ -210,6 +210,14 @@ typedef struct {
     NvU64 prefetch_initialized;
     NvU64 prefetch_off;
     NvU64 prefetch_pressure_pauses;
+    NvU64 replacement_enabled;
+    NvU64 replacement_cached_free_bytes;
+    NvU64 replacement_usable_free_bytes;
+    NvU64 background_cached_root_releases;
+    NvU64 background_allocated_root_releases;
+    NvU64 replacement_pending_roots;
+    NvU64 replacement_requests;
+    NvU64 replacement_freed_roots;
     NvU64 prefetch_allocation_failures;
     NvU64 prefetch_prefetched_blocks;
     NvU64 prefetch_mature_blocks;
@@ -475,6 +483,9 @@ typedef struct uvm_pmm_gpu_struct
         // Updates are protected by 'list_lock', but it can be queried outside
         // of the critical section.
         long pinned_count;
+        // Whole USER roots available in PMM free lists, excluding roots
+        // already selected for eviction. Maintained under list_lock.
+        NvU64 cached_free_root_count;
     } root_chunks;
 
     // Lock protecting PMA allocation, freeing and eviction
@@ -506,6 +517,12 @@ typedef struct uvm_pmm_gpu_struct
         // entries never retain VA range/block pointers. Protected by list_lock.
         uvm_prefetch_pattern_t patterns;
         uvm_prefetch_refault_t refault;
+        // Coalesced shortage, never an unbounded queue of notification requests.
+        unsigned replacement_roots;
+        NvU64 replacement_requests;
+        NvU64 replacement_freed_roots;
+        NvU64 cached_root_releases;
+        NvU64 allocated_root_releases;
         bool active;
         bool recovering_watermark;
         bool stopping;
