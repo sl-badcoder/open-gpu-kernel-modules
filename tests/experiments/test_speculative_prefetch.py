@@ -65,6 +65,7 @@ static NvU64 grant, requested, reserved, transferred;
 static bool completed_success;
 static NvU64 reservation_generation = 17;
 static int calls, begin_calls, end_calls, waits, capacity_at, error_at, wait_error;
+static int context_allocations, context_frees;
 static int pressure_after_copies;
 static int watermark_at, watermark_calls, feedback_quick, feedback_capacity;
 static int pressure_pauses;
@@ -98,8 +99,8 @@ static bool uvm_processor_mask_test_and_clear_atomic(unsigned *p,int id) {(void)
 static bool uvm_processor_mask_test_and_set_atomic(unsigned *p,int id) {(void)id;bool old=*p;*p=1;return old;}
 static void uvm_processor_mask_clear_atomic(unsigned *p,int id) {(void)id;*p=0;}
 static void uvm_processor_mask_set_atomic(unsigned *p,int id) {(void)id;*p=1;}
-static uvm_va_block_context_t *uvm_va_block_context_alloc(struct mm_struct *m) {(void)m;return alloc_fail?NULL:&context;}
-static void uvm_va_block_context_free(uvm_va_block_context_t *p) {assert(p==&context);}
+static uvm_va_block_context_t *uvm_va_block_context_alloc(struct mm_struct *m) {(void)m;++context_allocations;assert(reserved && begin_calls>0);return alloc_fail?NULL:&context;}
+static void uvm_va_block_context_free(uvm_va_block_context_t *p) {assert(p==&context);assert(!reserved);++context_frees;}
 static size_t uvm_va_range_num_blocks(uvm_va_range_managed_t *r) {return r->count;}
 static size_t uvm_va_range_block_index(uvm_va_range_managed_t *r,NvU64 start) {return start/UVM_VA_BLOCK_SIZE-r->start/UVM_VA_BLOCK_SIZE;}
 static uvm_va_block_t *uvm_va_range_block(uvm_va_range_managed_t *r,size_t index) {assert(index<r->count);return r->blocks[index];}
@@ -110,6 +111,8 @@ static NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *p,NvU64 by
 }
 static void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *p,uvm_prefetch_reservation_t *r,NvU64 moved,bool success) {
  (void)p;assert(waits==1 && reserved==r->bytes && moved<=r->bytes);
+ // OOM must retain the trigger claim until its reservation is released.
+ if (alloc_fail) assert(blocks[trigger_slot].gpu_prefetch_started);
  assert(r->generation==reservation_generation);completed_success=success;reserved=0;transferred=moved;++end_calls;
 }
 static NV_STATUS uvm_tracker_wait_deinit(uvm_tracker_t *p) {(void)p;++waits;return wait_error;}
@@ -134,7 +137,7 @@ static void reset(void) {
  for(size_t i=0;i<8;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
  enabled=supported=true;alloc_fail=trigger_resident=false;grant=4*UVM_SIZE_1MB;requested=reserved=transferred=0;
  refault_enabled=false;refault_neighbor_count=0;range.cpu_prefetch_range_id=77;range.cpu_access_counter_policy=true;
- calls=begin_calls=end_calls=waits=capacity_at=error_at=wait_error=0;
+ calls=begin_calls=end_calls=waits=capacity_at=error_at=wait_error=0;context_allocations=context_frees=0;
  watermark_at=-1;watermark_calls=feedback_quick=feedback_capacity=pressure_pauses=0;
  trigger_slot=4;
  uvm_cpu_preferred_prefetch_chunk_mb=64;
@@ -168,7 +171,9 @@ int main(void) {
  // Sparse neighbor blocks consume no bytes and do not instantiate new blocks.
  reset();range.blocks[3]=NULL;run();assert(calls==1 && transferred==UVM_VA_BLOCK_SIZE && end_calls==1);
  // Transient denial retries, permanent disable never admits or sets retry.
- reset();grant=0;run();assert(!calls && !end_calls && blocks[4].gpu_prefetch_retry);
+ reset();grant=0;run();assert(!calls && !end_calls && blocks[4].gpu_prefetch_retry && !context_allocations && !context_frees);
+ for(int i=0;i<100;++i)run();
+ assert(!context_allocations && !context_frees && !reserved);
  reset();enabled=false;run();assert(!begin_calls && !calls && !waits && !blocks[4].gpu_prefetch_retry);
  reset();uvm_cpu_preferred_prefetch_chunk_mb=0;run();assert(!begin_calls && !calls);
  // Every admitted failure waits before releasing the reservation.
@@ -176,8 +181,15 @@ int main(void) {
  reset();capacity_at=2;run();assert(calls==2 && end_calls==1 && feedback_capacity==1 && !completed_success && !pressure_pauses && blocks[4].gpu_prefetch_retry);
  reset();watermark_at=0;run();assert(!calls && end_calls==1 && completed_success && !feedback_capacity && pressure_pauses==1);
  reset();wait_error=9;run();assert(end_calls==1 && !completed_success && !reserved);
- // Context allocation failure cannot leak an admission or change retry state.
- reset();alloc_fail=true;run();assert(!begin_calls && !end_calls && !blocks[4].gpu_prefetch_started);
+ // A granted reservation is released on context OOM, and a later signal can retry.
+ reset();alloc_fail=true;run();
+ assert(begin_calls==1 && end_calls==1 && !completed_success && !reserved);
+ assert(context_allocations==1 && !context_frees && !calls && !blocks[4].gpu_prefetch_started);
+ alloc_fail=false;waits=0;run();
+ assert(begin_calls==2 && end_calls==2 && completed_success && !reserved);
+ assert(context_allocations==2 && context_frees==1 && calls==2);
+ // Already claimed blocks and empty plans allocate no context.
+ reset();blocks[4].gpu_prefetch_started=1;run();assert(!context_allocations && !begin_calls);
  // One-shot callback avoids repeat copies; capacity-retry can be claimed once.
  reset();run();run();assert(begin_calls==1 && calls==2 && end_calls==1 && !reserved);
  reset();grant=0;run();grant=4*UVM_SIZE_1MB;waits=0;run();assert(end_calls==1 && calls==2 && uvm_cpu_preferred_prefetch_retries==1);

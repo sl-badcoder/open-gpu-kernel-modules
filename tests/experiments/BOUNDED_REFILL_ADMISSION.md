@@ -142,3 +142,17 @@ duplicates while a request is pending; it is not a count of workqueue kicks.
 Local validation compiles production policy and PMM routines with mocked hardware
 and exercises the monitor. Full Linux kernel compilation and GPU tests remain
 required on the target system.
+
+## Cheaper denied population attempts
+
+The follow-up optimization allocates a migration context only after a byte
+reservation succeeds. Denied, empty-plan and duplicate claimed attempts avoid
+context allocation/free; successful population retains the same size, order,
+byte limits and eviction policy. No additional module parameter is required.
+
+If context allocation fails after admission, normal completion releases the
+reservation before reopening the trigger for another notification. This counts
+as an admitted failed attempt. In the old optional backoff/recovery mode a failed
+recovery probe can therefore defer the next probe; keep that controller disabled
+for this bounded-refill experiment as specified above. GPU performance impact of
+the allocation-order change still requires a matched hardware comparison.

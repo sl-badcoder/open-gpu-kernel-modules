@@ -502,7 +502,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
 {
     uvm_va_range_managed_t *managed_range = trigger_block->managed_range;
     uvm_va_space_t *va_space;
-    uvm_va_block_context_t *block_context;
+    uvm_va_block_context_t *block_context = NULL;
     size_t block_count;
     size_t chunk_block_count;
     size_t end_index;
@@ -522,6 +522,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     bool capacity_stopped = false;
     bool refault_mode = uvm_pmm_gpu_refault_enabled();
     bool prefetch_admitted = false;
+    bool rearm_after_completion = false;
     bool prefetch_success = true;
     uvm_tracker_t prefetch_tracker = UVM_TRACKER_INIT();
 
@@ -566,10 +567,6 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         uvm_processor_mask_clear_atomic(&trigger_block->gpu_prefetch_started, gpu->id);
         retry = true;
     }
-
-    block_context = uvm_va_block_context_alloc(mm);
-    if (!block_context)
-        return;
 
     if (uvm_processor_mask_test_and_set_atomic(&trigger_block->gpu_prefetch_started, gpu->id))
         goto out;
@@ -657,6 +654,18 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         goto out;
     }
     prefetch_admitted = true;
+
+    // Capacity denials are common under oversubscription. Obtain the byte
+    // reservation before allocating a migration context so denied or already
+    // claimed attempts need no context allocation/free. On allocation failure
+    // release the reservation through the normal completion path and allow a
+    // subsequent signal to try again.
+    block_context = uvm_va_block_context_alloc(mm);
+    if (!block_context) {
+        prefetch_success = false;
+        rearm_after_completion = true;
+        goto out;
+    }
 
     atomic64_inc(&uvm_cpu_preferred_range_prefetches);
     if (retry)
@@ -782,7 +791,13 @@ out:
         uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm, &reservation,
                                                 prefetched_bytes, prefetch_success);
 
-    uvm_va_block_context_free(block_context);
+    // Keep ownership through reservation release: another signal must not
+    // claim this trigger while the failed attempt still owns capacity.
+    if (rearm_after_completion)
+        uvm_processor_mask_clear_atomic(&trigger_block->gpu_prefetch_started, gpu->id);
+
+    if (block_context)
+        uvm_va_block_context_free(block_context);
 }
 
 void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t *gpu, bool resident_evicted)
