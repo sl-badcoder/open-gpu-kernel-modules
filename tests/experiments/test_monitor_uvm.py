@@ -14,6 +14,17 @@ import monitor_uvm as monitor
 
 
 class MonitorTest(unittest.TestCase):
+    def test_trigger_attribution(self):
+        delta = {"module/uvm_cpu_preferred_trigger_indicated_bytes": 256*1024,
+                 "module/uvm_cpu_preferred_trigger_extra_bytes": 1792*1024}
+        self.assertEqual(monitor.trigger_extra_fraction(delta), 0.875)
+        self.assertIsNone(monitor.trigger_extra_fraction({}))
+        self.assertIsNone(monitor.trigger_extra_fraction({k: 0 for k in delta}))
+        self.assertIsNone(monitor.trigger_extra_fraction({k: None for k in delta}))
+        rows = monitor.differences({"monotonic_s": 10, "metrics": {k: 0 for k in delta}},
+                                   {"monotonic_s": 12, "metrics": delta})
+        self.assertTrue(all(r["kind"] == "counter" and r["per_second"] == r["change"]/2 for r in rows))
+
     def test_return_distance_counters_and_histogram(self):
         before = {"monotonic_s": 10, "metrics": {}}
         after = {"monotonic_s": 12, "metrics": {}}

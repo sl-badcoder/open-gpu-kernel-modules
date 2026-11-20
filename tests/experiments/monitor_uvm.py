@@ -37,6 +37,7 @@ prefetch_pattern_learned_predictions prefetch_pattern_expirations prefetch_recov
 prefetch_probes uvm_cpu_preferred_block_promotions uvm_cpu_preferred_range_prefetches
 uvm_cpu_preferred_prefetch_retries uvm_cpu_preferred_prefetched_bytes
 uvm_cpu_preferred_trigger_prefetched_bytes uvm_cpu_preferred_neighbor_prefetched_bytes
+uvm_cpu_preferred_trigger_indicated_bytes uvm_cpu_preferred_trigger_extra_bytes
 uvm_cpu_preferred_prefetch_capacity_stops uvm_cpu_preferred_admission_requests
 uvm_cpu_preferred_admission_deferred uvm_cpu_preferred_admission_low_pressure
 uvm_cpu_preferred_admission_repeated uvm_cpu_preferred_admission_state_failures
@@ -65,6 +66,14 @@ def return_distance_histogram(delta):
     for row in rows:
         row["population_byte_fraction"] = row["population_bytes"] / total if total else None
     return rows
+
+
+def trigger_extra_fraction(delta):
+    indicated = delta.get("module/uvm_cpu_preferred_trigger_indicated_bytes")
+    extra = delta.get("module/uvm_cpu_preferred_trigger_extra_bytes")
+    if indicated is None or extra is None or indicated + extra <= 0:
+        return None
+    return extra / (indicated + extra)
 
 
 def value(text):
@@ -346,6 +355,7 @@ def main(argv=None):
                 observed_writer.writerows(observed_rows)
             delta = {r["metric"]: r["change"] for r in observed_rows if r["kind"] == "counter"}
             ratios = {}
+            ratios["module/trigger_extra_fraction"] = trigger_extra_fraction(delta)
             for key in delta:
                 if not key.endswith("/prefetch_refault_returns"):
                     continue

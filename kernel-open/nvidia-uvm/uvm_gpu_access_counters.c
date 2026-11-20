@@ -57,6 +57,7 @@ typedef struct
 {
     uvm_va_block_t *blocks[UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY];
     NvU16 region_masks[UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY];
+    uvm_page_mask_t indicated_pages[UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY];
     uvm_gpu_t *gpu;
     struct mm_struct *mm;
     NvU32 count;
@@ -68,7 +69,7 @@ static void demand_first_prefetch_queue_flush(demand_first_prefetch_queue_t *que
 
     for (i = 0; i < queue->count; i++)
         uvm_cpu_block_policy_prefetch_on_signal(queue->blocks[i], queue->gpu, queue->mm,
-                                                queue->region_masks[i]);
+                                                queue->region_masks[i], &queue->indicated_pages[i]);
 
     queue->count = 0;
 }
@@ -82,7 +83,8 @@ static void demand_first_prefetch_queue_push(demand_first_prefetch_queue_t *queu
                                              uvm_va_block_t *block,
                                              uvm_gpu_t *gpu,
                                              struct mm_struct *mm,
-                                             NvU16 region_mask)
+                                             NvU16 region_mask,
+                                             const uvm_page_mask_t *indicated_pages)
 {
     if (queue->count == UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY)
         demand_first_prefetch_queue_flush(queue);
@@ -95,6 +97,7 @@ static void demand_first_prefetch_queue_push(demand_first_prefetch_queue_t *queu
     UVM_ASSERT(queue->gpu == gpu);
     UVM_ASSERT(queue->mm == mm);
     queue->region_masks[queue->count] = region_mask;
+    uvm_page_mask_copy(&queue->indicated_pages[queue->count], indicated_pages);
     queue->blocks[queue->count++] = block;
 }
 
@@ -1589,6 +1592,7 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     bool allow_cpu_promotion = true;
     NvU64 admission_clear_serial = 0;
     NvU16 region_mask = 0;
+    uvm_page_mask_t indicated_pages;
     uvm_page_mask_t cpu_before;
     bool refault_mode = false;
     bool returned_page = false;
@@ -1652,6 +1656,9 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     batch_context->block_service_context.access_counters_buffer_index = access_counters->index;
 
     has_accessed_pages = !uvm_page_mask_empty(accessed_pages);
+    // Native servicing can filter or expand accessed_pages. Preserve the
+    // notification evidence by value until deferred optional population runs.
+    uvm_page_mask_copy(&indicated_pages, accessed_pages);
     refault_mode = has_accessed_pages && !is_hmm &&
                        va_block->managed_range->cpu_access_counter_policy && uvm_pmm_gpu_refault_enabled();
     if (refault_mode) {
@@ -1755,7 +1762,7 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
     }
 
     if (status == NV_OK && prefetch_queue && has_accessed_pages && allow_cpu_promotion)
-        demand_first_prefetch_queue_push(prefetch_queue, va_block, gpu, mm, region_mask);
+        demand_first_prefetch_queue_push(prefetch_queue, va_block, gpu, mm, region_mask, &indicated_pages);
 
     return status;
 }

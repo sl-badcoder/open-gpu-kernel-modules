@@ -39,6 +39,9 @@ static atomic64_t uvm_cpu_preferred_range_prefetches = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_retries = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetched_bytes = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_trigger_prefetched_bytes = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_trigger_indicated_bytes = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_trigger_extra_bytes = ATOMIC64_INIT(0);
+static bool uvm_perf_access_counter_indicated_pages_enable;
 static atomic64_t uvm_cpu_preferred_neighbor_prefetched_bytes = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
 static bool uvm_perf_access_counter_admission_enable = true;
@@ -87,6 +90,11 @@ static const struct kernel_param_ops atomic64_count_ops = {
 };
 
 module_param(uvm_perf_access_counter_admission_enable, bool, S_IRUGO);
+module_param(uvm_perf_access_counter_indicated_pages_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_indicated_pages_enable,
+                 "Under pressure, limit optional trigger population to counter-indicated pages (default false).");
+module_param_cb(uvm_cpu_preferred_trigger_indicated_bytes, &atomic64_count_ops, &uvm_cpu_preferred_trigger_indicated_bytes, S_IRUGO);
+module_param_cb(uvm_cpu_preferred_trigger_extra_bytes, &atomic64_count_ops, &uvm_cpu_preferred_trigger_extra_bytes, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_access_counter_admission_enable,
                  "Pressure-aware admission before CPU-preferred counter promotion (default true). Disables legacy refault path.");
 module_param(uvm_perf_access_counter_admission_pressure_percent, uint, S_IRUGO);
@@ -370,7 +378,9 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
                                 NvU64 *prefetched_bytes,
                                 uvm_prefetch_reservation_t *reservation,
                                 bool *capacity_stop,
-                                bool speculative_neighbor)
+                                bool speculative_neighbor,
+                                const uvm_page_mask_t *indicated_pages,
+                                bool limit_to_indicated)
 {
     NV_STATUS status;
     uvm_va_block_retry_t retry;
@@ -406,6 +416,13 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
     if (thrashing_pages)
         uvm_page_mask_andnot(&prefetch_mask, &prefetch_mask, thrashing_pages);
 
+    if (limit_to_indicated) {
+        if (!indicated_pages)
+            uvm_page_mask_zero(&prefetch_mask);
+        else
+            uvm_page_mask_and(&prefetch_mask, &prefetch_mask, indicated_pages);
+    }
+
     if (uvm_page_mask_empty(&prefetch_mask)) {
         status = NV_OK;
         goto out_unlock;
@@ -430,6 +447,14 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
     if (status == NV_OK) {
         NvU64 moved = (NvU64)uvm_page_mask_weight(&block_context->make_resident.pages_changed_residency) * PAGE_SIZE;
         *prefetched_bytes += moved;
+        if (!speculative_neighbor && indicated_pages && moved) {
+            uvm_page_mask_t overlap;
+            NvU64 indicated;
+            uvm_page_mask_and(&overlap, &block_context->make_resident.pages_changed_residency, indicated_pages);
+            indicated = (NvU64)uvm_page_mask_weight(&overlap) * PAGE_SIZE;
+            atomic64_add(indicated, &uvm_cpu_preferred_trigger_indicated_bytes);
+            atomic64_add(moved - indicated, &uvm_cpu_preferred_trigger_extra_bytes);
+        }
         if (moved && (uvm_perf_access_counter_admission_eviction_enable ||
                       uvm_perf_access_counter_admission_distance_stats_enable)) {
             uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
@@ -498,7 +523,8 @@ out_unlock:
 void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                              uvm_gpu_t *gpu,
                                              struct mm_struct *mm,
-                                             NvU16 region_mask)
+                                             NvU16 region_mask,
+                                             const uvm_page_mask_t *indicated_pages)
 {
     uvm_va_range_managed_t *managed_range = trigger_block->managed_range;
     uvm_va_space_t *va_space;
@@ -523,6 +549,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     bool refault_mode = uvm_pmm_gpu_refault_enabled();
     bool prefetch_admitted = false;
     bool rearm_after_completion = false;
+    bool limit_to_indicated = false;
     bool prefetch_success = true;
     uvm_tracker_t prefetch_tracker = UVM_TRACKER_INIT();
 
@@ -582,6 +609,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     if (uvm_cpu_block_policy_counter_pressure(gpu)) {
         chunk_block_count = min_t(size_t, chunk_block_count, 1);
         region_mask = 0;
+        limit_to_indicated = uvm_perf_access_counter_indicated_pages_enable && !refault_mode;
     }
 
     if (refault_mode) {
@@ -654,6 +682,9 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         goto out;
     }
     prefetch_admitted = true;
+    // A successful partial population must not make the whole VA block
+    // one-shot. Later reports can name different CPU-resident pages in it.
+    rearm_after_completion = limit_to_indicated;
 
     // Capacity denials are common under oversubscription. Obtain the byte
     // reservation before allocating a migration context so denied or already
@@ -742,7 +773,9 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                 &prefetched_bytes,
                                 &reservation,
                                 &capacity_stop,
-                                candidate_index != trigger_index);
+                                candidate_index != trigger_index,
+                                candidate_index == trigger_index ? indicated_pages : NULL,
+                                candidate_index == trigger_index && limit_to_indicated);
         if (candidate_index == trigger_index)
             trigger_prefetched_bytes += prefetched_bytes - bytes_before;
         if (capacity_stop) {
@@ -793,8 +826,11 @@ out:
 
     // Keep ownership through reservation release: another signal must not
     // claim this trigger while the failed attempt still owns capacity.
-    if (rearm_after_completion)
+    if (rearm_after_completion && !capacity_stopped) {
+        if (limit_to_indicated)
+            uvm_processor_mask_clear_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
         uvm_processor_mask_clear_atomic(&trigger_block->gpu_prefetch_started, gpu->id);
+    }
 
     if (block_context)
         uvm_va_block_context_free(block_context);

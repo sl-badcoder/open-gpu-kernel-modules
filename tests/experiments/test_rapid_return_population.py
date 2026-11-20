@@ -42,7 +42,8 @@ static void atomic64_inc(long long *p) {++*p;}
 static long long atomic64_add_return(NvU64 n,long long *p) {*p+=n;return *p;}
 static long long uvm_cpu_preferred_admission_return_bytes;
 static void atomic64_add(NvU64 n,long long *p) {*p+=n;}
-static uvm_page_mask_t cpu, resident, thrashing, changed;
+static uvm_page_mask_t cpu, resident, thrashing, changed, allowed;
+static long long uvm_cpu_preferred_trigger_indicated_bytes,uvm_cpu_preferred_trigger_extra_bytes;
 static bool has_cpu, fail_allocation;
 static NV_STATUS resident_status, map_status, tracker_status;
 static unsigned records, maps, retries, dependencies, populations;
@@ -55,6 +56,7 @@ static const uvm_page_mask_t *uvm_va_block_resident_mask_get(uvm_va_block_t *b,i
 { assert(b->lock && node==-1); return id==0 ? (has_cpu?&cpu:NULL) : &resident; }
 static const uvm_page_mask_t *uvm_perf_thrashing_get_thrashing_pages(uvm_va_block_t *b)
 { assert(b->lock); return &thrashing; }
+static void uvm_page_mask_and(uvm_page_mask_t *d,const uvm_page_mask_t *a,const uvm_page_mask_t *b) {*d=*a & *b;}
 static void uvm_page_mask_copy(uvm_page_mask_t *d,const uvm_page_mask_t *s) { *d=*s; }
 static void uvm_page_mask_andnot(uvm_page_mask_t *d,const uvm_page_mask_t *a,const uvm_page_mask_t *b) { *d=*a & ~*b; }
 static bool uvm_page_mask_empty(const uvm_page_mask_t *m) { return !*m; }
@@ -67,7 +69,7 @@ static int uvm_va_block_region_from_block(uvm_va_block_t *b) { assert(b->lock); 
 static NV_STATUS uvm_va_block_make_resident(uvm_va_block_t *b,uvm_va_block_retry_t *r,
  uvm_va_block_context_t *c,int id,int region,const uvm_page_mask_t *mask,void *unused,int cause)
 { assert(b->lock && !r->allow_eviction && id==1 && !region && !unused && cause==3);
- assert(*mask==(cpu & ~resident & ~thrashing)); c->make_resident.pages_changed_residency=changed;
+ assert(*mask==(cpu & ~resident & ~thrashing & allowed)); c->make_resident.pages_changed_residency=changed;
  r->no_eviction_allocation_failed=fail_allocation; return resident_status; }
 static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get(uvm_va_block_t *b,int id)
 { assert(b->lock && id==1); return &b->state; }
@@ -95,14 +97,41 @@ static NvU64 moved;
 static void reset(void)
 {
  memset(&block,0,sizeof(block));block.managed_range=&managed;populations=0; memset(&context,0,sizeof(context));
+ allowed=~0ULL;uvm_cpu_preferred_trigger_indicated_bytes=uvm_cpu_preferred_trigger_extra_bytes=0;
  has_cpu=true; fail_allocation=false; cpu=7; resident=2; thrashing=4; changed=1;
  resident_status=map_status=tracker_status=0;
  records=maps=retries=dependencies=0; moved=recorded_now=recorded_generation=0;
 }
 static NV_STATUS run(bool neighbor)
-{ return prefetch_block(&block,&gpu,NULL,&context,&tracker,&moved,&reservation,&capacity,neighbor); }
+{ return prefetch_block(&block,&gpu,NULL,&context,&tracker,&moved,&reservation,&capacity,neighbor,NULL,false); }
+static NV_STATUS run_mask(const uvm_page_mask_t *mask,bool limit) {
+ allowed=limit ? (mask ? *mask : 0) : ~0ULL;
+ return prefetch_block(&block,&gpu,NULL,&context,&tracker,&moved,&reservation,&capacity,false,mask,limit);
+}
 int main(void)
 {
+ // Baseline attribution distinguishes actual moved pages inside/outside evidence.
+ uvm_page_mask_t evidence=5;
+ reset();cpu=0xffff;resident=thrashing=0;changed=cpu;
+ assert(run_mask(&evidence,false)==NV_OK && moved==16*PAGE_SIZE);
+ assert(uvm_cpu_preferred_trigger_indicated_bytes==2*PAGE_SIZE);
+ assert(uvm_cpu_preferred_trigger_extra_bytes==14*PAGE_SIZE);
+ // Restricted mode transfers only eligible indicated pages.
+ reset();cpu=0xffff;resident=thrashing=0;changed=evidence;
+ assert(run_mask(&evidence,true)==NV_OK && moved==2*PAGE_SIZE);
+ assert(uvm_cpu_preferred_trigger_indicated_bytes==2*PAGE_SIZE && !uvm_cpu_preferred_trigger_extra_bytes);
+ // Residency/thrashing filters still apply; missing or stale evidence is empty.
+ reset();cpu=15;resident=2;thrashing=8;evidence=15;changed=5;
+ assert(run_mask(&evidence,true)==NV_OK && moved==2*PAGE_SIZE);
+ reset();evidence=resident;assert(run_mask(&evidence,true)==NV_OK && !moved && !maps);
+ reset();assert(run_mask(NULL,true)==NV_OK && !moved && !maps);
+ // Attribution uses actual changed residency, not all indicated candidates.
+ reset();cpu=15;resident=thrashing=0;evidence=15;changed=1;
+ assert(run_mask(&evidence,false)==NV_OK && uvm_cpu_preferred_trigger_indicated_bytes==PAGE_SIZE);
+ assert(!uvm_cpu_preferred_trigger_extra_bytes);
+ reset();cpu=15;resident=thrashing=0;evidence=1;changed=15;resident_status=7;
+ assert(run_mask(&evidence,false)==7 && !uvm_cpu_preferred_trigger_indicated_bytes && !uvm_cpu_preferred_trigger_extra_bytes);
+
  // Actual population consumes a return episode once, using actual moved bytes.
  reset(); gpu.counter_admission_population_bytes=0;uvm_cpu_preferred_admission_return_bytes=0;
  resident=0;block.state.counter_admission_history.evicted=true;

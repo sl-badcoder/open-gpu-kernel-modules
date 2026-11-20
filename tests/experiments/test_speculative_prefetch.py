@@ -15,6 +15,7 @@ PRELUDE = r'''
 #include <string.h>
 typedef unsigned long long NvU64; typedef unsigned short NvU16;
 typedef int NV_STATUS;
+typedef unsigned uvm_page_mask_t;
 typedef struct { int marker; } uvm_prefetch_refault_block_t;
 #define NV_OK 0
 #define UVM_SIZE_1MB (1ULL << 20)
@@ -58,6 +59,9 @@ static long long uvm_cpu_preferred_trigger_prefetched_bytes, uvm_cpu_preferred_n
 static void atomic64_inc(long long *p) {++*p;}
 static void atomic64_add(NvU64 n,long long *p) {*p+=(long long)n;}
 static bool enabled, supported, alloc_fail, trigger_resident;
+static bool uvm_perf_access_counter_indicated_pages_enable;
+static const uvm_page_mask_t *test_indicated_pages;
+static bool last_limit;
 static bool pressure;
 static bool refault_enabled;
 static unsigned refault_neighbor_count;
@@ -117,14 +121,16 @@ static void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *p,uvm_prefetc
 }
 static NV_STATUS uvm_tracker_wait_deinit(uvm_tracker_t *p) {(void)p;++waits;return wait_error;}
 static NV_STATUS prefetch_block(uvm_va_block_t *b,uvm_gpu_t *g,struct mm_struct *m,
- uvm_va_block_context_t *ctx,uvm_tracker_t *tracker,NvU64 *moved,uvm_prefetch_reservation_t *reservation,bool *capacity,bool neighbor) {
+ uvm_va_block_context_t *ctx,uvm_tracker_t *tracker,NvU64 *moved,uvm_prefetch_reservation_t *reservation,bool *capacity,bool neighbor,const uvm_page_mask_t *indicated,bool limit) {
+ last_limit=limit;
+ if(limit)assert(!neighbor);
  assert(reservation->generation==reservation_generation);
  (void)g;(void)m;(void)ctx;(void)tracker;assert(!b->lock && reserved && calls<64);
  visited[calls]=(size_t)(b-blocks);assert(neighbor == (b!=&blocks[trigger_slot]));
  ++calls;*capacity=(calls==capacity_at);
  if(*capacity)return 7;
  if(trigger_resident && !neighbor)return NV_OK;
- *moved+=UVM_VA_BLOCK_SIZE; assert(*moved<=reserved);
+ *moved+=limit ? (indicated ? (NvU64)__builtin_popcount(*indicated)*4096 : 0) : UVM_VA_BLOCK_SIZE; assert(*moved<=reserved);
  return calls==error_at ? 8 : NV_OK;
 }
 '''
@@ -132,6 +138,7 @@ static NV_STATUS prefetch_block(uvm_va_block_t *b,uvm_gpu_t *g,struct mm_struct 
 CASES = r'''
 static void reset(void) {
  now=1000000000ULL;completed_success=false;
+ uvm_perf_access_counter_indicated_pages_enable=false;test_indicated_pages=NULL;last_limit=false;
  memset(blocks,0,sizeof(blocks));memset(&range,0,sizeof(range));
  space.lock=1;range.va_range.va_space=&space;range.count=8;
  for(size_t i=0;i<8;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
@@ -145,9 +152,29 @@ static void reset(void) {
  uvm_cpu_preferred_prefetch_retries=uvm_cpu_preferred_prefetched_bytes=0;
  uvm_cpu_preferred_trigger_prefetched_bytes=uvm_cpu_preferred_neighbor_prefetched_bytes=0;
 }
-static void run(void){uvm_cpu_block_policy_prefetch_on_signal(&blocks[trigger_slot],&gpu,&mm,0);
+static void run(void){uvm_cpu_block_policy_prefetch_on_signal(&blocks[trigger_slot],&gpu,&mm,0,test_indicated_pages);
  assert(uvm_cpu_preferred_prefetched_bytes==uvm_cpu_preferred_trigger_prefetched_bytes+uvm_cpu_preferred_neighbor_prefetched_bytes);}
 int main(void) {
+ // Pressure-limited partial population reopens the trigger after release.
+ reset();pressure=true;grant=2*UVM_SIZE_1MB;uvm_perf_access_counter_indicated_pages_enable=true;
+ uvm_page_mask_t indicated=1;test_indicated_pages=&indicated;
+ run();assert(last_limit && calls==1 && transferred==4096 && !blocks[4].gpu_prefetch_started);
+ waits=0;indicated=2;run();assert(calls==2 && end_calls==2 && last_limit);
+ // A limited capacity failure cannot leak retry state into a later full copy.
+ reset();pressure=true;grant=2*UVM_SIZE_1MB;uvm_perf_access_counter_indicated_pages_enable=true;
+ test_indicated_pages=&indicated;capacity_at=1;
+ run();assert(blocks[4].gpu_prefetch_started && blocks[4].gpu_prefetch_retry);
+ watermark_at=0;int denied_begins=begin_calls;run();assert(begin_calls==denied_begins);
+ watermark_at=-1;waits=0;capacity_at=0;indicated=4;run();
+ assert(transferred==4096 && !blocks[4].gpu_prefetch_retry && !blocks[4].gpu_prefetch_started);
+ waits=0;pressure=false;grant=4*UVM_SIZE_1MB;run();
+ int completed_calls=calls;run();assert(calls==completed_calls && blocks[4].gpu_prefetch_started);
+ // Low pressure preserves larger populations, even with the flag enabled.
+ reset();uvm_perf_access_counter_indicated_pages_enable=true;test_indicated_pages=&indicated;
+ run();assert(!last_limit && calls==2 && blocks[4].gpu_prefetch_started);
+ // Flag off retains the successful one-shot behavior under pressure.
+ reset();pressure=true;grant=2*UVM_SIZE_1MB;test_indicated_pages=&indicated;
+ run();assert(!last_limit && calls==1 && blocks[4].gpu_prefetch_started);
  // Actual production loop: range clamps request; grant truncates it; trigger is first.
  reset();run();assert(requested==16*UVM_SIZE_1MB && calls==2 && visited[0]==4 && visited[1]==3);
  assert(uvm_cpu_preferred_trigger_prefetched_bytes==UVM_VA_BLOCK_SIZE && uvm_cpu_preferred_neighbor_prefetched_bytes==UVM_VA_BLOCK_SIZE);
@@ -158,7 +185,7 @@ int main(void) {
  assert(end_calls==1 && completed_success && transferred==grant && !reserved);
  assert(uvm_cpu_preferred_trigger_prefetched_bytes==UVM_VA_BLOCK_SIZE && !uvm_cpu_preferred_neighbor_prefetched_bytes);
  reset();pressure=true;grant=2*UVM_SIZE_1MB;
- uvm_cpu_block_policy_prefetch_on_signal(&blocks[4],&gpu,&mm,0x12);
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[4],&gpu,&mm,0x12,NULL);
  assert(calls==1 && visited[0]==4 && requested==UVM_VA_BLOCK_SIZE);
  reset();grant=8*UVM_SIZE_1MB;pressure_after_copies=1;run();
  assert(calls==1 && visited[0]==4 && end_calls==1 && completed_success);
@@ -240,30 +267,30 @@ int main(void) {
  reset();range.count=64;
  for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
  trigger_slot=2;grant=8*UVM_SIZE_1MB;
- uvm_cpu_block_policy_prefetch_on_signal(&blocks[2],&gpu,&mm,(1u<<1)|(1u<<4));
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[2],&gpu,&mm,(1u<<1)|(1u<<4),NULL);
  assert(requested==8*UVM_SIZE_1MB && calls==4 && visited[0]==2 && visited[1]==3 && visited[2]==8 && visited[3]==9);
  assert(transferred==grant && completed_success && !reserved);
  // Entire learned tile remains bounded by a smaller concurrent budget grant.
  reset();range.count=64;
  for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
  trigger_slot=31;grant=6*UVM_SIZE_1MB;
- uvm_cpu_block_policy_prefetch_on_signal(&blocks[31],&gpu,&mm,0xffff);
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[31],&gpu,&mm,0xffff,NULL);
  assert(requested==64*UVM_SIZE_1MB && calls==3 && visited[0]==31 && visited[1]==30 && visited[2]==0);
  // Partial first block at an unaligned range start: never visit the prior half.
  reset();range.start=3*UVM_VA_BLOCK_SIZE+4096;range.count=4;trigger_slot=0;grant=6*UVM_SIZE_1MB;
  for(size_t i=0;i<4;++i){blocks[i].start=(3+i)*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
  blocks[0].start=range.start;
- uvm_cpu_block_policy_prefetch_on_signal(&blocks[0],&gpu,&mm,(1u<<1)|(1u<<2));
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[0],&gpu,&mm,(1u<<1)|(1u<<2),NULL);
  assert(calls==3 && visited[0]==0 && visited[1]==1 && visited[2]==2 && requested==grant);
  // Allocation ending in the first half of a region must not invent its sibling.
  reset();range.count=3;trigger_slot=2;grant=2*UVM_SIZE_1MB;
- uvm_cpu_block_policy_prefetch_on_signal(&blocks[2],&gpu,&mm,(1u<<1));
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[2],&gpu,&mm,(1u<<1),NULL);
  assert(calls==1 && visited[0]==2 && requested==grant);
  // A tile boundary must clip a long allocation beginning before that tile.
  reset();range.count=64;
  for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
  trigger_slot=32;grant=64*UVM_SIZE_1MB;
- uvm_cpu_block_policy_prefetch_on_signal(&blocks[32],&gpu,&mm,0xffff);
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[32],&gpu,&mm,0xffff,NULL);
  assert(calls==32 && visited[0]==32 && visited[1]==33);
  for(int i=0;i<calls;++i)assert(visited[i]>=32 && visited[i]<64);
  // Refault admission copies only additional neighbors. The demand trigger
@@ -271,7 +298,7 @@ int main(void) {
  reset();range.count=64;
  for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
  trigger_slot=31; refault_enabled=true; refault_neighbor_count=2; grant=4*UVM_SIZE_1MB;
- uvm_cpu_block_policy_prefetch_on_signal(&blocks[31],&gpu,&mm,0);
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[31],&gpu,&mm,0,NULL);
  assert(requested==4*UVM_SIZE_1MB && calls==2 && visited[0]==30 && visited[1]==29);
  assert(transferred==grant && completed_success && !reserved);
  assert(!uvm_cpu_preferred_trigger_prefetched_bytes && (NvU64)uvm_cpu_preferred_neighbor_prefetched_bytes==grant);
@@ -279,13 +306,13 @@ int main(void) {
  reset();range.count=64;
  for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
  trigger_slot=0; refault_enabled=true; refault_neighbor_count=4; grant=8*UVM_SIZE_1MB;
- uvm_cpu_block_policy_prefetch_on_signal(&blocks[0],&gpu,&mm,0);
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[0],&gpu,&mm,0,NULL);
  assert(calls==4 && visited[0]==1 && visited[1]==2 && visited[2]==3 && visited[3]==4);
  // An empty admission makes no reservation and performs no speculative copy.
  reset();range.count=64;
  for(size_t i=0;i<64;++i){blocks[i].managed_range=&range;blocks[i].start=i*UVM_VA_BLOCK_SIZE;range.blocks[i]=&blocks[i];}
  trigger_slot=32; refault_enabled=true; refault_neighbor_count=0; grant=8*UVM_SIZE_1MB;
- uvm_cpu_block_policy_prefetch_on_signal(&blocks[32],&gpu,&mm,0);
+ uvm_cpu_block_policy_prefetch_on_signal(&blocks[32],&gpu,&mm,0,NULL);
  assert(!begin_calls && !end_calls && !reserved && !calls);
  puts("Production prefetch walker: bounded copies, trigger order, retry, balanced failures, waits and churn feedback passed.");
  return 0;

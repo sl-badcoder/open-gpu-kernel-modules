@@ -32,6 +32,7 @@ typedef unsigned long long NvU64;
 typedef int NV_STATUS;
 #define NV_OK 0
 #define UVM_ASSERT(x) assert(x)
+typedef NvU64 uvm_page_mask_t;
 struct mm_struct { int id; };
 typedef struct uvm_gpu_struct { int id; int pmm; } uvm_gpu_t;
 typedef struct uvm_va_space_struct { int id; } uvm_va_space_t;
@@ -42,6 +43,7 @@ typedef struct entry_struct { uvm_va_space_t *va_space; uvm_gpu_t *gpu; NvU64 ad
 typedef struct batch_struct { uvm_access_counter_buffer_entry_t *notifications[32]; NvU32 num_notifications; } uvm_access_counter_service_batch_context_t;
 typedef uvm_access_counter_service_batch_context_t batch_t;
 typedef struct access_struct { uvm_parent_gpu_t *parent_gpu; uvm_access_counter_service_batch_context_t batch_service_context; } uvm_access_counter_buffer_t;
+static void uvm_page_mask_copy(uvm_page_mask_t *dst, const uvm_page_mask_t *src) { *dst = *src; }
 /* Refault mode is exercised by test_prefetch_refault.py. Keep this queue
  * harness in the legacy path while still compiling the production calls. */
 static bool __attribute__((unused)) uvm_pmm_gpu_refault_enabled(void) { return false; }
@@ -49,7 +51,8 @@ static void __attribute__((unused)) uvm_pmm_gpu_refault_demand(int *p, NvU64 r, 
 static int log_events[256]; static size_t log_count; static int log_event(int kind, int id) { return log_events[log_count++] = kind * 1000 + id; }
 static int current_kind;
 static bool allow_queue = true;
-static void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *b, uvm_gpu_t *g, struct mm_struct *m, NvU16 mask) { (void)g; (void)m; assert(mask==0x12); log_event(3, b->id); }
+static uvm_page_mask_t seen_indicated[32];
+static void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *b, uvm_gpu_t *g, struct mm_struct *m, NvU16 mask, const uvm_page_mask_t *indicated) { (void)g; (void)m; assert(mask==0x12); assert(indicated); seen_indicated[log_count] = *indicated; log_event(3, b->id); }
 static void preprocess_notifications(uvm_parent_gpu_t *p, batch_t *b) { (void)p; (void)b; }
 static struct mm_struct global_mm;
 static struct mm_struct *uvm_va_space_mm_retain_lock(uvm_va_space_t *v) { (void)v; return &global_mm; }
@@ -78,18 +81,21 @@ static NV_STATUS service_notifications_batch(uvm_gpu_va_space_t *g, struct mm_st
     if (e->demand_status != NV_OK) return e->demand_status;
     if (e->flags_status != NV_OK) return e->flags_status;
     log_event(2, e->block->id); /* notification flags */
-    if (allow_queue)
-        demand_first_prefetch_queue_push(q, e->block, e->gpu, mm, 0x12);
+    if (allow_queue) {
+        uvm_page_mask_t indicated = (uvm_page_mask_t)(1ULL << e->block->id);
+        demand_first_prefetch_queue_push(q, e->block, e->gpu, mm, 0x12, &indicated);
+        indicated = 0;
+    }
     return NV_OK;
 }
 '''
     tests = r'''
-static void reset(void) { memset(log_events, 0, sizeof(log_events)); log_count = 0; }
+static void reset(void) { memset(log_events, 0, sizeof(log_events)); memset(seen_indicated, 0, sizeof(seen_indicated)); log_count = 0; }
 static void run(uvm_access_counter_buffer_t *a, uvm_access_counter_buffer_entry_t **e, size_t n) { a->batch_service_context.num_notifications = (NvU32)n; for (size_t i=0;i<n;i++) a->batch_service_context.notifications[i]=e[i]; }
 int main(void) {
     uvm_parent_gpu_t parent={0}; uvm_va_space_t va1={1}, va2={2}; uvm_gpu_t gpu1={1,0}, gpu2={2,0}; struct { uvm_va_block_t b; uvm_access_counter_buffer_entry_t e; } items[10]; uvm_access_counter_buffer_t a={.parent_gpu=&parent}; uvm_access_counter_buffer_entry_t *entries[10];
     for (int i=0;i<10;i++) { items[i].b.id=i+1; items[i].e=(uvm_access_counter_buffer_entry_t){&va1,&gpu1,0,0,NV_OK,NV_OK,&items[i].b}; entries[i]=&items[i].e; }
-    reset(); run(&a,entries,2); items[0].e.va_space=&va1; items[1].e.va_space=&va1; assert(service_notifications(&a)==NV_OK); assert(log_events[0]==1001 && log_events[1]==2001 && log_events[2]==1002 && log_events[3]==2002 && log_count==6 && log_events[4]==3001 && log_events[5]==3002);
+    reset(); run(&a,entries,2); items[0].e.va_space=&va1; items[1].e.va_space=&va1; assert(service_notifications(&a)==NV_OK); assert(log_events[0]==1001 && log_events[1]==2001 && log_events[2]==1002 && log_events[3]==2002 && log_count==6 && log_events[4]==3001 && log_events[5]==3002); assert(seen_indicated[4] == (1ULL << 1) && seen_indicated[5] == (1ULL << 2));
     reset(); items[2].e.gpu=&gpu2; items[3].e.gpu=&gpu2; items[2].e.va_space=&va1; items[3].e.va_space=&va2; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[2].e,&items[3].e},2); assert(service_notifications(&a)==NV_OK); assert(log_events[2]==3003 && log_events[5]==3004);
     reset(); items[0].e.demand_status=7; items[1].e.demand_status=NV_OK; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[0].e,&items[1].e},2); assert(service_notifications(&a)==7 && log_count==1);
     reset(); items[0].e.demand_status=NV_OK; items[0].e.flags_status=8; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[0].e},1); assert(service_notifications(&a)==8 && log_count==1);
@@ -163,7 +169,7 @@ struct vm_area_struct { NvU64 vm_end; };
 static bool uvm_va_block_is_hmm(uvm_va_block_t *b) { (void)b; return false; }
 static void uvm_hmm_migrate_begin_wait(uvm_va_block_t *b) { (void)b; }
 static void uvm_hmm_migrate_finish(uvm_va_block_t *b) { (void)b; }
-static void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *b, uvm_gpu_t *g, struct mm_struct *m, NvU16 mask) { (void)g; (void)m; assert(mask==0x11); prefetch_ids[queue_count++] = b->id; }
+static void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *b, uvm_gpu_t *g, struct mm_struct *m, NvU16 mask, const uvm_page_mask_t *indicated) { (void)g; (void)m; assert(mask==0x11); assert(indicated && *indicated); prefetch_ids[queue_count++] = b->id; }
 static void uvm_page_mask_zero(uvm_page_mask_t *m) { *m = 0; }
 static void uvm_assert_rwsem_locked(void *l) { (void)l; }
 static void uvm_va_block_context_init(uvm_va_block_context_t *c, struct mm_struct *m) { (void)c; (void)m; }
@@ -173,7 +179,7 @@ static uvm_va_block_gpu_state_t gpu_state;
 static bool gpu_state_present=true;
 static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get(uvm_va_block_t *b, int id) { (void)b; (void)id; return gpu_state_present ? &gpu_state : NULL; }
 static bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *b, uvm_gpu_t *g, unsigned buffer, NvU64 submitted, NvU64 fresh) { (void)b;(void)g;(void)buffer;(void)submitted;(void)fresh; return allow_cpu_promotion; }
-static NV_STATUS service_notification_va_block_helper(struct mm_struct *m, uvm_va_block_t *b, uvm_gpu_t *g, uvm_access_counter_service_batch_context_t *c, bool allow, bool *did_migrate) { (void)m;(void)b;(void)g;(void)c; *did_migrate = demand_status == NV_OK && allow; gpu_state.resident=allow ? gpu_after_mask : 0; gpu_state.evicted=0; gpu_state_present=true; return demand_status; }
+static NV_STATUS service_notification_va_block_helper(struct mm_struct *m, uvm_va_block_t *b, uvm_gpu_t *g, uvm_access_counter_service_batch_context_t *c, bool allow, bool *did_migrate) { (void)m;(void)b;(void)g; c->accessed_pages=0; *did_migrate = demand_status == NV_OK && allow; gpu_state.resident=allow ? gpu_after_mask : 0; gpu_state.evicted=0; gpu_state_present=true; return demand_status; }
 static NV_STATUS notify_tools_and_process_flags(uvm_va_space_t *v, uvm_gpu_t *g, uvm_access_counter_buffer_t *a, NvU64 x, uvm_access_counter_buffer_entry_t **e, NvU32 n, NvU32 f, void *m) { (void)v;(void)g;(void)a;(void)x;(void)e;(void)n;(void)m; last_flags=f; return flags_status; }
 '''
     block_queue = text[text.index("#define UVM_DEMAND_FIRST_PREFETCH_QUEUE_CAPACITY"):text.index("// Each page in a tracked physical range")]
