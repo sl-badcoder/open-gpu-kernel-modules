@@ -43,6 +43,7 @@ static atomic64_t uvm_cpu_preferred_neighbor_prefetched_bytes = ATOMIC64_INIT(0)
 static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
 static bool uvm_perf_access_counter_admission_enable = true;
 static unsigned uvm_perf_access_counter_admission_pressure_percent = 95;
+static unsigned uvm_perf_access_counter_admission_observations = 3;
 static atomic64_t uvm_cpu_preferred_admission_requests = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_admission_deferred = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_admission_low_pressure = ATOMIC64_INIT(0);
@@ -80,6 +81,9 @@ MODULE_PARM_DESC(uvm_perf_access_counter_admission_enable,
 module_param(uvm_perf_access_counter_admission_pressure_percent, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_access_counter_admission_pressure_percent,
                  "PMA usage percentage requiring reaccess after a completed counter clear (default 95, clamped 1..100).");
+module_param(uvm_perf_access_counter_admission_observations, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_admission_observations,
+                 "Clear-separated region observations required under pressure, including the initial report (default 3, clamped 2..8; 2 restores baseline).");
 module_param_cb(uvm_cpu_preferred_admission_requests, &atomic64_count_ops, &uvm_cpu_preferred_admission_requests, S_IRUGO);
 module_param_cb(uvm_cpu_preferred_admission_deferred, &atomic64_count_ops, &uvm_cpu_preferred_admission_deferred, S_IRUGO);
 module_param_cb(uvm_cpu_preferred_admission_low_pressure, &atomic64_count_ops, &uvm_cpu_preferred_admission_low_pressure, S_IRUGO);
@@ -115,8 +119,10 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
     pressure = uvm_cpu_block_policy_counter_pressure(gpu);
     state = uvm_va_block_gpu_state_get(va_block, gpu->id);
     if (!pressure) {
-        if (state)
+        if (state) {
             state->counter_admission.pending = false;
+            state->counter_admission.observations = 0;
+        }
         atomic64_inc(&uvm_cpu_preferred_admission_low_pressure);
         return true;
     }
@@ -127,7 +133,8 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
         atomic64_inc(&uvm_cpu_preferred_admission_deferred);
         return false;
     }
-    admitted = uvm_counter_admission_decide(&state->counter_admission, true, buffer, submitted, fresh);
+    admitted = uvm_counter_admission_decide(&state->counter_admission, true, buffer, submitted, fresh,
+                                           uvm_perf_access_counter_admission_observations);
     if (admitted)
         atomic64_inc(&uvm_cpu_preferred_admission_repeated);
     else

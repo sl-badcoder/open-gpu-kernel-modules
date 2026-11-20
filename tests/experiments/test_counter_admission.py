@@ -24,37 +24,100 @@ static struct task_struct current_kernel_task __attribute__((unused));
 '''
 
 CASES = r'''
+_Static_assert(sizeof(uvm_counter_admission_region_t) == 16,
+               "observation count must fit the existing region-state padding");
+
+static void three_observations_require_two_distinct_completed_clears(void)
+{
+    uvm_counter_admission_region_t r = {0};
+    assert(!uvm_counter_admission_decide(&r, true, 0, 10, 10, 3));
+    assert(r.observations == 1 && r.clear_serial == 11);
+    assert(!uvm_counter_admission_decide(&r, true, 0, 11, 10, 3));
+    assert(!uvm_counter_admission_decide(&r, true, 0, 11, 11, 3));
+    assert(r.observations == 2 && r.clear_serial == 12);
+    for (int i = 0; i < 100; ++i)
+        assert(!uvm_counter_admission_decide(&r, true, 0, 12, 11, 3));
+    assert(r.observations == 2);
+    assert(uvm_counter_admission_decide(&r, true, 0, 12, 12, 3));
+    assert(!r.pending && !r.observations);
+}
+
+static void probation_restarts_and_large_clear_jumps_count_once(void)
+{
+    uvm_counter_admission_region_t r = {0};
+    assert(!uvm_counter_admission_decide(&r, true, 0, 1, 1, 3));
+    assert(!uvm_counter_admission_decide(&r, true, 0, 100, 100, 3));
+    assert(r.observations == 2 && r.clear_serial == 101);
+    assert(!uvm_counter_admission_decide(&r, true, 1, 101, 101, 3));
+    assert(r.observations == 1 && r.buffer == 1);
+    assert(!uvm_counter_admission_decide(&r, true, 1, 102, 102, 3));
+    assert(uvm_counter_admission_decide(&r, false, 1, 102, 102, 3));
+    assert(!r.pending && !r.observations);
+    assert(!uvm_counter_admission_decide(&r, true, 1, 103, 103, 3));
+    // Failed clear/eviction cancels pending in the production caller. Stale
+    // observation bytes must never survive cancellation as usable evidence.
+    r.pending = false; r.observations = 2;
+    assert(!uvm_counter_admission_decide(&r, true, 1, 104, 104, 3));
+    assert(r.observations == 1);
+}
+
+static void required_counts_are_bounded_and_do_not_advance_from_backlog(void)
+{
+    for (NvU32 config = 0; config <= 10; ++config) {
+        NvU32 required = config < 2 ? 2 : (config > 8 ? 8 : config);
+        uvm_counter_admission_region_t r = {0};
+        for (NvU32 i = 0; i < required; ++i)
+            assert(uvm_counter_admission_decide(&r, true, 0, 10 + i, 10 + i, config) ==
+                   (i + 1 == required));
+    }
+    uvm_counter_admission_region_t r = {0};
+    uvm_counter_admission_buffer_t b = {.submitted=10, .fresh=10, .batch_fresh=10};
+    assert(!uvm_counter_admission_decide(&r, true, 0, b.submitted, b.batch_fresh, 3));
+    ++b.submitted; // clear for observation 1
+    uvm_counter_admission_prepare(&b, true, 2);
+    assert(!uvm_counter_admission_decide(&r, true, 0, b.submitted, b.batch_fresh, 3));
+    uvm_counter_admission_consumed(&b, 2);
+    assert(!uvm_counter_admission_decide(&r, true, 0, b.submitted, b.batch_fresh, 3));
+    assert(r.observations == 1); // crossing batch remains fenced
+    uvm_counter_admission_prepare(&b, false, 0);
+    assert(!uvm_counter_admission_decide(&r, true, 0, b.submitted, b.batch_fresh, 3));
+    assert(r.observations == 2);
+    ++b.submitted; // clear for observation 2
+    uvm_counter_admission_prepare(&b, true, 0);
+    assert(uvm_counter_admission_decide(&r, true, 0, b.submitted, b.batch_fresh, 3));
+}
+
 static void low_pressure_is_immediate_and_clears_pending(void)
 {
     uvm_counter_admission_region_t r = {0};
-    assert(uvm_counter_admission_decide(&r, true, 1, 10, 10) == false);
+    assert(uvm_counter_admission_decide(&r, true, 1, 10, 10, 2) == false);
     assert(r.pending && r.buffer == 1 && r.clear_serial == 11);
-    assert(uvm_counter_admission_decide(&r, false, 1, 10, 10) == true);
+    assert(uvm_counter_admission_decide(&r, false, 1, 10, 10, 2) == true);
     assert(!r.pending);
-    assert(uvm_counter_admission_decide(&r, true, 1, 11, 11) == false);
+    assert(uvm_counter_admission_decide(&r, true, 1, 11, 11, 2) == false);
 }
 
 static void pressure_requires_fresh_second_observation(void)
 {
     uvm_counter_admission_region_t r = {0};
-    assert(!uvm_counter_admission_decide(&r, true, 2, 20, 20));
+    assert(!uvm_counter_admission_decide(&r, true, 2, 20, 20, 2));
     /* Repeated notification from before the completed clear is insufficient. */
-    assert(!uvm_counter_admission_decide(&r, true, 2, 20, 20));
-    assert(!uvm_counter_admission_decide(&r, true, 2, 21, 20));
+    assert(!uvm_counter_admission_decide(&r, true, 2, 20, 20, 2));
+    assert(!uvm_counter_admission_decide(&r, true, 2, 21, 20, 2));
     /* A completed clear advances fresh to the recorded serial. */
-    assert(uvm_counter_admission_decide(&r, true, 2, 21, 21));
+    assert(uvm_counter_admission_decide(&r, true, 2, 21, 21, 2));
     assert(!r.pending);
 }
 
 static void different_buffers_do_not_satisfy_pending_region(void)
 {
     uvm_counter_admission_region_t r = {0};
-    assert(!uvm_counter_admission_decide(&r, true, 0, 4, 4));
-    assert(!uvm_counter_admission_decide(&r, true, 1, 5, 5));
+    assert(!uvm_counter_admission_decide(&r, true, 0, 4, 4, 2));
+    assert(!uvm_counter_admission_decide(&r, true, 1, 5, 5, 2));
     assert(r.pending && r.buffer == 1 && r.clear_serial == 6);
-    assert(!uvm_counter_admission_decide(&r, true, 0, 6, 6));
-    assert(!uvm_counter_admission_decide(&r, true, 1, 6, 5));
-    assert(uvm_counter_admission_decide(&r, true, 1, 7, 7));
+    assert(!uvm_counter_admission_decide(&r, true, 0, 6, 6, 2));
+    assert(!uvm_counter_admission_decide(&r, true, 1, 6, 5, 2));
+    assert(uvm_counter_admission_decide(&r, true, 1, 7, 7, 2));
 }
 
 static void prepare_without_queued_notifications_commits_immediately(void)
@@ -110,6 +173,9 @@ static void queued_count_boundary_and_wrap_abstraction(void)
 
 int main(void)
 {
+    three_observations_require_two_distinct_completed_clears();
+    probation_restarts_and_large_clear_jumps_count_once();
+    required_counts_are_bounded_and_do_not_advance_from_backlog();
     low_pressure_is_immediate_and_clears_pending();
     pressure_requires_fresh_second_observation();
     different_buffers_do_not_satisfy_pending_region();
@@ -164,7 +230,7 @@ typedef uint64_t NvU64;
 
 
 def extract_function(text: str, name: str) -> str:
-    match = re.search(r"static bool " + re.escape(name) + r"\(", text)
+    match = re.search(r"(?:static )?bool " + re.escape(name) + r"\(", text)
     if not match:
         raise ValueError(name)
     brace = text.index("{", match.start())
@@ -263,5 +329,70 @@ def main() -> None:
         subprocess.run([str(binary)], check=True)
 
 
+GATE_STUBS = r'''
+#define clamp(a,b,c) ((a)<(b)?(b):((a)>(c)?(c):(a)))
+typedef struct { uvm_counter_admission_region_t counter_admission; } uvm_va_block_gpu_state_t;
+typedef struct { int dummy; } range_t;
+typedef struct { int lock; range_t *managed_range; } uvm_va_block_t;
+typedef struct { int id; } uvm_gpu_t;
+static bool enabled=true, pressure=true, have_state=true, fail_alloc=false;
+static unsigned uvm_perf_access_counter_admission_observations=3;
+static long long uvm_cpu_preferred_admission_requests, uvm_cpu_preferred_admission_deferred;
+static long long uvm_cpu_preferred_admission_low_pressure, uvm_cpu_preferred_admission_repeated;
+static long long uvm_cpu_preferred_admission_state_failures;
+static uvm_va_block_gpu_state_t state;
+static void atomic64_inc(long long *p) {++*p;}
+static void uvm_assert_mutex_locked(int *p) {assert(*p);}
+static bool uvm_cpu_block_policy_counter_admission_enabled(void) {return enabled;}
+static bool uvm_va_block_is_hmm(uvm_va_block_t *b) {(void)b;return false;}
+static bool uvm_cpu_block_policy_should_service_4k(range_t *r,uvm_gpu_t *g) {(void)r;(void)g;return true;}
+static bool uvm_cpu_block_policy_counter_pressure(uvm_gpu_t *g) {(void)g;return pressure;}
+static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get(uvm_va_block_t *b,int id)
+{(void)b;(void)id;return have_state?&state:0;}
+static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get_alloc(uvm_va_block_t *b,uvm_gpu_t *g)
+{(void)b;(void)g;return fail_alloc?0:&state;}
+'''
+
+GATE_CASES = r'''
+int main(void) {
+    range_t range={0};uvm_va_block_t block={.lock=1,.managed_range=&range};uvm_gpu_t gpu={0};
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,10,10));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,11,11));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,12,12));
+    assert(uvm_cpu_preferred_admission_requests==3&&uvm_cpu_preferred_admission_deferred==2);
+    assert(uvm_cpu_preferred_admission_repeated==1);
+    uvm_perf_access_counter_admission_observations=2;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,13,13));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,14,14));
+    uvm_perf_access_counter_admission_observations=3;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,15,15));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,16,16));
+    pressure=false;
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,16,16));
+    assert(!state.counter_admission.pending&&!state.counter_admission.observations);
+    assert(uvm_cpu_preferred_admission_low_pressure==1);
+    pressure=true;have_state=false;fail_alloc=true;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,17,17));
+    assert(uvm_cpu_preferred_admission_state_failures==1);
+    assert(uvm_cpu_preferred_admission_requests==uvm_cpu_preferred_admission_deferred+
+           uvm_cpu_preferred_admission_low_pressure+uvm_cpu_preferred_admission_repeated);
+    puts("counter admission production gate: configurable observations, reset, accounting and state failure passed");
+}
+'''
+
+def test_production_gate():
+    source = (ROOT / "kernel-open/nvidia-uvm/uvm_cpu_block_policy.c").read_text()
+    code = PRELUDE + HEADER.read_text() + GATE_STUBS + extract_function(
+        source, "uvm_cpu_block_policy_admit_counter") + GATE_CASES
+    with tempfile.TemporaryDirectory(prefix="counter-admission-gate-") as directory:
+        cfile, binary = Path(directory) / "test.c", Path(directory) / "test"
+        cfile.write_text(code)
+        subprocess.run(["cc", "-std=c11", "-O1", "-Wall", "-Wextra", "-Werror",
+                        "-Wno-unused-function", "-fsanitize=address,undefined",
+                        str(cfile), "-o", str(binary)], check=True)
+        subprocess.run([str(binary)], check=True)
+
+
 if __name__ == "__main__":
     main()
+    test_production_gate()

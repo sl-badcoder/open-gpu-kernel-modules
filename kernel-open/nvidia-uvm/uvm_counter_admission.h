@@ -20,6 +20,8 @@ typedef struct
     NvU64 clear_serial;
     NvU32 buffer;
     bool pending;
+    // Fits in the existing padding; counts distinct clear-separated reports.
+    unsigned char observations;
 } uvm_counter_admission_region_t;
 
 // Called before fetching, after testing clear completion and reading PUT.
@@ -55,15 +57,28 @@ static inline void uvm_counter_admission_consumed(uvm_counter_admission_buffer_t
 
 static inline bool uvm_counter_admission_decide(uvm_counter_admission_region_t *r,
                                                 bool pressure, NvU32 buffer,
-                                                NvU64 submitted, NvU64 fresh)
+                                                NvU64 submitted, NvU64 fresh,
+                                                NvU32 required_observations)
 {
     if (!pressure) {
         r->pending = false;
+        r->observations = 0;
         return true;
     }
+    if (required_observations < 2)
+        required_observations = 2;
+    if (required_observations > 8)
+        required_observations = 8;
     if (r->pending && r->buffer == buffer && fresh >= r->clear_serial) {
-        r->pending = false;
-        return true;
+        if (++r->observations >= required_observations) {
+            r->pending = false;
+            r->observations = 0;
+            return true;
+        }
+        // A further observation must follow this report's own clear. Multiple
+        // reports against the same fresh boundary never advance the count.
+        r->clear_serial = submitted + 1;
+        return false;
     }
     // Keep the earliest pending clear. Repeated pre-clear notifications must
     // neither satisfy the second observation nor postpone it indefinitely.
@@ -71,6 +86,7 @@ static inline bool uvm_counter_admission_decide(uvm_counter_admission_region_t *
         r->pending = true;
         r->buffer = buffer;
         r->clear_serial = submitted + 1;
+        r->observations = 1;
     }
     return false;
 }

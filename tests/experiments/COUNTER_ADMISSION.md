@@ -1,6 +1,50 @@
 # Counter admission experiment
 
-Branch: `615.71.09/experiment/counter-admission`.
+Branch: `615.71.09/experiment/counter-admission-three-observations`.
+Based on the successful `615.71.09/experiment/counter-admission` baseline, without
+request-driven replacement or turnover-controller changes.
+
+## Three-observation comparison
+
+This branch defaults to three observations under pressure. Add this load-time
+parameter to the existing module command:
+
+```bash
+uvm_perf_access_counter_admission_observations=3
+```
+
+For the original admission behavior on the same binary, use `=2`. The value is
+clamped to 2..8. Below the pressure threshold, admission remains immediate.
+Keep the established settings fixed: admission enabled, pressure 85%, hardware
+threshold 1024, eager eviction enabled with high/low 99/90 and batch count 16,
+VAB mode 3, full-block promotion disabled, refault/backoff/recovery/sparse disabled.
+
+Three means an initial report plus two further observations of the same virtual
+block/GPU through the same buffer, each after the preceding observation's clear
+has completed and its captured notification backlog has drained. Reports in the
+same fresh-clear epoch cannot advance the count. Large jumps in the clear serial
+count as one observation, not several. This can require more than three raw
+hardware notifications because pre-clear/backlogged reports do not qualify.
+"Consecutive" is per-block probation, not adjacency in the global notification
+stream. Reports about other blocks do not reset it. There is no time expiration.
+
+A buffer change restarts at observation one. Low pressure, eviction, or a failed
+service/clear cancels probation; the next pressure-mode report starts fresh.
+After admission, a subsequent pressure-mode attempt must establish fresh evidence
+again, as in the baseline. An admission grant still need not produce a transfer.
+
+The observation byte fits the existing 16-byte per-block/GPU state padding. No
+new timers, history tables, counter-clear commands, or per-observation telemetry
+atomics are added. The existing monitor captures the module parameter and all
+existing decision and trigger/neighbor movement counters automatically.
+
+Compare `=2` and `=3` at batches 8, 24 and 32, reloading between configurations.
+Keep the reserve process and all other settings identical; alternate repeated
+runs. Compare per-pass tokens/s, trigger-populated bytes per output token,
+admission deferred/repeated counts, and background releases. A reduction in copy
+bytes alone is not success: stronger admission can increase remote host reads.
+More observations filter brief demand but do not rank the migration benefit of
+regions that are all repeatedly accessed. Hardware measurements are still needed.
 
 This experiment restores the ordinary CPU-preferred residency choice and controls
 the optional access-counter-triggered CPU-policy migration before it runs. It does
@@ -16,9 +60,9 @@ refault clock. Hardware access-counter thresholds and VAB mapping are unchanged.
   observation of a virtual 2 MiB block/GPU is deferred.
   The pages remain remotely accessible on the CPU. The notification is still
   cleared through the normal managed-memory clear path.
-- Admission requires another observation of that block through the same buffer
-  after the first observation's clear has completed and the old queued ring
-  backlog has been consumed. Repeated notifications in one batch or later batches
+- Admission requires the configured number of observations of that block through
+  the same buffer, with each further observation after the preceding observation's
+  clear has completed and the old queued ring backlog has been consumed. Repeated notifications in one batch or later batches
   before that boundary cannot satisfy the repeat. This is software region-level
   reaccess evidence, not proof of a second threshold crossing by the same page or
   the same hardware counter entry.
