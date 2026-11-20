@@ -43,7 +43,13 @@ static atomic64_t uvm_cpu_preferred_neighbor_prefetched_bytes = ATOMIC64_INIT(0)
 static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
 static bool uvm_perf_access_counter_admission_enable = true;
 static unsigned uvm_perf_access_counter_admission_pressure_percent = 95;
-static unsigned uvm_perf_access_counter_admission_observations = 3;
+static unsigned uvm_perf_access_counter_admission_observations = 2;
+static bool uvm_perf_access_counter_admission_eviction_enable = true;
+static unsigned uvm_perf_access_counter_admission_eviction_mb = 256;
+static unsigned uvm_perf_access_counter_admission_eviction_extra = 2;
+static atomic64_t uvm_cpu_preferred_admission_eviction_probations = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_admission_eviction_deferred = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_admission_return_bytes = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_admission_requests = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_admission_deferred = ATOMIC64_INIT(0);
 static atomic64_t uvm_cpu_preferred_admission_low_pressure = ATOMIC64_INIT(0);
@@ -83,7 +89,19 @@ MODULE_PARM_DESC(uvm_perf_access_counter_admission_pressure_percent,
                  "PMA usage percentage requiring reaccess after a completed counter clear (default 95, clamped 1..100).");
 module_param(uvm_perf_access_counter_admission_observations, uint, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_access_counter_admission_observations,
-                 "Clear-separated region observations required under pressure, including the initial report (default 3, clamped 2..8; 2 restores baseline).");
+                 "Base clear-separated observations under pressure (default 2, clamped 2..8).");
+module_param(uvm_perf_access_counter_admission_eviction_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_admission_eviction_enable,
+                 "Extra pressure admission probation for recently completely evicted logical blocks (default true).");
+module_param(uvm_perf_access_counter_admission_eviction_mb, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_admission_eviction_mb,
+                 "GPU CPU-policy population distance in MiB defining a recent eviction (default 256; zero disables extra probation).");
+module_param(uvm_perf_access_counter_admission_eviction_extra, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_admission_eviction_extra,
+                 "Additional clear-separated observations for recent returns (default 2, total capped at 8).");
+module_param_cb(uvm_cpu_preferred_admission_eviction_probations, &atomic64_count_ops, &uvm_cpu_preferred_admission_eviction_probations, S_IRUGO);
+module_param_cb(uvm_cpu_preferred_admission_eviction_deferred, &atomic64_count_ops, &uvm_cpu_preferred_admission_eviction_deferred, S_IRUGO);
+module_param_cb(uvm_cpu_preferred_admission_return_bytes, &atomic64_count_ops, &uvm_cpu_preferred_admission_return_bytes, S_IRUGO);
 module_param_cb(uvm_cpu_preferred_admission_requests, &atomic64_count_ops, &uvm_cpu_preferred_admission_requests, S_IRUGO);
 module_param_cb(uvm_cpu_preferred_admission_deferred, &atomic64_count_ops, &uvm_cpu_preferred_admission_deferred, S_IRUGO);
 module_param_cb(uvm_cpu_preferred_admission_low_pressure, &atomic64_count_ops, &uvm_cpu_preferred_admission_low_pressure, S_IRUGO);
@@ -108,6 +126,7 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
     uvm_va_block_gpu_state_t *state;
     bool pressure;
     bool admitted;
+    NvU32 required;
 
     uvm_assert_mutex_locked(&va_block->lock);
     if (!uvm_cpu_block_policy_counter_admission_enabled() || uvm_va_block_is_hmm(va_block) ||
@@ -133,8 +152,23 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
         atomic64_inc(&uvm_cpu_preferred_admission_deferred);
         return false;
     }
-    admitted = uvm_counter_admission_decide(&state->counter_admission, true, buffer, submitted, fresh,
-                                           uvm_perf_access_counter_admission_observations);
+    // Native/fault populations may have returned pages outside this policy.
+    if (!uvm_page_mask_empty(&state->resident))
+        state->counter_admission_history.evicted = false;
+    required = clamp(uvm_perf_access_counter_admission_observations, 2U, 8U);
+    if (uvm_perf_access_counter_admission_eviction_enable &&
+        (!state->counter_admission.pending || state->counter_admission.buffer != buffer)) {
+        required = uvm_counter_admission_required(&state->counter_admission_history,
+                      (NvU64)atomic64_read(&gpu->counter_admission_population_bytes),
+                      (NvU64)uvm_perf_access_counter_admission_eviction_mb * 1024 * 1024,
+                      required, uvm_perf_access_counter_admission_eviction_extra);
+        if (required > clamp(uvm_perf_access_counter_admission_observations, 2U, 8U))
+            atomic64_inc(&uvm_cpu_preferred_admission_eviction_probations);
+    }
+    admitted = uvm_counter_admission_decide(&state->counter_admission, true, buffer, submitted, fresh, required);
+    if (!admitted && state->counter_admission.required >
+                         clamp(uvm_perf_access_counter_admission_observations, 2U, 8U))
+        atomic64_inc(&uvm_cpu_preferred_admission_eviction_deferred);
     if (admitted)
         atomic64_inc(&uvm_cpu_preferred_admission_repeated);
     else
@@ -311,8 +345,14 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
     uvm_page_mask_copy(&prefetch_mask, cpu_resident);
 
     gpu_resident = uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE);
-    if (gpu_resident)
+    if (gpu_resident) {
+        if (!uvm_page_mask_empty(gpu_resident)) {
+            uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+            UVM_ASSERT(state);
+            state->counter_admission_history.evicted = false;
+        }
         uvm_page_mask_andnot(&prefetch_mask, &prefetch_mask, gpu_resident);
+    }
 
     // Do not speculatively move pages which UVM's thrashing policy is
     // currently protecting from migration.
@@ -344,6 +384,14 @@ static NV_STATUS prefetch_block(uvm_va_block_t *va_block,
     if (status == NV_OK) {
         NvU64 moved = (NvU64)uvm_page_mask_weight(&block_context->make_resident.pages_changed_residency) * PAGE_SIZE;
         *prefetched_bytes += moved;
+        if (moved && uvm_perf_access_counter_admission_eviction_enable) {
+            uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
+            UVM_ASSERT(state);
+            atomic64_add(moved, &gpu->counter_admission_population_bytes);
+            if (state->counter_admission_history.evicted)
+                atomic64_add(moved, &uvm_cpu_preferred_admission_return_bytes);
+            state->counter_admission_history.evicted = false;
+        }
         if (moved && speculative_neighbor) {
             uvm_va_block_gpu_state_t *gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
             UVM_ASSERT(gpu_state);
@@ -683,7 +731,7 @@ out:
     uvm_va_block_context_free(block_context);
 }
 
-void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t *gpu)
+void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t *gpu, bool resident_evicted)
 {
     uvm_va_block_gpu_state_t *gpu_state;
     NvU64 now = NV_GETTIME();
@@ -693,6 +741,15 @@ void uvm_cpu_block_policy_rearm_on_eviction(uvm_va_block_t *va_block, uvm_gpu_t 
     gpu_state = uvm_va_block_gpu_state_get(va_block, gpu->id);
     if (gpu_state)
         gpu_state->counter_admission.pending = false;
+    // This hook runs only after a successful eviction with pages removed.
+    // Partial evictions deliberately do not create a new history episode.
+    if (gpu_state && uvm_perf_access_counter_admission_eviction_enable &&
+        va_block->managed_range && va_block->managed_range->cpu_access_counter_policy &&
+        resident_evicted && uvm_page_mask_empty(&gpu_state->resident)) {
+        gpu_state->counter_admission_history.evicted = true;
+        gpu_state->counter_admission_history.population_at_eviction =
+            (NvU64)atomic64_read(&gpu->counter_admission_population_bytes);
+    }
     if (gpu_state && va_block->managed_range && va_block->managed_range->cpu_access_counter_policy)
         uvm_pmm_gpu_refault_evict(&gpu->pmm, &gpu_state->refault);
     if (gpu_state && gpu_state->speculative_prefetch_ns) {

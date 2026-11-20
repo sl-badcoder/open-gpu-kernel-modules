@@ -173,6 +173,19 @@ static void queued_count_boundary_and_wrap_abstraction(void)
 
 int main(void)
 {
+    uvm_counter_admission_history_t h = {.evicted=true, .population_at_eviction=100};
+    assert(uvm_counter_admission_required(&h, 100, 64, 2, 2)==4);
+    assert(uvm_counter_admission_required(&h, 163, 64, 2, 2)==4);
+    assert(uvm_counter_admission_required(&h, 164, 64, 2, 2)==2);
+    assert(uvm_counter_admission_required(&h, 100, 0, 2, 2)==2);
+    assert(uvm_counter_admission_required(&h, 100, 64, 7, 999)==8);
+    h.evicted=false;
+    assert(uvm_counter_admission_required(&h, 100, 64, 2, 2)==2);
+    uvm_counter_admission_region_t frozen={0};
+    assert(!uvm_counter_admission_decide(&frozen,true,0,0,0,4));
+    assert(!uvm_counter_admission_decide(&frozen,true,0,1,1,2));
+    assert(!uvm_counter_admission_decide(&frozen,true,0,2,2,2));
+    assert(uvm_counter_admission_decide(&frozen,true,0,3,3,2));
     three_observations_require_two_distinct_completed_clears();
     probation_restarts_and_large_clear_jumps_count_once();
     required_counts_are_bounded_and_do_not_advance_from_backlog();
@@ -331,16 +344,21 @@ def main() -> None:
 
 GATE_STUBS = r'''
 #define clamp(a,b,c) ((a)<(b)?(b):((a)>(c)?(c):(a)))
-typedef struct { uvm_counter_admission_region_t counter_admission; } uvm_va_block_gpu_state_t;
+typedef struct { uvm_counter_admission_region_t counter_admission; uvm_counter_admission_history_t counter_admission_history; unsigned resident; } uvm_va_block_gpu_state_t;
 typedef struct { int dummy; } range_t;
 typedef struct { int lock; range_t *managed_range; } uvm_va_block_t;
-typedef struct { int id; } uvm_gpu_t;
+typedef struct { int id; long long counter_admission_population_bytes; } uvm_gpu_t;
+static bool uvm_perf_access_counter_admission_eviction_enable=true;
+static unsigned uvm_perf_access_counter_admission_eviction_mb=256, uvm_perf_access_counter_admission_eviction_extra=2;
+static long long uvm_cpu_preferred_admission_eviction_probations, uvm_cpu_preferred_admission_eviction_deferred;
+static long long atomic64_read(long long *p) {return *p;}
 static bool enabled=true, pressure=true, have_state=true, fail_alloc=false;
 static unsigned uvm_perf_access_counter_admission_observations=3;
 static long long uvm_cpu_preferred_admission_requests, uvm_cpu_preferred_admission_deferred;
 static long long uvm_cpu_preferred_admission_low_pressure, uvm_cpu_preferred_admission_repeated;
 static long long uvm_cpu_preferred_admission_state_failures;
 static uvm_va_block_gpu_state_t state;
+static bool uvm_page_mask_empty(unsigned *p) {return !*p;}
 static void atomic64_inc(long long *p) {++*p;}
 static void uvm_assert_mutex_locked(int *p) {assert(*p);}
 static bool uvm_cpu_block_policy_counter_admission_enabled(void) {return enabled;}
@@ -355,6 +373,14 @@ static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get_alloc(uvm_va_block_t
 
 GATE_CASES = r'''
 int main(void) {
+    uvm_va_block_gpu_state_t lower={0}, upper={0};
+    lower.counter_admission_history.evicted=true;
+    lower.counter_admission_history.population_at_eviction=123;
+    lower.counter_admission.pending=upper.counter_admission.pending=true;
+    production_split_history(&lower,&upper);
+    assert(upper.counter_admission_history.evicted);
+    assert(upper.counter_admission_history.population_at_eviction==123);
+    assert(!lower.counter_admission.pending && !upper.counter_admission.pending);
     range_t range={0};uvm_va_block_t block={.lock=1,.managed_range=&range};uvm_gpu_t gpu={0};
     assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,10,10));
     assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,11,11));
@@ -371,7 +397,27 @@ int main(void) {
     assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,16,16));
     assert(!state.counter_admission.pending&&!state.counter_admission.observations);
     assert(uvm_cpu_preferred_admission_low_pressure==1);
-    pressure=true;have_state=false;fail_alloc=true;
+    pressure=true;
+    uvm_perf_access_counter_admission_observations=2;
+    state.counter_admission_history.evicted=true;
+    state.counter_admission_history.population_at_eviction=0;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,20,20));
+    gpu.counter_admission_population_bytes=512LL*1024*1024;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,21,21));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,22,22));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,23,23));
+    assert(uvm_cpu_preferred_admission_eviction_probations==1);
+    assert(uvm_cpu_preferred_admission_eviction_deferred==3);
+    gpu.counter_admission_population_bytes=0;
+    uvm_perf_access_counter_admission_eviction_enable=false;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,24,24));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,25,25));
+    uvm_perf_access_counter_admission_eviction_enable=true;
+    state.resident=1;state.counter_admission_history.evicted=true;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,26,26));
+    assert(!state.counter_admission_history.evicted && state.counter_admission.required==2);
+    state.resident=0;
+    have_state=false;fail_alloc=true;
     assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,17,17));
     assert(uvm_cpu_preferred_admission_state_failures==1);
     assert(uvm_cpu_preferred_admission_requests==uvm_cpu_preferred_admission_deferred+
@@ -382,7 +428,13 @@ int main(void) {
 
 def test_production_gate():
     source = (ROOT / "kernel-open/nvidia-uvm/uvm_cpu_block_policy.c").read_text()
-    code = PRELUDE + HEADER.read_text() + GATE_STUBS + extract_function(
+    block_source = (ROOT / "kernel-open/nvidia-uvm/uvm_va_block.c").read_text()
+    split = block_source.split("    new_gpu_state->counter_admission_history =", 1)[1].split(
+        "    block_copy_split_gpu_chunks", 1)[0]
+    split = "static void production_split_history(uvm_va_block_gpu_state_t *existing_gpu_state, uvm_va_block_gpu_state_t *new_gpu_state) {\n    new_gpu_state->counter_admission_history =" + split + "}\n"
+    gpu_source = (ROOT / "kernel-open/nvidia-uvm/uvm_gpu.h").read_text()
+    assert "counter_admission_population_bytes" in gpu_source.split("struct uvm_gpu_struct\n",1)[1].split("struct uvm_parent_gpu_struct\n",1)[0]
+    code = PRELUDE + HEADER.read_text() + GATE_STUBS + split + extract_function(
         source, "uvm_cpu_block_policy_admit_counter") + GATE_CASES
     with tempfile.TemporaryDirectory(prefix="counter-admission-gate-") as directory:
         cfile, binary = Path(directory) / "test.c", Path(directory) / "test"

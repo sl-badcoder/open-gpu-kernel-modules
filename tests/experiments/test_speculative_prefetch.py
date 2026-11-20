@@ -30,10 +30,10 @@ typedef struct { int marker; } uvm_prefetch_refault_block_t;
 struct mm_struct { int unused; };
 typedef struct { int lock; } uvm_va_space_t;
 typedef struct { bool pending; int buffer; NvU64 clear_serial; } counter_admission_t;
-typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; uvm_prefetch_refault_block_t refault; counter_admission_t counter_admission; } uvm_va_block_gpu_state_t;
+typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; uvm_prefetch_refault_block_t refault; counter_admission_t counter_admission; struct { NvU64 population_at_eviction; bool evicted; } counter_admission_history; unsigned resident; } uvm_va_block_gpu_state_t;
 typedef struct { int unused; } uvm_pmm_gpu_t;
 typedef struct { NvU64 bytes; NvU64 generation; } uvm_prefetch_reservation_t;
-typedef struct { int id; uvm_pmm_gpu_t pmm; } uvm_gpu_t;
+typedef struct { int id; uvm_pmm_gpu_t pmm; long long counter_admission_population_bytes; } uvm_gpu_t;
 typedef struct uvm_va_range_managed_struct uvm_va_range_managed_t;
 typedef struct {
  uvm_va_range_managed_t *managed_range; NvU64 start; int lock;
@@ -47,6 +47,9 @@ typedef struct { int unused; } uvm_va_block_context_t;
 typedef struct { int unused; } uvm_tracker_t;
 #define UVM_TRACKER_INIT() {0}
 static NvU64 now = 1000000000ULL;
+static bool uvm_perf_access_counter_admission_eviction_enable=true;
+static long long atomic64_read(long long *p) {return *p;}
+static bool uvm_page_mask_empty(unsigned *p) {return !*p;}
 static unsigned uvm_cpu_preferred_prefetch_chunk_mb;
 static long long uvm_cpu_preferred_prefetch_capacity_stops, uvm_cpu_preferred_range_prefetches;
 static long long uvm_cpu_preferred_prefetch_retries, uvm_cpu_preferred_prefetched_bytes;
@@ -177,23 +180,42 @@ int main(void) {
  // One-shot callback avoids repeat copies; capacity-retry can be claimed once.
  reset();run();run();assert(begin_calls==1 && calls==2 && end_calls==1 && !reserved);
  reset();grant=0;run();grant=4*UVM_SIZE_1MB;waits=0;run();assert(end_calls==1 && calls==2 && uvm_cpu_preferred_prefetch_retries==1);
+ // Partial eviction does not create history. Complete eviction stamps once.
+ reset();blocks[4].lock=1;blocks[4].state.resident=1;gpu.counter_admission_population_bytes=100;
+ uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu,true);
+ assert(!blocks[4].state.counter_admission_history.evicted);
+ blocks[4].state.resident=0;
+ uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu,true);
+ assert(blocks[4].state.counter_admission_history.evicted);
+ assert(blocks[4].state.counter_admission_history.population_at_eviction==100);
+ gpu.counter_admission_population_bytes=200;
+ uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu,true);
+ assert(blocks[4].state.counter_admission_history.population_at_eviction==200);
+ blocks[4].state.counter_admission_history.evicted=false;
+ uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu,false);
+ assert(!blocks[4].state.counter_admission_history.evicted);
+ blocks[4].lock=0;
+ reset();blocks[4].lock=1;uvm_perf_access_counter_admission_eviction_enable=false;
+ uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu,true);
+ assert(!blocks[4].state.counter_admission_history.evicted);
+ blocks[4].lock=0;uvm_perf_access_counter_admission_eviction_enable=true;
  // Actual eviction hook and actual demand callback: quick return is consumed once.
  reset();blocks[4].state.speculative_cohort=42;blocks[4].state.speculative_prefetch_ns=now-10;blocks[4].lock=1;
- uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu);blocks[4].lock=0;
+ uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu,true);blocks[4].lock=0;
  assert(blocks[4].state.speculative_evicted_ns==now && !blocks[4].state.speculative_prefetch_ns);
  grant=0;run();run();assert(feedback_quick==1 && !blocks[4].state.speculative_evicted_ns && !blocks[4].state.speculative_cohort);
  // Expired returns and expired prefetch-to-eviction intervals cannot qualify.
  reset();blocks[4].state.speculative_evicted_ns=now-21*NSEC_PER_MSEC;grant=0;run();assert(!feedback_quick);
  reset();blocks[4].state.speculative_prefetch_ns=now-21*NSEC_PER_MSEC;blocks[4].lock=1;
- uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu);blocks[4].lock=0;grant=0;run();assert(!feedback_quick);
+ uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu,true);blocks[4].lock=0;grant=0;run();assert(!feedback_quick);
  // Boundary is inclusive for each interval; a second partial eviction cannot refresh it.
  reset();blocks[4].state.speculative_cohort=42;
  blocks[4].state.speculative_prefetch_ns=now-20*NSEC_PER_MSEC;blocks[4].lock=1;
- uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu);blocks[4].lock=0;
+ uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu,true);blocks[4].lock=0;
  NvU64 first_eviction=blocks[4].state.speculative_evicted_ns;
  assert(first_eviction==now);
  now+=10*NSEC_PER_MSEC;blocks[4].lock=1;
- uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu);blocks[4].lock=0;
+ uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu,true);blocks[4].lock=0;
  assert(blocks[4].state.speculative_evicted_ns==first_eviction);
  now+=10*NSEC_PER_MSEC;grant=0;run();run();assert(feedback_quick==1);
  // An expired demand consumes the token and cannot be revived by another signal.

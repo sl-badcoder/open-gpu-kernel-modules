@@ -701,6 +701,10 @@ struct uvm_gpu_struct
     // A unique uvm gpu id in range [1, UVM_ID_MAX_PROCESSORS).
     uvm_gpu_id_t id;
 
+    // Monotonic CPU-policy population clock for eviction-aware admission.
+    // GPU objects are zero-allocated; history shares their lifetime.
+    atomic64_t counter_admission_population_bytes;
+
     // Should be UVM_GPU_MAGIC_VALUE. Used for memory checking.
     NvU64 magic;
 

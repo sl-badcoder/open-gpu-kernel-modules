@@ -122,6 +122,7 @@ typedef struct
     uvm_prefetch_refault_block_t refault;
 
     uvm_counter_admission_region_t counter_admission;
+    uvm_counter_admission_history_t counter_admission_history;
 
     // Array of naturally-aligned chunks. Each chunk has the largest possible
     // size which can fit within the block, so they are not uniform size.

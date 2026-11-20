@@ -22,7 +22,30 @@ typedef struct
     bool pending;
     // Fits in the existing padding; counts distinct clear-separated reports.
     unsigned char observations;
+    unsigned char required;
 } uvm_counter_admission_region_t;
+
+// One complete-eviction episode per logical block/GPU. Distance is CPU-policy
+// population bytes on this GPU, not elapsed time or PCIe wire traffic.
+typedef struct
+{
+    NvU64 population_at_eviction;
+    bool evicted;
+} uvm_counter_admission_history_t;
+
+static inline NvU32 uvm_counter_admission_required(uvm_counter_admission_history_t *h,
+                                                  NvU64 population, NvU64 budget,
+                                                  NvU32 base, NvU32 extra)
+{
+    bool recent = h->evicted && population - h->population_at_eviction < budget;
+    if (base < 2)
+        base = 2;
+    if (base > 8)
+        base = 8;
+    if (extra > 8 - base)
+        extra = 8 - base;
+    return base + (recent ? extra : 0);
+}
 
 // Called before fetching, after testing clear completion and reading PUT.
 // Capture AFTER completion, so already queued notifications cannot be evidence
@@ -70,7 +93,7 @@ static inline bool uvm_counter_admission_decide(uvm_counter_admission_region_t *
     if (required_observations > 8)
         required_observations = 8;
     if (r->pending && r->buffer == buffer && fresh >= r->clear_serial) {
-        if (++r->observations >= required_observations) {
+        if (++r->observations >= r->required) {
             r->pending = false;
             r->observations = 0;
             return true;
@@ -87,6 +110,7 @@ static inline bool uvm_counter_admission_decide(uvm_counter_admission_region_t *
         r->buffer = buffer;
         r->clear_serial = submitted + 1;
         r->observations = 1;
+        r->required = required_observations;
     }
     return false;
 }

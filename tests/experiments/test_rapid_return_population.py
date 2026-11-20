@@ -28,12 +28,15 @@ typedef int uvm_tracker_t;
 struct mm_struct { int unused; };
 typedef struct { bool allow_eviction, no_eviction_allocation_failed; } uvm_va_block_retry_t;
 typedef struct { struct { uvm_page_mask_t pages_changed_residency; unsigned all_involved_processors; } make_resident; } uvm_va_block_context_t;
-typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; } uvm_va_block_gpu_state_t;
+typedef struct { NvU64 speculative_prefetch_ns, speculative_evicted_ns, speculative_cohort; struct { bool evicted; } counter_admission_history; } uvm_va_block_gpu_state_t;
 typedef struct { NvU64 cpu_prefetch_range_id; } managed_t;
 typedef struct { int lock; uvm_tracker_t tracker; uvm_va_block_gpu_state_t state; managed_t *managed_range; NvU64 start; } uvm_va_block_t;
 typedef struct { NvU64 generation; } uvm_prefetch_reservation_t;
 typedef struct { unsigned unused; } uvm_pmm_gpu_t;
-typedef struct { int id; uvm_pmm_gpu_t pmm; } uvm_gpu_t;
+typedef struct { int id; uvm_pmm_gpu_t pmm; long long counter_admission_population_bytes; } uvm_gpu_t;
+static bool uvm_perf_access_counter_admission_eviction_enable=true;
+static long long uvm_cpu_preferred_admission_return_bytes;
+static void atomic64_add(NvU64 n,long long *p) {*p+=n;}
 static uvm_page_mask_t cpu, resident, thrashing, changed;
 static bool has_cpu, fail_allocation;
 static NV_STATUS resident_status, map_status, tracker_status;
@@ -95,6 +98,21 @@ static NV_STATUS run(bool neighbor)
 { return prefetch_block(&block,&gpu,NULL,&context,&tracker,&moved,&reservation,&capacity,neighbor); }
 int main(void)
 {
+ // Actual population consumes a return episode once, using actual moved bytes.
+ reset(); gpu.counter_admission_population_bytes=0;uvm_cpu_preferred_admission_return_bytes=0;
+ resident=0;block.state.counter_admission_history.evicted=true;
+ assert(run(false)==0);
+ assert(gpu.counter_admission_population_bytes==PAGE_SIZE);
+ assert(uvm_cpu_preferred_admission_return_bytes==PAGE_SIZE && !block.state.counter_admission_history.evicted);
+ assert(run(false)==0 && uvm_cpu_preferred_admission_return_bytes==PAGE_SIZE);
+ reset();resident=0;block.state.counter_admission_history.evicted=true;changed=0;
+ assert(run(false)==0 && block.state.counter_admission_history.evicted);
+ reset();resident=0;block.state.counter_admission_history.evicted=true;resident_status=7;
+ assert(run(false)==7 && block.state.counter_admission_history.evicted);
+ // Native partial returns invalidate the old complete-eviction episode.
+ reset(); block.state.counter_admission_history.evicted=true;
+ assert(run(false)==0 && !block.state.counter_admission_history.evicted);
+ assert(uvm_cpu_preferred_admission_return_bytes==PAGE_SIZE);
  // One moved sparse page still counts as one neighbor population episode.
  reset(); assert(run(true)==0 && moved==PAGE_SIZE && records==1 && populations==1 && maps==1);
  assert(block.state.speculative_cohort==42 && block.state.speculative_prefetch_ns==123456789);

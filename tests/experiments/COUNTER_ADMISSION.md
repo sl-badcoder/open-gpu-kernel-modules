@@ -1,5 +1,9 @@
 # Counter admission experiment
 
+For the current eviction-aware experiment and its off/on comparison, see
+[EVICTION_AWARE_ADMISSION.md](EVICTION_AWARE_ADMISSION.md). The three-observation
+settings below describe the parent experiment, whose global default was three.
+
 Branch: `615.71.09/experiment/counter-admission-three-observations`.
 Based on the successful `615.71.09/experiment/counter-admission` baseline, without
 request-driven replacement or turnover-controller changes.

@@ -10560,6 +10560,12 @@ static void block_split_gpu(uvm_va_block_t *existing, uvm_va_block_t *new, uvm_g
     UVM_ASSERT(PAGE_ALIGNED(existing->start));
     existing_pages = (new->start - existing->start) / PAGE_SIZE;
 
+    // Complete-eviction history covers both halves. Pending observations
+    // restart after a split, rather than transferring evidence between ranges.
+    new_gpu_state->counter_admission_history = existing_gpu_state->counter_admission_history;
+    existing_gpu_state->counter_admission.pending = false;
+    new_gpu_state->counter_admission.pending = false;
+
     block_copy_split_gpu_chunks(existing, new, gpu);
 
     block_split_page_mask(&existing_gpu_state->resident,
@@ -13019,6 +13025,7 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
     struct mm_struct *mm;
     bool accessed_by_set = false;
     bool pages_evicted;
+    bool resident_evicted;
 
     uvm_assert_mutex_locked(&va_block->lock);
 
@@ -13098,6 +13105,7 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
                      uvm_va_block_resident_mask_get(va_block, gpu->id, NUMA_NO_NODE));
     uvm_page_mask_and(pages_to_evict, pages_to_evict, &block_context->scratch_page_mask);
     pages_evicted = !uvm_page_mask_empty(pages_to_evict);
+    resident_evicted = uvm_page_mask_intersects(pages_to_evict, &gpu_state->resident);
     uvm_processor_mask_zero(&block_context->make_resident.all_involved_processors);
 
     if (uvm_va_block_is_hmm(va_block)) {
@@ -13139,7 +13147,7 @@ NV_STATUS uvm_va_block_evict_chunks(uvm_va_block_t *va_block,
         goto out;
 
     if (pages_evicted)
-        uvm_cpu_block_policy_rearm_on_eviction(va_block, gpu);
+        uvm_cpu_block_policy_rearm_on_eviction(va_block, gpu, resident_evicted);
 
     // VA space lock may not be held and hence we cannot reestablish any
     // mappings here and need to defer it to a work queue.
