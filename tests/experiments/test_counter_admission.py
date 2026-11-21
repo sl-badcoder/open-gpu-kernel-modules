@@ -16,6 +16,7 @@ PRELUDE = r'''
 #include <stdio.h>
 typedef uint32_t NvU32;
 typedef uint64_t NvU64;
+typedef uint64_t uvm_page_mask_t;
 /* Keep the Linux current identifier available to catch accidental collisions
  * with kernel names when this small header is compiled standalone. */
 struct task_struct { int pid; };
@@ -109,6 +110,18 @@ static void pressure_requires_fresh_second_observation(void)
     assert(!r.pending);
 }
 
+static void fresh_helper_matches_clear_and_buffer_boundaries(void)
+{
+    uvm_counter_admission_region_t r = {0};
+    assert(uvm_counter_admission_fresh(&r, 0, 0));
+    r.pending = true;
+    r.buffer = 1;
+    r.clear_serial = 10;
+    assert(uvm_counter_admission_fresh(&r, 0, 0));
+    assert(!uvm_counter_admission_fresh(&r, 1, 9));
+    assert(uvm_counter_admission_fresh(&r, 1, 10));
+}
+
 static void different_buffers_do_not_satisfy_pending_region(void)
 {
     uvm_counter_admission_region_t r = {0};
@@ -198,6 +211,7 @@ int main(void)
     required_counts_are_bounded_and_do_not_advance_from_backlog();
     low_pressure_is_immediate_and_clears_pending();
     pressure_requires_fresh_second_observation();
+    fresh_helper_matches_clear_and_buffer_boundaries();
     different_buffers_do_not_satisfy_pending_region();
     prepare_without_queued_notifications_commits_immediately();
     crossing_fence_is_conservative_until_queue_drains();
@@ -351,12 +365,20 @@ def main() -> None:
 
 GATE_STUBS = r'''
 #define clamp(a,b,c) ((a)<(b)?(b):((a)>(c)?(c):(a)))
-typedef struct { uvm_counter_admission_region_t counter_admission; uvm_counter_admission_history_t counter_admission_history; unsigned resident; } uvm_va_block_gpu_state_t;
+#define max(a,b) ((a) > (b) ? (a) : (b))
+typedef struct { uvm_counter_admission_region_t counter_admission; uvm_counter_admission_history_t counter_admission_history; uvm_page_mask_t resident; uvm_page_mask_t counter_admission_pages; } uvm_va_block_gpu_state_t;
 typedef struct { int dummy; } range_t;
 typedef struct { int lock; range_t *managed_range; } uvm_va_block_t;
 typedef struct { int id; long long counter_admission_population_bytes; } uvm_gpu_t;
 static bool uvm_perf_access_counter_admission_eviction_enable=true;
 static bool uvm_perf_access_counter_admission_distance_stats_enable=true;
+static bool uvm_perf_access_counter_admission_coverage_enable=false;
+static unsigned uvm_perf_access_counter_admission_coverage_percent=25;
+static unsigned uvm_perf_access_counter_admission_sparse_observations=4;
+static unsigned mock_num_cpu_pages=8;
+static long long uvm_cpu_preferred_admission_coverage_broad;
+static long long uvm_cpu_preferred_admission_coverage_sparse;
+static long long uvm_cpu_preferred_admission_coverage_deferred;
 static long long uvm_cpu_preferred_return_probations[5], uvm_cpu_preferred_return_grants[5];
 static unsigned uvm_perf_access_counter_admission_eviction_mb=256, uvm_perf_access_counter_admission_eviction_extra=2;
 static long long uvm_cpu_preferred_admission_eviction_probations, uvm_cpu_preferred_admission_eviction_deferred;
@@ -367,7 +389,13 @@ static long long uvm_cpu_preferred_admission_requests, uvm_cpu_preferred_admissi
 static long long uvm_cpu_preferred_admission_low_pressure, uvm_cpu_preferred_admission_repeated;
 static long long uvm_cpu_preferred_admission_state_failures;
 static uvm_va_block_gpu_state_t state;
-static bool uvm_page_mask_empty(unsigned *p) {return !*p;}
+static bool uvm_page_mask_empty(uvm_page_mask_t *p) {return !*p;}
+static void uvm_page_mask_zero(uvm_page_mask_t *p) {*p = 0;}
+static void uvm_page_mask_or(uvm_page_mask_t *dst, const uvm_page_mask_t *a,
+                             const uvm_page_mask_t *b) {*dst = *a | *b;}
+static unsigned uvm_page_mask_weight(const uvm_page_mask_t *p)
+{ unsigned v = *p, n = 0; while (v) { n += v & 1U; v >>= 1; } return n; }
+static unsigned uvm_va_block_num_cpu_pages(uvm_va_block_t *b) {(void)b; return mock_num_cpu_pages;}
 static void atomic64_inc(long long *p) {++*p;}
 static void uvm_assert_mutex_locked(int *p) {assert(*p);}
 static bool uvm_cpu_block_policy_counter_admission_enabled(void) {return enabled;}
@@ -391,39 +419,120 @@ int main(void) {
     assert(upper.counter_admission_history.population_at_eviction==123);
     assert(!lower.counter_admission.pending && !upper.counter_admission.pending);
     range_t range={0};uvm_va_block_t block={.lock=1,.managed_range=&range};uvm_gpu_t gpu={0};
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,10,10));
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,11,11));
-    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,12,12));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,10,10,NULL));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,11,11,NULL));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,12,12,NULL));
     assert(uvm_cpu_preferred_admission_requests==3&&uvm_cpu_preferred_admission_deferred==2);
     assert(uvm_cpu_preferred_admission_repeated==1);
+
+    /* Coverage mode qualifies a broad block after the base two fresh
+     * observations, while a narrow block needs the sparse target. */
+    uvm_perf_access_counter_admission_coverage_enable=true;
     uvm_perf_access_counter_admission_observations=2;
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,13,13));
-    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,14,14));
-    uvm_perf_access_counter_admission_observations=3;
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,15,15));
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,16,16));
+    uvm_perf_access_counter_admission_sparse_observations=4;
+    state.counter_admission = (uvm_counter_admission_region_t){0};
+    state.counter_admission_pages = 0;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,40,40,(const uvm_page_mask_t[]){0x3}));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,41,41,(const uvm_page_mask_t[]){0x3}));
+    assert(uvm_cpu_preferred_admission_coverage_broad == 1);
+
+    state.counter_admission = (uvm_counter_admission_region_t){0};
+    state.counter_admission_pages = 0;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,50,50,(const uvm_page_mask_t[]){0x1}));
+    /* Same clear serial is a duplicate and cannot add evidence or grant. */
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,50,50,(const uvm_page_mask_t[]){0x2}));
+    assert(state.counter_admission_pages == 0x1);
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,51,51,(const uvm_page_mask_t[]){0x1}));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,52,52,(const uvm_page_mask_t[]){0x1}));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,53,53,(const uvm_page_mask_t[]){0x1}));
+    assert(uvm_cpu_preferred_admission_coverage_sparse >= 1);
+
+    /* Distinct fresh masks union to broad coverage and therefore shorten the
+     * probation on the second report. */
+    state.counter_admission = (uvm_counter_admission_region_t){0};
+    state.counter_admission_pages = 0;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,60,60,(const uvm_page_mask_t[]){0x1}));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,61,61,(const uvm_page_mask_t[]){0x2}));
+    assert(state.counter_admission_pages == 0x3);
+
+    /* Changing the counter buffer starts a new period and cannot reuse the
+     * old broad mask as evidence. */
+    state.counter_admission = (uvm_counter_admission_region_t){0};
+    state.counter_admission_pages = 0;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,70,70,(const uvm_page_mask_t[]){0x3}));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,1,70,70,(const uvm_page_mask_t[]){0x1}));
+    assert(state.counter_admission_pages == 0x1);
+
+    /* A low-pressure interval ends the period; the next probation must not
+     * retain the previous mask. */
     pressure=false;
-    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,16,16));
-    assert(!state.counter_admission.pending&&!state.counter_admission.observations);
-    assert(uvm_cpu_preferred_admission_low_pressure==1);
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,1,71,71,NULL));
     pressure=true;
-    uvm_perf_access_counter_admission_observations=2;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,1,72,72,(const uvm_page_mask_t[]){0x4}));
+    assert(state.counter_admission_pages == 0x4);
+
+    /* The denominator is the actual VA-block page count, not a fixed 2 MiB
+     * constant: one of four pages is already broad coverage. */
+    mock_num_cpu_pages=4;
+    state.counter_admission = (uvm_counter_admission_region_t){0};
+    state.counter_admission_pages = 0;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,80,80,(const uvm_page_mask_t[]){0x1}));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,81,81,(const uvm_page_mask_t[]){0x1}));
+    mock_num_cpu_pages=8;
+
+    /* A recent eviction target remains a floor even when coverage is broad. */
+    state.counter_admission = (uvm_counter_admission_region_t){0};
+    state.counter_admission_pages = 0;
     state.counter_admission_history.evicted=true;
     state.counter_admission_history.population_at_eviction=0;
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,20,20));
+    uvm_perf_access_counter_admission_eviction_enable=true;
+    uvm_perf_access_counter_admission_eviction_extra=2;
+    gpu.counter_admission_population_bytes=0;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,90,90,(const uvm_page_mask_t[]){0x3}));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,91,91,(const uvm_page_mask_t[]){0x3}));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,92,92,(const uvm_page_mask_t[]){0x3}));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,93,93,(const uvm_page_mask_t[]){0x3}));
+    uvm_perf_access_counter_admission_eviction_enable=false;
+    state.counter_admission = (uvm_counter_admission_region_t){0};
+    state.counter_admission_history = (uvm_counter_admission_history_t){0};
+    state.counter_admission_pages = 0;
+
+    /* Low pressure bypasses the coverage gate and clears its period state. */
+    pressure=false;
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,54,54,(const uvm_page_mask_t[]){0x1}));
+    assert(!state.counter_admission.pending);
+    uvm_perf_access_counter_admission_coverage_enable=false;
+    pressure=true;
+    uvm_perf_access_counter_admission_observations=2;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,13,13,NULL));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,14,14,NULL));
+    uvm_perf_access_counter_admission_observations=3;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,15,15,NULL));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,16,16,NULL));
+    pressure=false;
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,16,16,NULL));
+    assert(!state.counter_admission.pending&&!state.counter_admission.observations);
+    assert(uvm_cpu_preferred_admission_low_pressure>=1);
+    pressure=true;
+    uvm_perf_access_counter_admission_observations=2;
+    uvm_perf_access_counter_admission_eviction_enable=true;
+    state.counter_admission = (uvm_counter_admission_region_t){0};
+    state.counter_admission_history.evicted=true;
+    state.counter_admission_history.population_at_eviction=0;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,20,20,NULL));
     gpu.counter_admission_population_bytes=512LL*1024*1024;
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,21,21));
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,22,22));
-    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,23,23));
-    assert(uvm_cpu_preferred_admission_eviction_probations==1);
-    assert(uvm_cpu_preferred_admission_eviction_deferred==3);
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,21,21,NULL));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,22,22,NULL));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,23,23,NULL));
+    assert(uvm_cpu_preferred_admission_eviction_probations>=1);
+    assert(uvm_cpu_preferred_admission_eviction_deferred>=3);
     gpu.counter_admission_population_bytes=0;
     uvm_perf_access_counter_admission_eviction_enable=false;
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,24,24));
-    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,25,25));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,24,24,NULL));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,25,25,NULL));
     uvm_perf_access_counter_admission_eviction_enable=true;
     state.resident=1;state.counter_admission_history.evicted=true;
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,26,26));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,26,26,NULL));
     assert(!state.counter_admission_history.evicted && state.counter_admission.required==2);
     state.resident=0;
     // Instrumentation remains active with extra probation disabled.
@@ -434,17 +543,17 @@ int main(void) {
     gpu.counter_admission_population_bytes=1LL<<30;
     long long before_prob=uvm_cpu_preferred_return_probations[3];
     long long before_grant=uvm_cpu_preferred_return_grants[3];
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,30,30));
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,30,30));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,30,30,NULL));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,30,30,NULL));
     assert(uvm_cpu_preferred_return_probations[3]==before_prob+1);
-    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,31,31));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,31,31,NULL));
     assert(uvm_cpu_preferred_return_grants[3]==before_grant+1);
     pressure=false;
-    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,32,32));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,32,32,NULL));
     assert(uvm_cpu_preferred_return_grants[3]==before_grant+2);
     pressure=true;
     have_state=false;fail_alloc=true;
-    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,17,17));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,17,17,NULL));
     assert(uvm_cpu_preferred_admission_state_failures==1);
     assert(uvm_cpu_preferred_admission_requests==uvm_cpu_preferred_admission_deferred+
            uvm_cpu_preferred_admission_low_pressure+uvm_cpu_preferred_admission_repeated);

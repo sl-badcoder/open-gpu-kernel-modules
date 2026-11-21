@@ -47,6 +47,12 @@ static atomic64_t uvm_cpu_preferred_prefetch_capacity_stops = ATOMIC64_INIT(0);
 static bool uvm_perf_access_counter_admission_enable = true;
 static unsigned uvm_perf_access_counter_admission_pressure_percent = 95;
 static unsigned uvm_perf_access_counter_admission_observations = 2;
+static bool uvm_perf_access_counter_admission_coverage_enable;
+static unsigned uvm_perf_access_counter_admission_coverage_percent = 25;
+static unsigned uvm_perf_access_counter_admission_sparse_observations = 4;
+static atomic64_t uvm_cpu_preferred_admission_coverage_broad = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_admission_coverage_sparse = ATOMIC64_INIT(0);
+static atomic64_t uvm_cpu_preferred_admission_coverage_deferred = ATOMIC64_INIT(0);
 static bool uvm_perf_access_counter_admission_eviction_enable = false;
 static bool uvm_perf_access_counter_admission_distance_stats_enable = true;
 static unsigned uvm_perf_access_counter_admission_eviction_mb = 256;
@@ -90,6 +96,24 @@ static const struct kernel_param_ops atomic64_count_ops = {
 };
 
 module_param(uvm_perf_access_counter_admission_enable, bool, S_IRUGO);
+module_param(uvm_perf_access_counter_admission_coverage_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_admission_coverage_enable,
+                 "Require more fresh observations for narrow block coverage under pressure (default false).");
+module_param(uvm_perf_access_counter_admission_coverage_percent, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_admission_coverage_percent,
+                 "Fresh notification coverage percent qualifying for normal block admission (default 25, range 1-100).");
+module_param(uvm_perf_access_counter_admission_sparse_observations, uint, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_access_counter_admission_sparse_observations,
+                 "Minimum fresh observations for narrow block coverage (default 4, range 2-8).");
+module_param_cb(uvm_cpu_preferred_admission_coverage_broad, &atomic64_count_ops, &uvm_cpu_preferred_admission_coverage_broad, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_admission_coverage_broad,
+                 "Pressure admission grants with broad notification coverage, not completed transfers.");
+module_param_cb(uvm_cpu_preferred_admission_coverage_sparse, &atomic64_count_ops, &uvm_cpu_preferred_admission_coverage_sparse, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_admission_coverage_sparse,
+                 "Pressure admission grants with narrow notification coverage, not completed transfers.");
+module_param_cb(uvm_cpu_preferred_admission_coverage_deferred, &atomic64_count_ops, &uvm_cpu_preferred_admission_coverage_deferred, S_IRUGO);
+MODULE_PARM_DESC(uvm_cpu_preferred_admission_coverage_deferred,
+                 "Denied pressure decisions with narrow coverage, including duplicate reports and base probation.");
 module_param(uvm_perf_access_counter_indicated_pages_enable, bool, S_IRUGO);
 MODULE_PARM_DESC(uvm_perf_access_counter_indicated_pages_enable,
                  "Under pressure, limit optional trigger population to counter-indicated pages (default false).");
@@ -165,12 +189,14 @@ static void counter_admission_record_return_grant(uvm_va_block_gpu_state_t *stat
 }
 
 bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu,
-                                       NvU32 buffer, NvU64 submitted, NvU64 fresh)
+                                       NvU32 buffer, NvU64 submitted, NvU64 fresh,
+                                       const uvm_page_mask_t *accessed_pages)
 {
     uvm_va_block_gpu_state_t *state;
     bool pressure;
     bool admitted;
     NvU32 required;
+    bool narrow = false;
 
     uvm_assert_mutex_locked(&va_block->lock);
     if (!uvm_cpu_block_policy_counter_admission_enabled() || uvm_va_block_is_hmm(va_block) ||
@@ -217,8 +243,40 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
         if (required > clamp(uvm_perf_access_counter_admission_observations, 2U, 8U))
             atomic64_inc(&uvm_cpu_preferred_admission_eviction_probations);
     }
+    if (uvm_perf_access_counter_admission_coverage_enable) {
+        bool new_probation = !state->counter_admission.pending || state->counter_admission.buffer != buffer;
+        if (new_probation) {
+            uvm_page_mask_zero(&state->counter_admission_pages);
+            state->counter_admission.coverage_base_required = required;
+        }
+        // Only evidence separated by a completed clear may widen coverage.
+        // Duplicate queued reports neither advance probation nor add pages.
+        if (accessed_pages && uvm_counter_admission_fresh(&state->counter_admission, buffer, fresh))
+            uvm_page_mask_or(&state->counter_admission_pages, &state->counter_admission_pages, accessed_pages);
+        narrow = (NvU64)uvm_page_mask_weight(&state->counter_admission_pages) * 100 <
+                 (NvU64)uvm_va_block_num_cpu_pages(va_block) *
+                     clamp(uvm_perf_access_counter_admission_coverage_percent, 1U, 100U);
+        required = state->counter_admission.coverage_base_required;
+        if (narrow)
+            required = max(required, clamp(uvm_perf_access_counter_admission_sparse_observations, 2U, 8U));
+        // Broadening the evidence may restore the base target mid-probation.
+        // The original eviction-based target stays frozen separately.
+        if (!new_probation)
+            state->counter_admission.required = required;
+    }
     admitted = uvm_counter_admission_decide(&state->counter_admission, true, buffer, submitted, fresh, required);
-    if (!admitted && state->counter_admission.required >
+    if (uvm_perf_access_counter_admission_coverage_enable) {
+        if (admitted) {
+            if (narrow)
+                atomic64_inc(&uvm_cpu_preferred_admission_coverage_sparse);
+            else
+                atomic64_inc(&uvm_cpu_preferred_admission_coverage_broad);
+        }
+        else if (narrow)
+            atomic64_inc(&uvm_cpu_preferred_admission_coverage_deferred);
+    }
+    if (!admitted && (uvm_perf_access_counter_admission_coverage_enable ?
+                         state->counter_admission.coverage_base_required : state->counter_admission.required) >
                          clamp(uvm_perf_access_counter_admission_observations, 2U, 8U))
         atomic64_inc(&uvm_cpu_preferred_admission_eviction_deferred);
     if (admitted) {

@@ -178,7 +178,7 @@ static void expand_notification_block(uvm_gpu_va_space_t *g, struct mm_struct *m
 static uvm_va_block_gpu_state_t gpu_state;
 static bool gpu_state_present=true;
 static uvm_va_block_gpu_state_t *uvm_va_block_gpu_state_get(uvm_va_block_t *b, int id) { (void)b; (void)id; return gpu_state_present ? &gpu_state : NULL; }
-static bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *b, uvm_gpu_t *g, unsigned buffer, NvU64 submitted, NvU64 fresh) { (void)b;(void)g;(void)buffer;(void)submitted;(void)fresh; return allow_cpu_promotion; }
+static bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *b, uvm_gpu_t *g, unsigned buffer, NvU64 submitted, NvU64 fresh, const uvm_page_mask_t *pages) { assert(pages && *pages);(void)b;(void)g;(void)buffer;(void)submitted;(void)fresh; return allow_cpu_promotion; }
 static NV_STATUS service_notification_va_block_helper(struct mm_struct *m, uvm_va_block_t *b, uvm_gpu_t *g, uvm_access_counter_service_batch_context_t *c, bool allow, bool *did_migrate) { (void)m;(void)b;(void)g; c->accessed_pages=0; *did_migrate = demand_status == NV_OK && allow; gpu_state.resident=allow ? gpu_after_mask : 0; gpu_state.evicted=0; gpu_state_present=true; return demand_status; }
 static NV_STATUS notify_tools_and_process_flags(uvm_va_space_t *v, uvm_gpu_t *g, uvm_access_counter_buffer_t *a, NvU64 x, uvm_access_counter_buffer_entry_t **e, NvU32 n, NvU32 f, void *m) { (void)v;(void)g;(void)a;(void)x;(void)e;(void)n;(void)m; last_flags=f; return flags_status; }
 '''

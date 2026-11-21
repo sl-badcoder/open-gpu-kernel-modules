@@ -43,6 +43,9 @@ uvm_cpu_preferred_admission_deferred uvm_cpu_preferred_admission_low_pressure
 uvm_cpu_preferred_admission_repeated uvm_cpu_preferred_admission_state_failures
 uvm_cpu_preferred_admission_eviction_probations uvm_cpu_preferred_admission_eviction_deferred
 uvm_cpu_preferred_admission_return_bytes""".split())
+COUNTERS.update(("uvm_cpu_preferred_admission_coverage_broad",
+                 "uvm_cpu_preferred_admission_coverage_sparse",
+                 "uvm_cpu_preferred_admission_coverage_deferred"))
 COUNTERS.update(("background_cached_root_releases", "background_allocated_root_releases",
                  "replacement_requests", "replacement_freed_roots"))
 RETURN_DISTANCE_BUCKETS = ("lt64m", "64m_256m", "256m_1g", "1g_4g", "ge4g")

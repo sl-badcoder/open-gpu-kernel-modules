@@ -122,6 +122,8 @@ typedef struct
     uvm_prefetch_refault_block_t refault;
 
     uvm_counter_admission_region_t counter_admission;
+    // Union of fresh notification evidence during one pressure probation.
+    uvm_page_mask_t counter_admission_pages;
     uvm_counter_admission_history_t counter_admission_history;
 
     // Array of naturally-aligned chunks. Each chunk has the largest possible

@@ -1701,7 +1701,8 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
         allow_cpu_promotion = uvm_cpu_block_policy_admit_counter(va_block, gpu,
                                                                access_counters->index,
                                                                access_counters->admission.submitted,
-                                                               access_counters->admission.batch_fresh);
+                                                               access_counters->admission.batch_fresh,
+                                                               &indicated_pages);
         if (!allow_cpu_promotion) {
             uvm_va_block_gpu_state_t *state = uvm_va_block_gpu_state_get(va_block, gpu->id);
             if (state && state->counter_admission.pending &&

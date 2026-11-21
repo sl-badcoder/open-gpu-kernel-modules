@@ -23,7 +23,14 @@ typedef struct
     // Fits in the existing padding; counts distinct clear-separated reports.
     unsigned char observations;
     unsigned char required;
+    unsigned char coverage_base_required;
 } uvm_counter_admission_region_t;
+
+static inline bool uvm_counter_admission_fresh(const uvm_counter_admission_region_t *r,
+                                               NvU32 buffer, NvU64 fresh)
+{
+    return !r->pending || r->buffer != buffer || fresh >= r->clear_serial;
+}
 
 // One complete-eviction episode per logical block/GPU. Distance is CPU-policy
 // population bytes on this GPU, not elapsed time or PCIe wire traffic.

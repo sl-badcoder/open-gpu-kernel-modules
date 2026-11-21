@@ -31,7 +31,8 @@ bool uvm_cpu_block_policy_enabled(void);
 bool uvm_cpu_block_policy_counter_admission_enabled(void);
 bool uvm_cpu_block_policy_counter_pressure(uvm_gpu_t *gpu);
 bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu,
-                                       NvU32 buffer, NvU64 submitted, NvU64 fresh);
+                                       NvU32 buffer, NvU64 submitted, NvU64 fresh,
+                                       const uvm_page_mask_t *accessed_pages);
 void uvm_cpu_block_policy_init_range(uvm_va_range_managed_t *managed_range);
 bool uvm_cpu_block_policy_should_add_accessed_by(uvm_va_range_managed_t *managed_range,
                                                 uvm_gpu_t *gpu);

@@ -68,6 +68,14 @@ class MonitorTest(unittest.TestCase):
             self.assertEqual(row["change"], 8192)
             self.assertEqual(row["per_second"], 4096)
 
+    def test_coverage_admission_counter_rates(self):
+        for suffix in ("broad", "sparse", "deferred"):
+            key = f"module/uvm_cpu_preferred_admission_coverage_{suffix}"
+            row = monitor.differences({"monotonic_s": 10, "metrics": {key: 3}},
+                                      {"monotonic_s": 12, "metrics": {key: 9}})[0]
+            self.assertEqual(row["kind"], "counter")
+            self.assertEqual(row["per_second"], 3)
+
     def test_run_collects_changes_and_preserves_child_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
