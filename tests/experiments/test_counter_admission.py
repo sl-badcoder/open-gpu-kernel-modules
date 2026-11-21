@@ -393,6 +393,9 @@ static bool uvm_page_mask_empty(uvm_page_mask_t *p) {return !*p;}
 static void uvm_page_mask_zero(uvm_page_mask_t *p) {*p = 0;}
 static void uvm_page_mask_or(uvm_page_mask_t *dst, const uvm_page_mask_t *a,
                              const uvm_page_mask_t *b) {*dst = *a | *b;}
+static bool uvm_page_mask_and(uvm_page_mask_t *dst, const uvm_page_mask_t *a,
+                             const uvm_page_mask_t *b) {*dst = *a & *b; return *dst != 0;}
+static void uvm_page_mask_copy(uvm_page_mask_t *dst, const uvm_page_mask_t *src) {*dst = *src;}
 static unsigned uvm_page_mask_weight(const uvm_page_mask_t *p)
 { unsigned v = *p, n = 0; while (v) { n += v & 1U; v >>= 1; } return n; }
 static unsigned uvm_va_block_num_cpu_pages(uvm_va_block_t *b) {(void)b; return mock_num_cpu_pages;}
@@ -447,13 +450,34 @@ int main(void) {
     assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,53,53,(const uvm_page_mask_t[]){0x1}));
     assert(uvm_cpu_preferred_admission_coverage_sparse >= 1);
 
-    /* Distinct fresh masks union to broad coverage and therefore shorten the
-     * probation on the second report. */
+    /* A disjoint scan is not reuse, even across completed clears. */
     state.counter_admission = (uvm_counter_admission_region_t){0};
     state.counter_admission_pages = 0;
     assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,60,60,(const uvm_page_mask_t[]){0x1}));
-    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,61,61,(const uvm_page_mask_t[]){0x2}));
-    assert(state.counter_admission_pages == 0x3);
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,61,61,(const uvm_page_mask_t[]){0x2}));
+    assert(state.counter_admission_pages == 0x2);
+    for (unsigned i=62; i<1000; ++i) {
+        uvm_page_mask_t scan = 1ULL << (i % 8);
+        assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,i,i,&scan));
+        assert(state.counter_admission.observations == 1);
+    }
+    /* Broad repeated coverage still earns a batched population. */
+    state.counter_admission = (uvm_counter_admission_region_t){0};
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,1000,1000,(const uvm_page_mask_t[]){0x7}));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,1001,1001,(const uvm_page_mask_t[]){0x6}));
+    assert(state.counter_admission_pages == 0x6);
+    /* Shrinking reuse coverage must raise the target before granting. */
+    state.counter_admission = (uvm_counter_admission_region_t){0};
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,1002,1002,(const uvm_page_mask_t[]){0x7}));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,1003,1003,(const uvm_page_mask_t[]){0x1}));
+    assert(state.counter_admission.required == 4);
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,1004,1004,(const uvm_page_mask_t[]){0x1}));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,1005,1005,(const uvm_page_mask_t[]){0x1}));
+    /* Missing evidence cannot preserve an old reuse mask. */
+    state.counter_admission = (uvm_counter_admission_region_t){0};
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,1010,1010,(const uvm_page_mask_t[]){0x3}));
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,1011,1011,NULL));
+    assert(state.counter_admission_pages == 0);
 
     /* Changing the counter buffer starts a new period and cannot reuse the
      * old broad mask as evidence. */

@@ -56,10 +56,12 @@ thrashing pages. Missing evidence permits no limited population. There is no
 new per-block history or scan. The queue adds eight page masks (512 bytes total
 on a 4 KiB-page build).
 
-After a limited attempt completes without a capacity stop and releases its reservation, the trigger
-claim and retry flag are cleared so later reports can populate different pages
-in the same block. Capacity-stopped attempts retain the existing recovery retry
-gate to avoid repeated failed reservations. Normal admission still applies to each notification.
+A successful limited attempt retains the block's one-shot claim. Later reports
+for other pages still receive normal native servicing, but do not reopen optional
+population. Eviction rearms the block. Capacity-stopped attempts retain the
+existing recovery retry gate; migration-context allocation failures may retry
+after releasing the reservation. This prevents a scan from repeatedly paying
+reservation, mapping and completion costs for partial population of one block.
 Reservations retain the conservative 2 MiB quantum; physical allocation can
 also exceed the copied mask. The hardware notification itself may cover a broad
 range, so this does not promise 4 KiB transfers. Byte counters measure changed

@@ -249,17 +249,32 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
             uvm_page_mask_zero(&state->counter_admission_pages);
             state->counter_admission.coverage_base_required = required;
         }
-        // Only evidence separated by a completed clear may widen coverage.
-        // Duplicate queued reports neither advance probation nor add pages.
-        if (accessed_pages && uvm_counter_admission_fresh(&state->counter_admission, buffer, fresh))
-            uvm_page_mask_or(&state->counter_admission_pages, &state->counter_admission_pages, accessed_pages);
+        // A scan can report different pages of one block after each clear.
+        // That is spatial coverage, not reuse: only pages present in every
+        // clear-separated observation may justify optional population under
+        // pressure. Backlogged reports must not alter this evidence.
+        if (uvm_counter_admission_fresh(&state->counter_admission, buffer, fresh)) {
+            if (!new_probation && accessed_pages)
+                uvm_page_mask_and(&state->counter_admission_pages,
+                                  &state->counter_admission_pages, accessed_pages);
+            if (!accessed_pages || uvm_page_mask_empty(&state->counter_admission_pages)) {
+                // Restart on the latest report, rather than admitting a
+                // disjoint stream merely because enough reports arrived.
+                state->counter_admission.pending = false;
+                new_probation = true;
+            }
+            if (new_probation && accessed_pages)
+                uvm_page_mask_copy(&state->counter_admission_pages, accessed_pages);
+            else if (!accessed_pages)
+                uvm_page_mask_zero(&state->counter_admission_pages);
+        }
         narrow = (NvU64)uvm_page_mask_weight(&state->counter_admission_pages) * 100 <
                  (NvU64)uvm_va_block_num_cpu_pages(va_block) *
                      clamp(uvm_perf_access_counter_admission_coverage_percent, 1U, 100U);
         required = state->counter_admission.coverage_base_required;
         if (narrow)
             required = max(required, clamp(uvm_perf_access_counter_admission_sparse_observations, 2U, 8U));
-        // Broadening the evidence may restore the base target mid-probation.
+        // Coverage can shrink as new reports remove non-reused pages.
         // The original eviction-based target stays frozen separately.
         if (!new_probation)
             state->counter_admission.required = required;
@@ -606,7 +621,6 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     bool capacity_stopped = false;
     bool refault_mode = uvm_pmm_gpu_refault_enabled();
     bool prefetch_admitted = false;
-    bool rearm_after_completion = false;
     bool limit_to_indicated = false;
     bool prefetch_success = true;
     uvm_tracker_t prefetch_tracker = UVM_TRACKER_INIT();
@@ -740,9 +754,10 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
         goto out;
     }
     prefetch_admitted = true;
-    // A successful partial population must not make the whole VA block
-    // one-shot. Later reports can name different CPU-resident pages in it.
-    rearm_after_completion = limit_to_indicated;
+    // Successful partial population is one-shot too. Re-arming on every
+    // notification turns a scan into repeated reservations, mappings and
+    // waits for the same block. Normal servicing remains available; eviction
+    // starts a new population episode through rearm_on_eviction().
 
     // Capacity denials are common under oversubscription. Obtain the byte
     // reservation before allocating a migration context so denied or already
@@ -752,7 +767,6 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     block_context = uvm_va_block_context_alloc(mm);
     if (!block_context) {
         prefetch_success = false;
-        rearm_after_completion = true;
         goto out;
     }
 
@@ -884,9 +898,7 @@ out:
 
     // Keep ownership through reservation release: another signal must not
     // claim this trigger while the failed attempt still owns capacity.
-    if (rearm_after_completion && !capacity_stopped) {
-        if (limit_to_indicated)
-            uvm_processor_mask_clear_atomic(&trigger_block->gpu_prefetch_retry, gpu->id);
+    if (!prefetch_success && !capacity_stopped) {
         uvm_processor_mask_clear_atomic(&trigger_block->gpu_prefetch_started, gpu->id);
     }
 

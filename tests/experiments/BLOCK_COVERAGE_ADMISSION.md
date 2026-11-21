@@ -41,14 +41,16 @@ coverage threshold; vary one parameter at a time.
 
 Below admission pressure, the original immediate admission remains. Under
 pressure, the first observation starts probation and records its notification
-page mask. Subsequent observations contribute to the union only after the
-existing completed-clear and backlog fences establish fresh evidence.
-Pre-clear duplicates neither advance observations nor broaden coverage.
+page mask. Subsequent observations intersect that mask only after the existing
+completed-clear and backlog fences establish fresh evidence. Disjoint reports
+restart probation on the latest mask: a scan across different pages must not
+qualify as repeated use. Pre-clear duplicates cannot change the reuse mask.
 
-Coverage is the number of distinct indicated OS pages divided by the actual
-logical VA-block page count. A full 2 MiB block needs at least 512 KiB of
-coverage at 25%; a shorter boundary block uses its own size. Repeated touches
-to the same pages do not increase coverage. Hardware counter granularity limits
+Coverage is the number of OS pages common to the fresh reports divided by the
+actual logical VA-block page count. A full 2 MiB block needs at least 512 KiB of
+coverage at 25%; a shorter boundary block uses its own size. Coverage can shrink
+as further reports exclude previously indicated pages. Hardware counter
+granularity limits
 the precision of this evidence; coverage is not an exact application byte count.
 In the current notification expansion path, backing other than a 2 MiB physical
 chunk contributes only one OS page per notification; 2 MiB backing can expose
@@ -58,9 +60,10 @@ a useful discriminator. Check the broad/sparse grant split before tuning it.
 
 Broad coverage permits admission at the normal two-observation target. Narrow
 coverage requires four fresh observations, so sustained narrow demand can still
-qualify without waiting indefinitely for broader coverage. If the second fresh
-report broadens the union enough, the normal target applies immediately. If the
-optional old eviction probation is enabled, its separately frozen target is a
+qualify without waiting indefinitely for broader coverage. Broad repeated masks
+qualify at the normal target; disjoint masks cannot accumulate into a broad
+grant. If the optional old eviction probation is enabled, its separately frozen
+target is a
 floor; coverage never relaxes that target.
 
 After admission, optional population retains its original whole-block mask,
@@ -73,8 +76,8 @@ admission or cancelled service/clear. Stale masks are ignored and cleared on the
 next probation. No global history, timer or scan is introduced. One OS-page mask
 is added per allocated logical block/GPU state (64 bytes for a 2 MiB block on
 a 4 KiB-page build). When enabled under pressure, fresh reports perform a mask
-union and coverage decisions count mask bits. With the gate disabled, no union
-or bit count is performed; state storage remains.
+intersection and coverage decisions count mask bits. With the gate disabled,
+no intersection or bit count is performed; state storage remains.
 
 ## Measurements
 
@@ -92,7 +95,7 @@ Grants are opportunities, not guaranteed data transfers. Compare warm tokens/s,
 trigger population bytes per output token, admitted population attempts and
 background allocated-root releases. Do not use fewer copied bytes alone as the
 success criterion. Existing trigger indicated/extra counters describe only the
-notification at the eventual population, not the accumulated probation union;
+notification at the eventual population, not the probation reuse mask;
 outside-mask bytes can therefore be expected with whole-block copying.
 
 Coverage is a hypothesis for block usefulness, not proof. A frequently used

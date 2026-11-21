@@ -122,7 +122,7 @@ typedef struct
     uvm_prefetch_refault_block_t refault;
 
     uvm_counter_admission_region_t counter_admission;
-    // Union of fresh notification evidence during one pressure probation.
+    // Pages common to fresh notifications during one pressure probation.
     uvm_page_mask_t counter_admission_pages;
     uvm_counter_admission_history_t counter_admission_history;
 

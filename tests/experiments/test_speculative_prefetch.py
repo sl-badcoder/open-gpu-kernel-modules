@@ -155,18 +155,30 @@ static void reset(void) {
 static void run(void){uvm_cpu_block_policy_prefetch_on_signal(&blocks[trigger_slot],&gpu,&mm,0,test_indicated_pages);
  assert(uvm_cpu_preferred_prefetched_bytes==uvm_cpu_preferred_trigger_prefetched_bytes+uvm_cpu_preferred_neighbor_prefetched_bytes);}
 int main(void) {
- // Pressure-limited partial population reopens the trigger after release.
+ // Partial success stays one-shot: scanning other pages cannot repeat work.
  reset();pressure=true;grant=2*UVM_SIZE_1MB;uvm_perf_access_counter_indicated_pages_enable=true;
  uvm_page_mask_t indicated=1;test_indicated_pages=&indicated;
- run();assert(last_limit && calls==1 && transferred==4096 && !blocks[4].gpu_prefetch_started);
- waits=0;indicated=2;run();assert(calls==2 && end_calls==2 && last_limit);
+ run();assert(last_limit && calls==1 && transferred==4096 && blocks[4].gpu_prefetch_started);
+ for (unsigned i=0;i<100;i++) { indicated=2;run(); }
+ assert(calls==1 && end_calls==1 && transferred==4096);
+ // A real eviction opens a new episode for the same logical block.
+ blocks[4].lock=1;uvm_cpu_block_policy_rearm_on_eviction(&blocks[4],&gpu,true);blocks[4].lock=0;
+ waits=0;run();assert(calls==2 && end_calls==2);
+ // A successful empty attempt is also one-shot; native servicing continues.
+ reset();pressure=true;grant=2*UVM_SIZE_1MB;uvm_perf_access_counter_indicated_pages_enable=true;
+ indicated=0;test_indicated_pages=&indicated;run();assert(!transferred && blocks[4].gpu_prefetch_started);
+ indicated=1;run();assert(calls==1 && end_calls==1);
+ // Transient failures release the claim only after draining and release.
+ reset();pressure=true;grant=2*UVM_SIZE_1MB;uvm_perf_access_counter_indicated_pages_enable=true;
+ test_indicated_pages=&indicated;error_at=1;run();assert(!blocks[4].gpu_prefetch_started && !reserved);
+ error_at=0;waits=0;run();assert(calls==2 && blocks[4].gpu_prefetch_started);
  // A limited capacity failure cannot leak retry state into a later full copy.
  reset();pressure=true;grant=2*UVM_SIZE_1MB;uvm_perf_access_counter_indicated_pages_enable=true;
  test_indicated_pages=&indicated;capacity_at=1;
  run();assert(blocks[4].gpu_prefetch_started && blocks[4].gpu_prefetch_retry);
  watermark_at=0;int denied_begins=begin_calls;run();assert(begin_calls==denied_begins);
  watermark_at=-1;waits=0;capacity_at=0;indicated=4;run();
- assert(transferred==4096 && !blocks[4].gpu_prefetch_retry && !blocks[4].gpu_prefetch_started);
+ assert(transferred==4096 && !blocks[4].gpu_prefetch_retry && blocks[4].gpu_prefetch_started);
  waits=0;pressure=false;grant=4*UVM_SIZE_1MB;run();
  int completed_calls=calls;run();assert(calls==completed_calls && blocks[4].gpu_prefetch_started);
  // Low pressure preserves larger populations, even with the flag enabled.
