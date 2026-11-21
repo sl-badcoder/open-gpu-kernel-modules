@@ -43,6 +43,16 @@ uvm_cpu_preferred_admission_deferred uvm_cpu_preferred_admission_low_pressure
 uvm_cpu_preferred_admission_repeated uvm_cpu_preferred_admission_state_failures
 uvm_cpu_preferred_admission_eviction_probations uvm_cpu_preferred_admission_eviction_deferred
 uvm_cpu_preferred_admission_return_bytes""".split())
+COUNTERS.update((
+    "uvm_perf_diag_counter_service_calls", "uvm_perf_diag_counter_service_ns",
+    "uvm_perf_diag_counter_block_calls", "uvm_perf_diag_counter_block_ns",
+    "uvm_perf_diag_population_submit_calls", "uvm_perf_diag_population_submit_ns",
+    "uvm_perf_diag_population_wait_calls", "uvm_perf_diag_population_wait_ns",
+    "uvm_perf_diag_eviction_select_calls", "uvm_perf_diag_eviction_select_ns",
+    "uvm_perf_diag_eviction_submit_calls", "uvm_perf_diag_eviction_submit_ns",
+    "uvm_perf_diag_eviction_drain_calls", "uvm_perf_diag_eviction_drain_ns",
+    "uvm_perf_diag_admitted_empty", "uvm_perf_diag_admitted_nonempty",
+    "uvm_perf_diag_admitted_failed"))
 COUNTERS.update(("uvm_cpu_preferred_admission_coverage_broad",
                  "uvm_cpu_preferred_admission_coverage_sparse",
                  "uvm_cpu_preferred_admission_coverage_deferred"))
@@ -77,6 +87,70 @@ def trigger_extra_fraction(delta):
     if indicated is None or extra is None or indicated + extra <= 0:
         return None
     return extra / (indicated + extra)
+
+
+DIAGNOSTIC_STAGES = ("counter_service", "counter_block", "population_submit", "population_wait",
+                     "eviction_select", "eviction_submit", "eviction_drain")
+
+
+def boolean_setting(value):
+    """Parse Linux module boolean spellings without treating unknown text as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value) if value in (0, 1) else None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("y", "yes", "1", "true", "on"):
+            return True
+        if normalized in ("n", "no", "0", "false", "off"):
+            return False
+    return None
+
+
+def placement_diagnostics(rows, before_metrics, after_metrics):
+    """Summarize placement timing over the same before/after interval.
+
+    Rows are deliberately from differences(before, after), rather than the
+    first/last observed samples, so all stages use one common interval.
+    Missing or reset counters remain unknown. Timing stages can overlap.
+    """
+    by_name = {row["metric"].split("/")[-1]: row for row in rows}
+    setting = "module/uvm_perf_placement_diagnostics_enable"
+    if setting not in before_metrics or setting not in after_metrics:
+        status = "unsupported"
+    else:
+        before_enabled = boolean_setting(before_metrics[setting])
+        after_enabled = boolean_setting(after_metrics[setting])
+        if before_enabled is None or after_enabled is None:
+            status = "unknown"
+        elif before_enabled != after_enabled:
+            status = "changed"
+        else:
+            status = "enabled" if after_enabled else "disabled"
+    stages = {}
+    for name in DIAGNOSTIC_STAGES:
+        prefix = name
+        calls = by_name.get("uvm_perf_diag_%s_calls" % prefix)
+        duration = by_name.get("uvm_perf_diag_%s_ns" % prefix)
+        calls_delta = calls.get("change") if calls else None
+        ns_delta = duration.get("change") if duration else None
+        entry = {"calls": calls_delta, "total_seconds":
+                 ns_delta / 1e9 if ns_delta is not None else None,
+                 "mean_us": (ns_delta / calls_delta / 1000
+                              if ns_delta is not None and calls_delta not in (None, 0)
+                              and calls_delta > 0 else None)}
+        stages[name] = entry
+    outcomes = {}
+    for name in ("empty", "nonempty", "failed"):
+        row = by_name.get("uvm_perf_diag_admitted_" + name)
+        outcomes[name] = row.get("change") if row else None
+    empty, nonempty = outcomes["empty"], outcomes["nonempty"]
+    total = (empty + nonempty if empty is not None and nonempty is not None else 0)
+    outcomes["empty_fraction"] = (empty / total if total else None)
+    return {"status": status, "stages": stages, "admitted": outcomes,
+            "notes": ["Timing totals may overlap and are not additive wall time.",
+                      "Durations are CPU-side instrumentation, not GPU engine busy time."]}
 
 
 def value(text):
@@ -369,6 +443,8 @@ def main(argv=None):
                     ("hot_skip_visits_per_freed_root", "background_hot_skips", "background_roots_freed")):
                     n, d = delta.get(prefix + numerator), delta.get(prefix + denominator)
                     ratios[prefix + name] = n / d if n is not None and d is not None and d > 0 else None
+            ratios["placement_diagnostics"] = placement_diagnostics(
+                rows, before["metrics"], after["metrics"])
             write_json(out / "summary.json", {
                 "exit_code": exit_code, "snapshot_span_seconds": after["monotonic_s"] - before["monotonic_s"],
                 "pcie_sampler_exit_code": dmon.returncode if dmon else None,

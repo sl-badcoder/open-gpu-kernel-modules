@@ -4,6 +4,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 from test_demand_first_eviction import function
+from diagnostics_stubs import DIAGNOSTICS_STUBS
 
 ROOT = Path(__file__).parents[2]
 
@@ -138,6 +139,7 @@ static NV_STATUS prefetch_block(uvm_va_block_t *b,uvm_gpu_t *g,struct mm_struct 
 CASES = r'''
 static void reset(void) {
  now=1000000000ULL;completed_success=false;
+ memset(diag_calls,0,sizeof(diag_calls));diag_empty=diag_nonempty=diag_failed=0;
  uvm_perf_access_counter_indicated_pages_enable=false;test_indicated_pages=NULL;last_limit=false;
  memset(blocks,0,sizeof(blocks));memset(&range,0,sizeof(range));
  space.lock=1;range.va_range.va_space=&space;range.count=8;
@@ -155,6 +157,14 @@ static void reset(void) {
 static void run(void){uvm_cpu_block_policy_prefetch_on_signal(&blocks[trigger_slot],&gpu,&mm,0,test_indicated_pages);
  assert(uvm_cpu_preferred_prefetched_bytes==uvm_cpu_preferred_trigger_prefetched_bytes+uvm_cpu_preferred_neighbor_prefetched_bytes);}
 int main(void) {
+ // Diagnostics classify admitted attempts independently of bytes and failure.
+ reset();run();assert(diag_calls[UVM_PERF_DIAG_POPULATION_SUBMIT]==2);
+ assert(diag_calls[UVM_PERF_DIAG_POPULATION_WAIT]==1 && diag_nonempty==1 && !diag_empty && !diag_failed);
+ reset();pressure=true;grant=2*UVM_SIZE_1MB;trigger_resident=true;run();
+ assert(diag_empty==1 && !diag_nonempty && !diag_failed);
+ reset();grant=0;run();assert(!diag_empty && !diag_nonempty && !diag_calls[UVM_PERF_DIAG_POPULATION_WAIT]);
+ reset();alloc_fail=true;run();assert(diag_empty==1 && diag_failed==1 && !diag_nonempty);
+ reset();capacity_at=2;run();assert(diag_nonempty==1 && diag_failed==1 && !diag_empty);
  // Partial success stays one-shot: scanning other pages cannot repeat work.
  reset();pressure=true;grant=2*UVM_SIZE_1MB;uvm_perf_access_counter_indicated_pages_enable=true;
  uvm_page_mask_t indicated=1;test_indicated_pages=&indicated;
@@ -334,7 +344,7 @@ int main(void) {
 
 def main():
     source = (ROOT / 'kernel-open/nvidia-uvm/uvm_cpu_block_policy.c').read_text()
-    code = PRELUDE + function(source, 'uvm_cpu_block_policy_prefetch_on_signal')
+    code = PRELUDE + DIAGNOSTICS_STUBS + function(source, 'uvm_cpu_block_policy_prefetch_on_signal')
     code += function(source, 'uvm_cpu_block_policy_rearm_on_eviction') + CASES
     with tempfile.TemporaryDirectory(prefix='speculative-prefetch-') as directory:
         c = Path(directory) / 'test.c'

@@ -21,6 +21,7 @@
 *******************************************************************************/
 
 #include "uvm_cpu_block_policy.h"
+#include "uvm_perf_diagnostics.h"
 #include "uvm_global.h"
 #include "uvm_gpu.h"
 #include "uvm_linux.h"
@@ -30,6 +31,31 @@
 #include "uvm_va_space.h"
 
 static atomic64_t cpu_prefetch_next_range_id = ATOMIC64_INIT(0);
+bool uvm_perf_placement_diagnostics_enable __read_mostly;
+static atomic64_t placement_diag_calls[UVM_PERF_DIAG_STAGE_COUNT];
+static atomic64_t placement_diag_ns[UVM_PERF_DIAG_STAGE_COUNT];
+static atomic64_t uvm_perf_diag_admitted_empty = ATOMIC64_INIT(0);
+static atomic64_t uvm_perf_diag_admitted_nonempty = ATOMIC64_INIT(0);
+static atomic64_t uvm_perf_diag_admitted_failed = ATOMIC64_INIT(0);
+
+void uvm_perf_diag_record(uvm_perf_diag_stage_t stage, NvU64 elapsed_ns)
+{
+    UVM_ASSERT((unsigned)stage < UVM_PERF_DIAG_STAGE_COUNT);
+    atomic64_inc(&placement_diag_calls[stage]);
+    atomic64_add(elapsed_ns, &placement_diag_ns[stage]);
+}
+
+void uvm_perf_diag_population(NvU64 bytes, bool success)
+{
+    if (!uvm_perf_placement_diagnostics_enable)
+        return;
+    if (bytes)
+        atomic64_inc(&uvm_perf_diag_admitted_nonempty);
+    else
+        atomic64_inc(&uvm_perf_diag_admitted_empty);
+    if (!success)
+        atomic64_inc(&uvm_perf_diag_admitted_failed);
+}
 
 static unsigned uvm_cpu_preferred_blocks_enable __read_mostly;
 static unsigned uvm_cpu_preferred_block_promotion_enable __read_mostly = 0;
@@ -94,6 +120,24 @@ static int atomic64_count_get(char *buffer, const struct kernel_param *kp)
 static const struct kernel_param_ops atomic64_count_ops = {
     .get = atomic64_count_get,
 };
+
+module_param(uvm_perf_placement_diagnostics_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_placement_diagnostics_enable,
+                 "Measure inclusive placement wall times and admitted population outcomes (default false).");
+#define UVM_PLACEMENT_DIAG_PARAMS(label, index) \
+    module_param_cb(uvm_perf_diag_##label##_calls, &atomic64_count_ops, &placement_diag_calls[index], S_IRUGO); \
+    module_param_cb(uvm_perf_diag_##label##_ns, &atomic64_count_ops, &placement_diag_ns[index], S_IRUGO)
+UVM_PLACEMENT_DIAG_PARAMS(counter_service, UVM_PERF_DIAG_COUNTER_SERVICE);
+UVM_PLACEMENT_DIAG_PARAMS(counter_block, UVM_PERF_DIAG_COUNTER_BLOCK);
+UVM_PLACEMENT_DIAG_PARAMS(population_submit, UVM_PERF_DIAG_POPULATION_SUBMIT);
+UVM_PLACEMENT_DIAG_PARAMS(population_wait, UVM_PERF_DIAG_POPULATION_WAIT);
+UVM_PLACEMENT_DIAG_PARAMS(eviction_select, UVM_PERF_DIAG_EVICTION_SELECT);
+UVM_PLACEMENT_DIAG_PARAMS(eviction_submit, UVM_PERF_DIAG_EVICTION_SUBMIT);
+UVM_PLACEMENT_DIAG_PARAMS(eviction_drain, UVM_PERF_DIAG_EVICTION_DRAIN);
+#undef UVM_PLACEMENT_DIAG_PARAMS
+module_param_cb(uvm_perf_diag_admitted_empty, &atomic64_count_ops, &uvm_perf_diag_admitted_empty, S_IRUGO);
+module_param_cb(uvm_perf_diag_admitted_nonempty, &atomic64_count_ops, &uvm_perf_diag_admitted_nonempty, S_IRUGO);
+module_param_cb(uvm_perf_diag_admitted_failed, &atomic64_count_ops, &uvm_perf_diag_admitted_failed, S_IRUGO);
 
 module_param(uvm_perf_access_counter_admission_enable, bool, S_IRUGO);
 module_param(uvm_perf_access_counter_admission_coverage_enable, bool, S_IRUGO);
@@ -622,6 +666,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
     bool refault_mode = uvm_pmm_gpu_refault_enabled();
     bool prefetch_admitted = false;
     bool limit_to_indicated = false;
+    NvU64 submit_start;
     bool prefetch_success = true;
     uvm_tracker_t prefetch_tracker = UVM_TRACKER_INIT();
 
@@ -837,6 +882,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
             continue;
 
         bytes_before = prefetched_bytes;
+        submit_start = uvm_perf_diag_begin();
         status = prefetch_block(va_block,
                                 gpu,
                                 mm,
@@ -848,6 +894,7 @@ void uvm_cpu_block_policy_prefetch_on_signal(uvm_va_block_t *trigger_block,
                                 candidate_index != trigger_index,
                                 candidate_index == trigger_index ? indicated_pages : NULL,
                                 candidate_index == trigger_index && limit_to_indicated);
+        uvm_perf_diag_end(UVM_PERF_DIAG_POPULATION_SUBMIT, submit_start);
         if (candidate_index == trigger_index)
             trigger_prefetched_bytes += prefetched_bytes - bytes_before;
         if (capacity_stop) {
@@ -883,7 +930,9 @@ out:
     // No VA-block lock is held here. Drain all submitted work before allowing
     // eager eviction, even when submission stopped for capacity or an error.
     {
+        NvU64 wait_start = prefetch_admitted ? uvm_perf_diag_begin() : 0;
         NV_STATUS status = uvm_tracker_wait_deinit(&prefetch_tracker);
+        uvm_perf_diag_end(UVM_PERF_DIAG_POPULATION_WAIT, wait_start);
         if (status != NV_OK) {
             prefetch_success = false;
             UVM_DBG_PRINT("Managed allocation prefetch completion failed with %s on GPU %s\n",
@@ -892,9 +941,11 @@ out:
         }
     }
 
-    if (prefetch_admitted)
+    if (prefetch_admitted) {
         uvm_pmm_gpu_eager_eviction_prefetch_end(&gpu->pmm, &reservation,
                                                 prefetched_bytes, prefetch_success);
+        uvm_perf_diag_population(prefetched_bytes, prefetch_success);
+    }
 
     // Keep ownership through reservation release: another signal must not
     // claim this trigger while the failed attempt still owns capacity.

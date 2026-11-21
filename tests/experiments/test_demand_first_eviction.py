@@ -59,6 +59,14 @@ typedef int NV_STATUS;
 #define min(a,b) ((a)<(b)?(a):(b))
 #define NV_GETTIME() mock_now
 static NvU64 mock_now=1000;
+typedef enum { UVM_PERF_DIAG_COUNTER_SERVICE, UVM_PERF_DIAG_POPULATION_SUBMIT,
+               UVM_PERF_DIAG_POPULATION_WAIT, UVM_PERF_DIAG_EVICTION_SELECT,
+               UVM_PERF_DIAG_EVICTION_SUBMIT, UVM_PERF_DIAG_EVICTION_DRAIN,
+               UVM_PERF_DIAG_STAGE_COUNT } uvm_perf_diag_stage_t;
+static unsigned diag_counts[UVM_PERF_DIAG_STAGE_COUNT];
+static NvU64 uvm_perf_diag_begin(void) { return 1; }
+static void uvm_perf_diag_end(uvm_perf_diag_stage_t stage, NvU64 start)
+{ if (start) ++diag_counts[stage]; }
 static unsigned uvm_perf_vab_min_residency_ms=100;
 static unsigned uvm_perf_speculative_prefetch_limit_mb=32;
 static unsigned uvm_perf_speculative_prefetch_reserve_mb=64;
@@ -205,6 +213,9 @@ int main(void){
  assert(stats.prefetch_unretired_blocks==36 && stats.prefetch_unretired_returns==17);
  assert(stats.prefetch_ready_blocks==32 && stats.prefetch_ready_returns==16);
  assert(!memcmp(&before,&p.eager_eviction.budget,sizeof(before)));
+ assert(diag_counts[UVM_PERF_DIAG_EVICTION_SELECT] > 0);
+ assert(diag_counts[UVM_PERF_DIAG_EVICTION_SUBMIT] > 0);
+ assert(diag_counts[UVM_PERF_DIAG_EVICTION_DRAIN] > 0);
  puts("Production VAB demand/background eviction policy and telemetry passed.");
  return 0;
 }

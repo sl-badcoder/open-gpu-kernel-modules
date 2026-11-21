@@ -14,6 +14,75 @@ import monitor_uvm as monitor
 
 
 class MonitorTest(unittest.TestCase):
+    def test_placement_diagnostics_common_interval_and_units(self):
+        names = ["counter_service", "counter_block", "population_submit", "population_wait",
+                 "eviction_select", "eviction_submit", "eviction_drain"]
+        before_metrics = {"module/uvm_perf_placement_diagnostics_enable": "Y"}
+        after_metrics = {"module/uvm_perf_placement_diagnostics_enable": "Y"}
+        for index, name in enumerate(names, 1):
+            before_metrics[f"module/uvm_perf_diag_{name}_calls"] = 10
+            after_metrics[f"module/uvm_perf_diag_{name}_calls"] = 10 + index
+            before_metrics[f"module/uvm_perf_diag_{name}_ns"] = 1000
+            after_metrics[f"module/uvm_perf_diag_{name}_ns"] = 1000 + index * 1000
+        for name, value in (("empty", 2), ("nonempty", 6), ("failed", 1)):
+            before_metrics[f"module/uvm_perf_diag_admitted_{name}"] = 4
+            after_metrics[f"module/uvm_perf_diag_admitted_{name}"] = 4 + value
+        rows = monitor.differences({"monotonic_s": 10, "metrics": before_metrics},
+                                   {"monotonic_s": 12, "metrics": after_metrics})
+        counter_block_rows = {row["metric"]: row for row in rows
+                              if "counter_block" in row["metric"]}
+        self.assertEqual(counter_block_rows["module/uvm_perf_diag_counter_block_calls"]["kind"],
+                         "counter")
+        result = monitor.placement_diagnostics(rows, before_metrics, after_metrics)
+        self.assertEqual(result["status"], "enabled")
+        self.assertEqual(result["stages"]["counter_service"]["calls"], 1)
+        self.assertEqual(result["stages"]["counter_service"]["total_seconds"], 1e-6)
+        self.assertEqual(result["stages"]["counter_service"]["mean_us"], 1.0)
+        self.assertEqual(result["admitted"]["empty"], 2)
+        self.assertEqual(result["admitted"]["nonempty"], 6)
+        self.assertEqual(result["admitted"]["failed"], 1)
+        self.assertEqual(result["admitted"]["empty_fraction"], 0.25)
+
+    def test_placement_diagnostics_disabled_missing_and_reset(self):
+        key = "module/uvm_perf_diag_counter_service_calls"
+        ns = "module/uvm_perf_diag_counter_service_ns"
+        before = {"module/uvm_perf_placement_diagnostics_enable": "N", key: 10, ns: 100}
+        after = {"module/uvm_perf_placement_diagnostics_enable": "N", key: 11, ns: 200}
+        result = monitor.placement_diagnostics(
+            monitor.differences({"monotonic_s": 1, "metrics": before},
+                                 {"monotonic_s": 2, "metrics": after}), before, after)
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(result["stages"]["counter_service"]["mean_us"], 0.1)
+        self.assertIsNone(result["admitted"]["empty_fraction"])
+
+        missing = monitor.placement_diagnostics([], {}, {})
+        self.assertEqual(missing["status"], "unsupported")
+        self.assertIsNone(missing["stages"]["counter_service"]["calls"])
+        self.assertIsNone(missing["admitted"]["empty_fraction"])
+
+        reset_before = {"module/uvm_perf_placement_diagnostics_enable": 1,
+                        "module/uvm_perf_diag_admitted_empty": 9,
+                        "module/uvm_perf_diag_admitted_nonempty": 9}
+        reset_after = {"module/uvm_perf_placement_diagnostics_enable": 1,
+                       "module/uvm_perf_diag_admitted_empty": 1,
+                       "module/uvm_perf_diag_admitted_nonempty": 1}
+        reset = monitor.placement_diagnostics(
+            monitor.differences({"monotonic_s": 1, "metrics": reset_before},
+                                 {"monotonic_s": 2, "metrics": reset_after}),
+            reset_before, reset_after)
+        self.assertIsNone(reset["admitted"]["empty"])
+        self.assertIsNone(reset["admitted"]["nonempty"])
+        self.assertIsNone(reset["admitted"]["empty_fraction"])
+
+        changed = monitor.placement_diagnostics(
+            [], {"module/uvm_perf_placement_diagnostics_enable": "N"},
+            {"module/uvm_perf_placement_diagnostics_enable": "Y"})
+        self.assertEqual(changed["status"], "changed")
+        unknown = monitor.placement_diagnostics(
+            [], {"module/uvm_perf_placement_diagnostics_enable": "maybe"},
+            {"module/uvm_perf_placement_diagnostics_enable": "maybe"})
+        self.assertEqual(unknown["status"], "unknown")
+
     def test_trigger_attribution(self):
         delta = {"module/uvm_cpu_preferred_trigger_indicated_bytes": 256*1024,
                  "module/uvm_cpu_preferred_trigger_extra_bytes": 1792*1024}

@@ -4,6 +4,7 @@
 import pathlib
 import subprocess
 import tempfile
+from diagnostics_stubs import DIAGNOSTICS_STUBS
 
 SOURCE = pathlib.Path(__file__).parents[2] / "kernel-open/nvidia-uvm/uvm_gpu_access_counters.c"
 
@@ -90,14 +91,14 @@ static NV_STATUS service_notifications_batch(uvm_gpu_va_space_t *g, struct mm_st
 }
 '''
     tests = r'''
-static void reset(void) { memset(log_events, 0, sizeof(log_events)); memset(seen_indicated, 0, sizeof(seen_indicated)); log_count = 0; }
+static void reset(void) { memset(diag_calls,0,sizeof(diag_calls)); memset(log_events, 0, sizeof(log_events)); memset(seen_indicated, 0, sizeof(seen_indicated)); log_count = 0; }
 static void run(uvm_access_counter_buffer_t *a, uvm_access_counter_buffer_entry_t **e, size_t n) { a->batch_service_context.num_notifications = (NvU32)n; for (size_t i=0;i<n;i++) a->batch_service_context.notifications[i]=e[i]; }
 int main(void) {
     uvm_parent_gpu_t parent={0}; uvm_va_space_t va1={1}, va2={2}; uvm_gpu_t gpu1={1,0}, gpu2={2,0}; struct { uvm_va_block_t b; uvm_access_counter_buffer_entry_t e; } items[10]; uvm_access_counter_buffer_t a={.parent_gpu=&parent}; uvm_access_counter_buffer_entry_t *entries[10];
     for (int i=0;i<10;i++) { items[i].b.id=i+1; items[i].e=(uvm_access_counter_buffer_entry_t){&va1,&gpu1,0,0,NV_OK,NV_OK,&items[i].b}; entries[i]=&items[i].e; }
-    reset(); run(&a,entries,2); items[0].e.va_space=&va1; items[1].e.va_space=&va1; assert(service_notifications(&a)==NV_OK); assert(log_events[0]==1001 && log_events[1]==2001 && log_events[2]==1002 && log_events[3]==2002 && log_count==6 && log_events[4]==3001 && log_events[5]==3002); assert(seen_indicated[4] == (1ULL << 1) && seen_indicated[5] == (1ULL << 2));
+    reset(); run(&a,entries,2); items[0].e.va_space=&va1; items[1].e.va_space=&va1; assert(service_notifications(&a)==NV_OK); assert(log_events[0]==1001 && log_events[1]==2001 && log_events[2]==1002 && log_events[3]==2002 && log_count==6 && log_events[4]==3001 && log_events[5]==3002); assert(seen_indicated[4] == (1ULL << 1) && seen_indicated[5] == (1ULL << 2)); assert(diag_calls[UVM_PERF_DIAG_COUNTER_SERVICE]==1);
     reset(); items[2].e.gpu=&gpu2; items[3].e.gpu=&gpu2; items[2].e.va_space=&va1; items[3].e.va_space=&va2; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[2].e,&items[3].e},2); assert(service_notifications(&a)==NV_OK); assert(log_events[2]==3003 && log_events[5]==3004);
-    reset(); items[0].e.demand_status=7; items[1].e.demand_status=NV_OK; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[0].e,&items[1].e},2); assert(service_notifications(&a)==7 && log_count==1);
+    reset(); items[0].e.demand_status=7; items[1].e.demand_status=NV_OK; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[0].e,&items[1].e},2); assert(service_notifications(&a)==7 && log_count==1); assert(diag_calls[UVM_PERF_DIAG_COUNTER_SERVICE]==1);
     reset(); items[0].e.demand_status=NV_OK; items[0].e.flags_status=8; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[0].e},1); assert(service_notifications(&a)==8 && log_count==1);
     reset(); for (int i=0;i<9;i++) { items[i].e.kind=0; items[i].e.demand_status=NV_OK; items[i].e.flags_status=NV_OK; items[i].e.va_space=&va1; items[i].e.gpu=&gpu1; entries[i]=&items[i].e; } run(&a,entries,9); assert(service_notifications(&a)==NV_OK && log_count==27 && log_events[18]==3001 && log_events[26]==3009);
     reset(); items[0].e.kind=1; items[0].e.va_space=&va1; items[1].e.va_space=NULL; run(&a,(uvm_access_counter_buffer_entry_t *[]){&items[0].e,&items[1].e},2); assert(service_notifications(&a)==NV_OK && log_count==2 && log_events[0]==5001 && log_events[1]==4001);
@@ -109,7 +110,7 @@ int main(void) {
     return 0;
 }
 '''
-    source_text = PRELUDE + queue + mock_batch + orchestrator + tests
+    source_text = PRELUDE + DIAGNOSTICS_STUBS + queue + mock_batch + orchestrator + tests
     with tempfile.TemporaryDirectory(prefix="demand-first-test-") as directory:
         root = pathlib.Path(directory); cfile = root / "harness.c"; binary = root / "harness"
         cfile.write_text(source_text)
@@ -246,7 +247,7 @@ int main(void) {
     return 0;
 }
 '''
-    block_source = block_prelude + block_queue + block_function + block_tests
+    block_source = block_prelude + DIAGNOSTICS_STUBS + block_queue + block_function + block_tests
     with tempfile.TemporaryDirectory(prefix="demand-first-block-test-") as directory:
         root = pathlib.Path(directory); cfile = root / "block_harness.c"; binary = root / "block_harness"
         cfile.write_text(block_source)

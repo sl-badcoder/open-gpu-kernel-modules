@@ -34,6 +34,7 @@
 #include "uvm_va_range.h"
 #include "uvm_va_space_mm.h"
 #include "uvm_perf_module.h"
+#include "uvm_perf_diagnostics.h"
 #include "uvm_ats.h"
 #include "uvm_ats_faults.h"
 #include "uvm_cpu_block_policy.h"
@@ -1583,6 +1584,7 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
                                                 NvU32 *out_index,
                                                 demand_first_prefetch_queue_t *prefetch_queue)
 {
+    NvU64 diag_start = uvm_perf_diag_begin();
     NvU32 i;
     NvU32 flags = 0;
     NV_STATUS status = NV_OK;
@@ -1762,6 +1764,8 @@ static NV_STATUS service_notifications_in_block(uvm_gpu_va_space_t *gpu_va_space
         uvm_mutex_unlock(&va_block->lock);
     }
 
+    // Exclude deferred optional population, including a queue-capacity flush.
+    uvm_perf_diag_end(UVM_PERF_DIAG_COUNTER_BLOCK, diag_start);
     if (status == NV_OK && prefetch_queue && has_accessed_pages && allow_cpu_promotion)
         demand_first_prefetch_queue_push(prefetch_queue, va_block, gpu, mm, region_mask, &indicated_pages);
 
@@ -1990,6 +1994,7 @@ static bool should_service_4k_notification(uvm_va_space_t *va_space,
 
 static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_counters)
 {
+    NvU64 diag_start = uvm_perf_diag_begin();
     NvU32 i = 0;
     NV_STATUS status = NV_OK;
     struct mm_struct *mm = NULL;
@@ -2077,6 +2082,7 @@ static NV_STATUS service_notifications(uvm_access_counter_buffer_t *access_count
         uvm_va_space_mm_release_unlock(va_space, mm);
     }
 
+    uvm_perf_diag_end(UVM_PERF_DIAG_COUNTER_SERVICE, diag_start);
     return status;
 }
 

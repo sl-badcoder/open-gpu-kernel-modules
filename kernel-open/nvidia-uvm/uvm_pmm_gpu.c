@@ -176,6 +176,7 @@
 #include "uvm_va_range.h"
 #include "uvm_test.h"
 #include "uvm_linux.h"
+#include "uvm_perf_diagnostics.h"
 
 static int uvm_global_oversubscription = 1;
 module_param(uvm_global_oversubscription, int, S_IRUGO);
@@ -2152,6 +2153,7 @@ void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm,
 // Select and reclaim one root through the existing VA-block eviction path.
 static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_root)
 {
+    NvU64 diagnostic_start = uvm_perf_diag_begin();
     NV_STATUS status;
     uvm_gpu_root_chunk_t *root_chunk;
     uvm_vab_snapshot_t snapshot;
@@ -2167,19 +2169,24 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_ro
     // protection. Mandatory allocation and PMA callbacks retain their picker.
     if (!vab_only) {
         uvm_mutex_unlock(&pmm->lock);
+        uvm_perf_diag_end(UVM_PERF_DIAG_EVICTION_SELECT, diagnostic_start);
         return false;
     }
 
     root_chunk = vab_pick_root(pmm, &snapshot, vab_only);
     if (!root_chunk) {
         uvm_mutex_unlock(&pmm->lock);
+        uvm_perf_diag_end(UVM_PERF_DIAG_EVICTION_SELECT, diagnostic_start);
         return false;
     }
 
     cached_root = root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_FREE;
 
 
+    uvm_perf_diag_end(UVM_PERF_DIAG_EVICTION_SELECT, diagnostic_start);
+    diagnostic_start = uvm_perf_diag_begin();
     status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
+    uvm_perf_diag_end(UVM_PERF_DIAG_EVICTION_SUBMIT, diagnostic_start);
     uvm_mutex_unlock(&pmm->lock);
 
     if (status != NV_OK) {
@@ -2227,7 +2234,9 @@ static unsigned eager_eviction_batch(uvm_pmm_gpu_t *pmm, unsigned limit, unsigne
         // Drain successful submissions even if selecting a later root failed.
         // free_root_chunk waits for each root's tracker before releasing VRAM.
         for (i = 0; i < count; ++i) {
+            NvU64 diagnostic_start = uvm_perf_diag_begin();
             free_root_chunk(pmm, pending[i], FREE_ROOT_CHUNK_MODE_DEFAULT);
+            uvm_perf_diag_end(UVM_PERF_DIAG_EVICTION_DRAIN, diagnostic_start);
             uvm_spin_lock(&pmm->list_lock);
             ++pmm->vab_stats.background_roots_freed;
             uvm_spin_unlock(&pmm->list_lock);
