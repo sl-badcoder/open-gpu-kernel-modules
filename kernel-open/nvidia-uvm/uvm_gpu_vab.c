@@ -395,6 +395,10 @@ void uvm_gpu_vab_print(uvm_gpu_t *gpu, struct seq_file *s)
                roots.background_cached_root_releases, roots.background_allocated_root_releases);
     seq_printf(s, "replacement_enabled %llu\nreplacement_cached_free_bytes %llu\nreplacement_usable_free_bytes %llu\n",
                roots.replacement_enabled, roots.replacement_cached_free_bytes, roots.replacement_usable_free_bytes);
+    seq_printf(s, "adaptive_level %u\nadaptive_feedback_samples %llu\nadaptive_feedback_observed %llu\n"
+                  "adaptive_candidates %llu\nadaptive_probes %llu\n",
+               roots.adaptive_level, roots.adaptive_feedback_samples, roots.adaptive_feedback_observed,
+               roots.adaptive_candidates, roots.adaptive_probes);
     seq_printf(s, "replacement_pending_roots %llu\nreplacement_requests %llu\nreplacement_freed_roots %llu\n",
                roots.replacement_pending_roots, roots.replacement_requests, roots.replacement_freed_roots);
     seq_printf(s, "selection_changes %llu\nselection_fallbacks %llu\neligible_roots %llu\nreadiness_pending %llu\n",

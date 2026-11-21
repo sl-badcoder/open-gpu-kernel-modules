@@ -173,6 +173,7 @@
 #include "uvm_va_space.h"
 #include "uvm_va_block.h"
 #include "uvm_cpu_block_policy.h"
+#include "uvm_counter_admission.h"
 #include "uvm_va_range.h"
 #include "uvm_test.h"
 #include "uvm_linux.h"
@@ -2059,6 +2060,50 @@ static NvU64 prefetch_free_bytes_locked(uvm_pmm_gpu_t *pmm)
     return free_bytes;
 }
 
+bool uvm_perf_adaptive_replacement_admission_enable __read_mostly;
+module_param(uvm_perf_adaptive_replacement_admission_enable, bool, S_IRUGO);
+MODULE_PARM_DESC(uvm_perf_adaptive_replacement_admission_enable,
+                 "Adapt optional counter admission to headroom and VAB eviction evidence.");
+
+unsigned uvm_pmm_gpu_adaptive_admission_extra(uvm_pmm_gpu_t *pmm, bool returning)
+{
+    uvm_prefetch_budget_config_t config = speculative_prefetch_config();
+    unsigned extra = 0;
+
+    uvm_spin_lock(&pmm->list_lock);
+    if (uvm_perf_prefetch_replacement_enable && pmm->pma_stats &&
+        prefetch_free_bytes_locked(pmm) < config.demand_reserve_bytes +
+                                        pmm->eager_eviction.budget.reserved_bytes +
+                                        UVM_CHUNK_SIZE_MAX) {
+        extra = pmm->eager_eviction.adaptive_level;
+        if (extra && returning)
+            ++extra;
+
+        // A bounded fraction of candidates tests the base admission rule.
+        if (extra && (++pmm->eager_eviction.adaptive_candidates % 16 == 0)) {
+            ++pmm->eager_eviction.adaptive_probes;
+            extra = 0;
+        }
+    }
+    uvm_spin_unlock(&pmm->list_lock);
+    return extra;
+}
+
+static void adaptive_replacement_feedback(uvm_pmm_gpu_t *pmm, bool observed)
+{
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+    ++pmm->eager_eviction.adaptive_feedback_samples;
+    pmm->eager_eviction.adaptive_feedback_observed += observed;
+    pmm->eager_eviction.adaptive_observed += observed;
+    if (++pmm->eager_eviction.adaptive_samples == 16) {
+        pmm->eager_eviction.adaptive_level =
+            uvm_adaptive_replacement_level(pmm->eager_eviction.adaptive_level,
+                                           pmm->eager_eviction.adaptive_observed);
+        pmm->eager_eviction.adaptive_samples = 0;
+        pmm->eager_eviction.adaptive_observed = 0;
+    }
+}
+
 static NvU64 replacement_refill_bytes(const uvm_prefetch_budget_config_t *config, unsigned batch_count)
 {
     // Refill enough for a bounded burst, rather than forcing a new worker
@@ -2159,6 +2204,9 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_ro
     uvm_vab_snapshot_t snapshot;
     bool vab_only;
     bool cached_root;
+    bool observed_valid = false;
+    NvU64 last_access_ns = 0;
+    NvU64 ready_ns = 0;
 
     uvm_gpu_vab_get_snapshot(uvm_pmm_to_gpu(pmm)->parent, &snapshot);
     vab_only = snapshot.eviction_enabled && snapshot.valid && snapshot.linear_base != ~0ULL;
@@ -2181,6 +2229,12 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_ro
     }
 
     cached_root = root_chunk->chunk.state == UVM_PMM_GPU_CHUNK_STATE_FREE;
+    if (uvm_perf_adaptive_replacement_admission_enable && !cached_root) {
+        ready_ns = READ_ONCE(root_chunk->vab_ready_ns);
+        observed_valid = ready_ns && snapshot.sampled_ns > ready_ns && uvm_gpu_vab_get_recency(uvm_pmm_to_gpu(pmm)->parent, &snapshot,
+                                                root_chunk->chunk.address, UVM_CHUNK_SIZE_MAX,
+                                                ready_ns, &last_access_ns);
+    }
 
 
     uvm_perf_diag_end(UVM_PERF_DIAG_EVICTION_SELECT, diagnostic_start);
@@ -2197,6 +2251,8 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_ro
     }
 
     uvm_spin_lock(&pmm->list_lock);
+    if (observed_valid)
+        adaptive_replacement_feedback(pmm, last_access_ns > ready_ns);
     if (cached_root)
         ++pmm->eager_eviction.cached_root_releases;
     else
@@ -3875,6 +3931,11 @@ void uvm_pmm_gpu_vab_stats(uvm_pmm_gpu_t *pmm,
     stats->background_cached_root_releases = pmm->eager_eviction.cached_root_releases;
     stats->background_allocated_root_releases = pmm->eager_eviction.allocated_root_releases;
     stats->replacement_pending_roots = pmm->eager_eviction.replacement_roots;
+    stats->adaptive_level = pmm->eager_eviction.adaptive_level;
+    stats->adaptive_feedback_samples = pmm->eager_eviction.adaptive_feedback_samples;
+    stats->adaptive_feedback_observed = pmm->eager_eviction.adaptive_feedback_observed;
+    stats->adaptive_candidates = pmm->eager_eviction.adaptive_candidates;
+    stats->adaptive_probes = pmm->eager_eviction.adaptive_probes;
     stats->replacement_requests = pmm->eager_eviction.replacement_requests;
     stats->replacement_freed_roots = pmm->eager_eviction.replacement_freed_roots;
     stats->prefetch_allocation_failures = pmm->eager_eviction.budget.allocation_failures;
@@ -4004,6 +4065,13 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
     pmm->root_chunks.in_eviction_count = 0;
     pmm->eager_eviction.active = false;
     pmm->eager_eviction.prefetch_count = 0;
+    pmm->eager_eviction.adaptive_level = 0;
+    pmm->eager_eviction.adaptive_samples = 0;
+    pmm->eager_eviction.adaptive_observed = 0;
+    pmm->eager_eviction.adaptive_feedback_samples = 0;
+    pmm->eager_eviction.adaptive_feedback_observed = 0;
+    pmm->eager_eviction.adaptive_candidates = 0;
+    pmm->eager_eviction.adaptive_probes = 0;
     pmm->eager_eviction.replacement_roots = 0;
     pmm->eager_eviction.replacement_requests = 0;
     pmm->eager_eviction.replacement_freed_roots = 0;

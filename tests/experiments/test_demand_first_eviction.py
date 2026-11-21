@@ -8,7 +8,7 @@ import tempfile
 ROOT = Path(__file__).parents[2]
 
 def function(source, name):
-    matches = re.finditer(r"^(?:static [^\n]*|void |NvU64 )\b" + name + r"\(", source, re.M)
+    matches = re.finditer(r"^(?:static [^\n]*|void |unsigned |NvU64 )\b" + name + r"\(", source, re.M)
     match = next((m for m in matches if ';' not in source[m.start():source.index('{', m.start())]), None)
     if match is None:
         raise ValueError(name)
@@ -67,6 +67,7 @@ static unsigned diag_counts[UVM_PERF_DIAG_STAGE_COUNT];
 static NvU64 uvm_perf_diag_begin(void) { return 1; }
 static void uvm_perf_diag_end(uvm_perf_diag_stage_t stage, NvU64 start)
 { if (start) ++diag_counts[stage]; }
+static bool uvm_perf_adaptive_replacement_admission_enable;
 static unsigned uvm_perf_vab_min_residency_ms=100;
 static unsigned uvm_perf_speculative_prefetch_limit_mb=32;
 static unsigned uvm_perf_speculative_prefetch_reserve_mb=64;
@@ -84,7 +85,7 @@ typedef struct { uvm_gpu_chunk_t chunk; NvU64 vab_generation,vab_ready_generatio
 typedef struct { int dummy; } uvm_parent_gpu_t;
 typedef struct { uvm_parent_gpu_t *parent; struct { NvU64 size; struct {bool enabled;} numa; } mem_info; } uvm_gpu_t;
 static uvm_gpu_t mock_gpu;
-typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; NvU64 cached_free_root_count; } root_chunks; struct {NvU64 numFreePages64k;} *pma_stats; struct { NvU64 epoch; unsigned replacement_roots; NvU64 replacement_requests, replacement_freed_roots, cached_root_releases, allocated_root_releases; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; uvm_prefetch_refault_t refault; struct {NvU64 events, confirmations, replacements, predictions, learned_predictions, expirations;} patterns; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
+typedef struct { int lock,list_lock; struct { struct list_head alloc_list[3]; NvU64 cached_free_root_count; } root_chunks; struct mock_pma_stats {NvU64 numFreePages64k;} *pma_stats; struct { NvU64 epoch; unsigned replacement_roots, adaptive_level, adaptive_samples, adaptive_observed; NvU64 adaptive_feedback_samples, adaptive_feedback_observed, adaptive_candidates, adaptive_probes; NvU64 replacement_requests, replacement_freed_roots, cached_root_releases, allocated_root_releases; unsigned prefetch_count; bool recovering_watermark, active; uvm_prefetch_budget_t budget; uvm_prefetch_refault_t refault; struct {NvU64 events, confirmations, replacements, predictions, learned_predictions, expirations;} patterns; } eager_eviction; struct list_head free_list[2]; uvm_pmm_gpu_vab_stats_t vab_stats; } uvm_pmm_gpu_t;
 static uvm_gpu_t *uvm_pmm_to_gpu(uvm_pmm_gpu_t *p) {(void)p; return &mock_gpu;}
 static uvm_vab_snapshot_t mock_snapshot;
 static unsigned snapshot_calls;
@@ -147,6 +148,26 @@ static void add(unsigned i,unsigned list){
 }
 int main(void){
  uvm_gpu_root_chunk_t *out=NULL;
+ struct mock_pma_stats capacity={0};
+ reset();
+ p.pma_stats=&capacity;
+ uvm_perf_prefetch_replacement_enable=true;
+ uvm_spin_lock(&p.list_lock);
+ for (unsigned i=0;i<16;++i)
+     adaptive_replacement_feedback(&p,false);
+ uvm_spin_unlock(&p.list_lock);
+ assert(p.eager_eviction.adaptive_level==1 && p.eager_eviction.adaptive_feedback_samples==16);
+ for (unsigned i=0;i<15;++i)
+     assert(uvm_pmm_gpu_adaptive_admission_extra(&p,true)==2);
+ assert(uvm_pmm_gpu_adaptive_admission_extra(&p,true)==0 && p.eager_eviction.adaptive_probes==1);
+ capacity.numFreePages64k=4096;
+ assert(uvm_pmm_gpu_adaptive_admission_extra(&p,true)==0 && p.eager_eviction.adaptive_candidates==16);
+ uvm_spin_lock(&p.list_lock);
+ for (unsigned i=0;i<16;++i)
+     adaptive_replacement_feedback(&p,true);
+ uvm_spin_unlock(&p.list_lock);
+ assert(p.eager_eviction.adaptive_level==0 && p.eager_eviction.adaptive_feedback_observed==16);
+
  // Background skips all-hot roots.
  reset();add(0,2);add(1,2);mock_snapshot.access_bits[0]=3;
  assert(!eager_eviction_one(&p,&out)&&!evictions);
@@ -237,7 +258,12 @@ def main():
         code += re.search(r'static bool uvm_perf_speculative_prefetch_' + parameter + r' = (?:true|false);', source).group(0) + '\n'
     code += function(source, 'uvm_pmm_gpu_prefetch_feedback_window_ns')
     code += function(source, 'speculative_prefetch_config')
-    for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_one','eager_eviction_batch','prefetch_cached_free_bytes_locked','prefetch_free_bytes_locked','uvm_pmm_gpu_vab_stats'):
+    admission = (ROOT / 'kernel-open/nvidia-uvm/uvm_counter_admission.h').read_text()
+    code += function(admission, 'uvm_adaptive_replacement_level')
+    for name in ('prefetch_cached_free_bytes_locked', 'prefetch_free_bytes_locked',
+                 'uvm_pmm_gpu_adaptive_admission_extra', 'adaptive_replacement_feedback'):
+        code += function(source, name)
+    for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):
         code+=function(source,name)
     code+=SCENARIOS
     with tempfile.TemporaryDirectory(prefix='demand-first-eviction-') as directory:

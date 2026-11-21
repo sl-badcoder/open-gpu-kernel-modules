@@ -32,6 +32,16 @@ static inline bool uvm_counter_admission_fresh(const uvm_counter_admission_regio
     return !r->pending || r->buffer != buffer || fresh >= r->clear_serial;
 }
 
+// Event-based hysteresis. Only roots with valid residency evidence contribute.
+static inline unsigned uvm_adaptive_replacement_level(unsigned level, unsigned observed)
+{
+    if (observed <= 4 && level < 2)
+        return level + 1;
+    if (observed >= 12 && level > 0)
+        return level - 1;
+    return level;
+}
+
 // One complete-eviction episode per logical block/GPU. Distance is CPU-policy
 // population bytes on this GPU, not elapsed time or PCIe wire traffic.
 typedef struct

@@ -216,6 +216,11 @@ typedef struct {
     NvU64 background_cached_root_releases;
     NvU64 background_allocated_root_releases;
     NvU64 replacement_pending_roots;
+    unsigned adaptive_level;
+    NvU64 adaptive_feedback_samples;
+    NvU64 adaptive_feedback_observed;
+    NvU64 adaptive_candidates;
+    NvU64 adaptive_probes;
     NvU64 replacement_requests;
     NvU64 replacement_freed_roots;
     NvU64 prefetch_allocation_failures;
@@ -518,6 +523,13 @@ typedef struct uvm_pmm_gpu_struct
         uvm_prefetch_pattern_t patterns;
         uvm_prefetch_refault_t refault;
         // Coalesced shortage, never an unbounded queue of notification requests.
+        unsigned adaptive_level;
+        unsigned adaptive_samples;
+        unsigned adaptive_observed;
+        NvU64 adaptive_feedback_samples;
+        NvU64 adaptive_feedback_observed;
+        NvU64 adaptive_candidates;
+        NvU64 adaptive_probes;
         unsigned replacement_roots;
         NvU64 replacement_requests;
         NvU64 replacement_freed_roots;
@@ -741,6 +753,8 @@ bool uvm_pmm_gpu_counter_admission_pressure(uvm_pmm_gpu_t *pmm, unsigned high);
 // Return a byte reservation (zero denies) outside the eager eviction phase,
 // bounded by the per-GPU adaptive cap and free capacity minus demand reserve.
 // Every nonzero begin must be paired with end after GPU work completes.
+extern bool uvm_perf_adaptive_replacement_admission_enable;
+unsigned uvm_pmm_gpu_adaptive_admission_extra(uvm_pmm_gpu_t *pmm, bool returning);
 NvU64 uvm_pmm_gpu_eager_eviction_prefetch_begin(uvm_pmm_gpu_t *pmm,
                                                NvU64 requested_bytes,
                                                uvm_prefetch_reservation_t *reservation);

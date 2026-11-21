@@ -186,6 +186,12 @@ static void queued_count_boundary_and_wrap_abstraction(void)
 
 int main(void)
 {
+    assert(uvm_adaptive_replacement_level(0, 4) == 1);
+    assert(uvm_adaptive_replacement_level(1, 0) == 2);
+    assert(uvm_adaptive_replacement_level(2, 0) == 2);
+    assert(uvm_adaptive_replacement_level(2, 12) == 1);
+    assert(uvm_adaptive_replacement_level(1, 8) == 1);
+
     const NvU64 edges[] = {64ULL<<20, 256ULL<<20, 1ULL<<30, 4ULL<<30};
     assert(uvm_counter_admission_distance_bucket(0)==0);
     for (unsigned i=0;i<4;++i) {
@@ -369,7 +375,12 @@ GATE_STUBS = r'''
 typedef struct { uvm_counter_admission_region_t counter_admission; uvm_counter_admission_history_t counter_admission_history; uvm_page_mask_t resident; uvm_page_mask_t counter_admission_pages; } uvm_va_block_gpu_state_t;
 typedef struct { int dummy; } range_t;
 typedef struct { int lock; range_t *managed_range; } uvm_va_block_t;
-typedef struct { int id; long long counter_admission_population_bytes; } uvm_gpu_t;
+typedef struct { int id; long long counter_admission_population_bytes; int pmm; } uvm_gpu_t;
+#define min(a,b) ((a)<(b)?(a):(b))
+static bool uvm_perf_adaptive_replacement_admission_enable;
+static unsigned adaptive_extra;
+static unsigned uvm_pmm_gpu_adaptive_admission_extra(int *pmm, bool returning)
+{(void)pmm;(void)returning;return adaptive_extra;}
 static bool uvm_perf_access_counter_admission_eviction_enable=true;
 static bool uvm_perf_access_counter_admission_distance_stats_enable=true;
 static bool uvm_perf_access_counter_admission_coverage_enable=false;
@@ -422,6 +433,19 @@ int main(void) {
     assert(upper.counter_admission_history.population_at_eviction==123);
     assert(!lower.counter_admission.pending && !upper.counter_admission.pending);
     range_t range={0};uvm_va_block_t block={.lock=1,.managed_range=&range};uvm_gpu_t gpu={0};
+    uvm_perf_adaptive_replacement_admission_enable = true;
+    adaptive_extra = 1;
+    uvm_perf_access_counter_admission_observations = 2;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,1,1,NULL));
+    adaptive_extra = 0;
+    assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,2,2,NULL));
+    assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,3,3,NULL));
+    state = (uvm_va_block_gpu_state_t){0};
+    uvm_cpu_preferred_admission_requests = uvm_cpu_preferred_admission_deferred = 0;
+    uvm_cpu_preferred_admission_repeated = 0;
+    uvm_perf_access_counter_admission_observations = 3;
+    uvm_perf_adaptive_replacement_admission_enable = false;
+
     assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,10,10,NULL));
     assert(!uvm_cpu_block_policy_admit_counter(&block,&gpu,0,11,11,NULL));
     assert(uvm_cpu_block_policy_admit_counter(&block,&gpu,0,12,12,NULL));

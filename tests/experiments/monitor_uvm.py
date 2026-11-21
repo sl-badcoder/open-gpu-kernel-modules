@@ -57,7 +57,9 @@ COUNTERS.update(("uvm_cpu_preferred_admission_coverage_broad",
                  "uvm_cpu_preferred_admission_coverage_sparse",
                  "uvm_cpu_preferred_admission_coverage_deferred"))
 COUNTERS.update(("background_cached_root_releases", "background_allocated_root_releases",
-                 "replacement_requests", "replacement_freed_roots"))
+                 "replacement_requests", "replacement_freed_roots",
+                 "adaptive_feedback_samples", "adaptive_feedback_observed",
+                 "adaptive_candidates", "adaptive_probes"))
 RETURN_DISTANCE_BUCKETS = ("lt64m", "64m_256m", "256m_1g", "1g_4g", "ge4g")
 COUNTERS.update(f"uvm_cpu_preferred_return_{bucket}_{metric}"
                 for bucket in RETURN_DISTANCE_BUCKETS

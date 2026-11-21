@@ -253,7 +253,7 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
     state = uvm_va_block_gpu_state_get(va_block, gpu->id);
     if (state && !uvm_page_mask_empty(&state->resident))
         state->counter_admission_history.evicted = false;
-    if (!pressure) {
+    if (!pressure && !uvm_perf_adaptive_replacement_admission_enable) {
         if (state) {
             state->counter_admission.pending = false;
             state->counter_admission.observations = 0;
@@ -287,7 +287,12 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
         if (required > clamp(uvm_perf_access_counter_admission_observations, 2U, 8U))
             atomic64_inc(&uvm_cpu_preferred_admission_eviction_probations);
     }
-    if (uvm_perf_access_counter_admission_coverage_enable) {
+    if (uvm_perf_adaptive_replacement_admission_enable) {
+        if (!state->counter_admission.pending || state->counter_admission.buffer != buffer)
+            required = min(required + uvm_pmm_gpu_adaptive_admission_extra(
+                                         &gpu->pmm, state->counter_admission_history.evicted), 8U);
+    }
+    else if (uvm_perf_access_counter_admission_coverage_enable) {
         bool new_probation = !state->counter_admission.pending || state->counter_admission.buffer != buffer;
         if (new_probation) {
             uvm_page_mask_zero(&state->counter_admission_pages);
@@ -324,7 +329,7 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
             state->counter_admission.required = required;
     }
     admitted = uvm_counter_admission_decide(&state->counter_admission, true, buffer, submitted, fresh, required);
-    if (uvm_perf_access_counter_admission_coverage_enable) {
+    if (!uvm_perf_adaptive_replacement_admission_enable && uvm_perf_access_counter_admission_coverage_enable) {
         if (admitted) {
             if (narrow)
                 atomic64_inc(&uvm_cpu_preferred_admission_coverage_sparse);
@@ -334,7 +339,8 @@ bool uvm_cpu_block_policy_admit_counter(uvm_va_block_t *va_block, uvm_gpu_t *gpu
         else if (narrow)
             atomic64_inc(&uvm_cpu_preferred_admission_coverage_deferred);
     }
-    if (!admitted && (uvm_perf_access_counter_admission_coverage_enable ?
+    if (!admitted && !uvm_perf_adaptive_replacement_admission_enable &&
+        (uvm_perf_access_counter_admission_coverage_enable ?
                          state->counter_admission.coverage_base_required : state->counter_admission.required) >
                          clamp(uvm_perf_access_counter_admission_observations, 2U, 8U))
         atomic64_inc(&uvm_cpu_preferred_admission_eviction_deferred);
