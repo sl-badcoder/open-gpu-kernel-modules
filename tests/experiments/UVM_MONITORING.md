@@ -9,8 +9,9 @@ bash ../open-gpu-kernel-modules/tests/experiments/run_vllm_monitored.sh
 
 The wrapper uses your exact benchmark arguments, including three repeats. It
 creates a unique directory under `results/ember-adaptive/` for each batch size.
-Existing experiment directories are never overwritten. No kernel parameters are
-changed and the module is not reloaded. Python 3's standard library is sufficient.
+Existing experiment directories are never overwritten. By default no kernel
+parameters are changed and the module is not reloaded. Python 3's standard library
+is sufficient.
 
 Optional overrides:
 
@@ -24,6 +25,86 @@ bash ../open-gpu-kernel-modules/tests/experiments/run_vllm_monitored.sh
 benchmark's CUDA device selection. Set `CUDA_VISIBLE_DEVICES` consistently if
 needed. VAB snapshots collect all readable GPUs and sysfs counters are global.
 Avoid concurrent GPU workloads when comparing configurations.
+
+## Access-counter threshold sweep
+
+Use your existing module reload script, which must accept a
+`uvm_perf_access_counter_threshold=N` argument and perform its own sudo calls:
+
+```bash
+ACCESS_COUNTER_THRESHOLDS="1024 10024 32768 50024 65535" \
+RELOAD_SCRIPT=./reload_uvm.sh \
+BATCH_SIZES="32" RESULT_ROOT=results/access-counter-sweep \
+bash ../open-gpu-kernel-modules/tests/experiments/run_vllm_monitored.sh
+```
+
+The wrapper reloads once per threshold, then runs every requested batch size.
+Other settings come from your reload script. Run from the vLLM directory; the
+reload script inherits that working directory, including for relative `.ko` paths.
+Each result directory includes `-ac-N`, and reload output is saved in a separate
+`reload-ac-N-...log`. The monitor records module parameters in the usual snapshots.
+The entire threshold list is validated against 1..65535 before any reload;
+above-limit values are rejected instead of silently testing the driver's clamp.
+Reload or benchmark failure stops the sweep. The final threshold remains loaded.
+Keep other GPU clients that prevent module unloading stopped during a sweep.
+
+Remove obsolete arguments from your reload script if the current `.ko` does not
+support them; check with `modinfo -p /path/to/nvidia-uvm.ko`.
+
+### External GPU memory reservation
+
+For your existing `./reserv 2` command, enable reservation directly:
+
+```bash
+ACCESS_COUNTER_THRESHOLDS="1024 10024 32768 50024 65535" \
+RELOAD_SCRIPT=./reload_uvm.sh \
+RESERVATION_GIB=2 RESERVATION_EXECUTABLE=./reserv \
+BATCH_SIZES="32" RESULT_ROOT=results/access-counter-sweep \
+bash ../open-gpu-kernel-modules/tests/experiments/run_vllm_monitored.sh
+```
+
+`RESERVATION_GIB` is a positive integer passed as the helper's size argument;
+the helper defines the exact units. `RESERVATION_EXECUTABLE` defaults to `./reserv`.
+It must stay in the foreground until killed. To reserve another size, change
+`RESERVATION_GIB`. Leave it unset to preserve runs without a managed reservation.
+Stop your manually launched `reserv` before the first sweep; only processes
+started by this wrapper are stopped automatically.
+
+For a different command or extra arguments, use `RESERVATION_SCRIPT` instead of
+`RESERVATION_GIB` (they are mutually exclusive).
+Set `RESERVATION_SCRIPT` to a wrapper around your existing reservation command:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+exec /absolute/path/to/reservation-program YOUR_SIZE_AND_GPU_ARGUMENTS
+```
+
+Replace that example command with the actual invocation that reserves your 2 GB.
+The program must stay in the foreground while holding the allocation; use `exec`
+and do not background or daemonize it. The benchmark wrapper manages that PID.
+
+```bash
+ACCESS_COUNTER_THRESHOLDS="1024 10024 32768 50024 65535" \
+RELOAD_SCRIPT=./reload_uvm.sh RESERVATION_SCRIPT=./reserve_gpu.sh \
+RESERVATION_STARTUP_SECONDS=3 BATCH_SIZES="32" \
+RESULT_ROOT=results/access-counter-sweep \
+bash ../open-gpu-kernel-modules/tests/experiments/run_vllm_monitored.sh
+```
+
+For each threshold, the wrapper stops its previous reservation, reloads the module,
+starts a new reservation, waits for the configured startup interval, and runs the
+benchmarks. The interval is a startup allowance, not verification that allocation
+has completed; choose it to cover your helper's initialization time. The helper's
+output is saved in `reservation-ac-N-...log`. Its liveness is checked during startup
+and before/after each benchmark. If it exits during a benchmark, that result is
+invalid and the sweep stops after the monitor returns.
+
+The owned reservation is terminated on normal exit, benchmark failure, Ctrl-C,
+or SIGTERM. No shell cleanup can run after SIGKILL or a machine crash. Existing
+manually started reservations are not killed; stop those before running the sweep.
+Reservation and benchmark processes inherit `CUDA_VISIBLE_DEVICES`, so configure
+your helper to allocate on the intended benchmark GPU.
 
 ## Saved files
 
