@@ -2195,8 +2195,216 @@ void uvm_pmm_gpu_eager_eviction_prefetch_end(uvm_pmm_gpu_t *pmm,
         mod_delayed_work(system_wq, &pmm->eager_eviction.work, 0);
 }
 
+// Candidates are hints, not reservations. Root descriptors live for PMM's
+// lifetime; generation and eligibility are checked again under list_lock before
+// claiming one. This avoids pinning unused candidates across eviction failures.
+#define UVM_EVICTION_CANDIDATES_MAX 16
+
+typedef struct {
+    uvm_gpu_root_chunk_t *root;
+    NvU64 generation;
+    NvU64 last_access_ns;
+    unsigned order;
+} uvm_eviction_candidate_t;
+
+typedef struct {
+    uvm_eviction_candidate_t entries[UVM_EVICTION_CANDIDATES_MAX];
+    unsigned count;
+    unsigned next;
+    unsigned limit;
+    bool initialized;
+    bool refilled;
+    bool invalidated;
+    NvU64 sampled_ns;
+    NvU64 linear_base;
+    NvU32 granularity;
+    bool lru_enabled;
+} uvm_eviction_candidates_t;
+
+// One used-list scan costs O(N log B), rather than O(N * B) repeated
+// selections. A max heap retains the oldest candidates in this snapshot; list
+// order breaks recency ties. Later snapshots can invalidate cached candidates.
+static bool eviction_candidate_newer(const uvm_eviction_candidate_t *a,
+                                     const uvm_eviction_candidate_t *b)
+{
+    return a->last_access_ns > b->last_access_ns ||
+           (a->last_access_ns == b->last_access_ns && a->order > b->order);
+}
+
+static void eviction_candidates_sift(uvm_eviction_candidate_t *entries, unsigned count, unsigned parent)
+{
+    while (parent * 2 + 1 < count) {
+        unsigned child = parent * 2 + 1;
+        uvm_eviction_candidate_t tmp;
+        if (child + 1 < count && eviction_candidate_newer(&entries[child + 1], &entries[child]))
+            ++child;
+        if (!eviction_candidate_newer(&entries[child], &entries[parent]))
+            break;
+        tmp = entries[parent];
+        entries[parent] = entries[child];
+        entries[child] = tmp;
+        parent = child;
+    }
+}
+
+static void eviction_candidates_collect(uvm_pmm_gpu_t *pmm,
+                                         const uvm_vab_snapshot_t *snapshot,
+                                         uvm_eviction_candidates_t *candidates)
+{
+    uvm_gpu_chunk_t *entry;
+    NvU64 now = NV_GETTIME();
+    unsigned order = 0;
+    unsigned i;
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+    UVM_ASSERT(candidates->limit && candidates->limit <= UVM_EVICTION_CANDIDATES_MAX);
+    candidates->initialized = true;
+    candidates->invalidated = false;
+    candidates->count = 0;
+    candidates->next = 0;
+    candidates->sampled_ns = snapshot->sampled_ns;
+    candidates->linear_base = snapshot->linear_base;
+    candidates->granularity = snapshot->granularity;
+    candidates->lru_enabled = snapshot->lru_enabled;
+    list_for_each_entry(entry, &pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED], list) {
+        uvm_gpu_root_chunk_t *root = root_chunk_from_chunk(pmm, entry);
+        uvm_eviction_candidate_t candidate;
+        uvm_vab_region_state_t state;
+        unsigned index;
+
+        ++order;
+        if (!root->vab_ready_ns || now < root->vab_ready_ns ||
+            now - root->vab_ready_ns < (NvU64)uvm_perf_vab_min_residency_ms * NSEC_PER_MSEC)
+            continue;
+        state = vab_root_state(root, snapshot);
+        if (state != UVM_VAB_REGION_COLD) {
+            if (state == UVM_VAB_REGION_HOT)
+                ++pmm->vab_stats.background_hot_skips;
+            else
+                ++pmm->vab_stats.background_unknown_skips;
+            continue;
+        }
+        candidate.root = root;
+        candidate.generation = root->vab_generation;
+        candidate.last_access_ns = 0;
+        candidate.order = order;
+        if (snapshot->lru_enabled &&
+            !uvm_gpu_vab_get_recency(uvm_pmm_to_gpu(pmm)->parent, snapshot,
+                                    entry->address, UVM_CHUNK_SIZE_MAX,
+                                    root->vab_ready_ns, &candidate.last_access_ns))
+            continue;
+        if (candidates->count == candidates->limit) {
+            if (!eviction_candidate_newer(&candidates->entries[0], &candidate))
+                continue;
+            candidates->entries[0] = candidate;
+            eviction_candidates_sift(candidates->entries, candidates->count, 0);
+            continue;
+        }
+        index = candidates->count++;
+        candidates->entries[index] = candidate;
+        while (index) {
+            unsigned parent = (index - 1) / 2;
+            uvm_eviction_candidate_t tmp;
+            if (!eviction_candidate_newer(&candidates->entries[index], &candidates->entries[parent]))
+                break;
+            tmp = candidates->entries[parent];
+            candidates->entries[parent] = candidates->entries[index];
+            candidates->entries[index] = tmp;
+            index = parent;
+        }
+        // Without recency ordering the first eligible roots are already best.
+        if (!snapshot->lru_enabled && candidates->count == candidates->limit)
+            break;
+    }
+    // Heap sort produces oldest-first order, including stable list-order ties.
+    for (i = candidates->count; i > 1; --i) {
+        uvm_eviction_candidate_t tmp = candidates->entries[0];
+        candidates->entries[0] = candidates->entries[i - 1];
+        candidates->entries[i - 1] = tmp;
+        eviction_candidates_sift(candidates->entries, i - 1, 0);
+    }
+}
+
+static uvm_gpu_root_chunk_t *eviction_candidates_pick(uvm_pmm_gpu_t *pmm,
+                                                       const uvm_vab_snapshot_t *snapshot,
+                                                       uvm_eviction_candidates_t *candidates)
+{
+    uvm_gpu_chunk_t *chunk = NULL;
+    uvm_pmm_alloc_list_t list;
+    bool skipped = false;
+
+    uvm_spin_lock(&pmm->list_lock);
+    // Preserve free/discarded/unused priority without rescanning the used list.
+    if (!uvm_perf_prefetch_replacement_enable) {
+        chunk = list_first_chunk(find_free_list(pmm, UVM_PMM_GPU_MEMORY_TYPE_USER,
+                                                UVM_CHUNK_SIZE_MAX, UVM_PMM_LIST_NO_ZERO));
+        if (!chunk)
+            chunk = list_first_chunk(find_free_list(pmm, UVM_PMM_GPU_MEMORY_TYPE_USER,
+                                                    UVM_CHUNK_SIZE_MAX, UVM_PMM_LIST_ZERO));
+    }
+    for (list = 0; !chunk && list < UVM_PMM_ALLOC_LIST_USED; ++list)
+        chunk = list_first_chunk(&pmm->root_chunks.alloc_list[list]);
+    // New samples can change relative recency as well as eligibility.
+    if (candidates->sampled_ns != snapshot->sampled_ns ||
+        candidates->linear_base != snapshot->linear_base ||
+        candidates->granularity != snapshot->granularity ||
+        candidates->lru_enabled != snapshot->lru_enabled)
+        candidates->initialized = false;
+retry_candidates:
+    if (!chunk && !candidates->initialized)
+        eviction_candidates_collect(pmm, snapshot, candidates);
+    while (!chunk && candidates->next < candidates->count) {
+        const uvm_eviction_candidate_t *candidate = &candidates->entries[candidates->next++];
+        uvm_gpu_root_chunk_t *root = candidate->root;
+        NvU64 last_access_ns;
+        uvm_vab_region_state_t state;
+        // Other allocation/eviction threads may have changed this root while
+        // evict_root_chunk dropped PMM locks. Never trust a cached owner/sample.
+        if (root->vab_generation != candidate->generation ||
+            !chunk_is_evictable(pmm, &root->chunk)) {
+            skipped = true;
+            continue;
+        }
+        state = vab_root_state(root, snapshot);
+        if (state != UVM_VAB_REGION_COLD) {
+            skipped = true;
+            if (state == UVM_VAB_REGION_HOT)
+                ++pmm->vab_stats.background_hot_skips;
+            else
+                ++pmm->vab_stats.background_unknown_skips;
+            continue;
+        }
+        if (snapshot->lru_enabled &&
+            !uvm_gpu_vab_get_recency(uvm_pmm_to_gpu(pmm)->parent, snapshot,
+                                    root->chunk.address, UVM_CHUNK_SIZE_MAX,
+                                    root->vab_ready_ns, &last_access_ns)) {
+            skipped = true;
+            continue;
+        }
+        chunk = &root->chunk;
+        if (chunk != list_first_chunk(&pmm->root_chunks.alloc_list[UVM_PMM_ALLOC_LIST_USED]))
+            ++pmm->vab_stats.selection_changes;
+        ++pmm->vab_stats.selected_cold;
+    }
+    // One bounded retry can find cold roots outside a wholly invalidated
+    // candidate set. Do not repeatedly scan when concurrent churn prevents progress.
+    candidates->invalidated |= skipped;
+    if (!chunk && candidates->invalidated && !candidates->refilled) {
+        candidates->refilled = true;
+        candidates->initialized = false;
+        skipped = false;
+        goto retry_candidates;
+    }
+    if (chunk)
+        chunk_start_eviction(pmm, chunk);
+    uvm_spin_unlock(&pmm->list_lock);
+    return chunk ? root_chunk_from_chunk(pmm, chunk) : NULL;
+}
+
 // Select and reclaim one root through the existing VA-block eviction path.
-static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_root)
+static bool eager_eviction_one(uvm_pmm_gpu_t *pmm,
+                                uvm_gpu_root_chunk_t **out_root,
+                                uvm_eviction_candidates_t *candidates)
 {
     NvU64 diagnostic_start = uvm_perf_diag_begin();
     NV_STATUS status;
@@ -2221,7 +2429,7 @@ static bool eager_eviction_one(uvm_pmm_gpu_t *pmm, uvm_gpu_root_chunk_t **out_ro
         return false;
     }
 
-    root_chunk = vab_pick_root(pmm, &snapshot, vab_only);
+    root_chunk = eviction_candidates_pick(pmm, &snapshot, candidates);
     if (!root_chunk) {
         uvm_mutex_unlock(&pmm->lock);
         uvm_perf_diag_end(UVM_PERF_DIAG_EVICTION_SELECT, diagnostic_start);
@@ -2268,17 +2476,19 @@ static unsigned eager_eviction_batch(uvm_pmm_gpu_t *pmm, unsigned limit, unsigne
 {
     // Bound stack use and outstanding pinned VRAM independently of the module
     // parameter. Copies for these roots can run before the first PMA free waits.
-    uvm_gpu_root_chunk_t *pending[16];
+    uvm_gpu_root_chunk_t *pending[UVM_EVICTION_CANDIDATES_MAX];
     unsigned submitted = 0;
     unsigned count;
     unsigned i;
     bool exhausted = false;
 
     while (submitted < limit && eager_eviction_usage_percent(pmm) > low && !exhausted) {
+        uvm_eviction_candidates_t candidates = {0};
+        candidates.limit = min(limit - submitted, (unsigned)ARRAY_SIZE(pending));
         count = 0;
         while (count < ARRAY_SIZE(pending) && submitted < limit &&
                eager_eviction_usage_percent_pending(pmm, count) > low) {
-            if (!eager_eviction_one(pmm, &pending[count])) {
+            if (!eager_eviction_one(pmm, &pending[count], &candidates)) {
                 exhausted = true;
                 break;
             }

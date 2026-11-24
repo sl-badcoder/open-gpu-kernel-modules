@@ -93,7 +93,7 @@ static void uvm_gpu_vab_get_snapshot(uvm_parent_gpu_t *p,uvm_vab_snapshot_t *s) 
     (void)p; ++snapshot_calls; *s=mock_snapshot;
     s->valid=s->valid && uvm_vab_sample_fresh(mock_now,s->sampled_ns,300);
 }
-static NvU64 mock_recency[6];
+static NvU64 mock_recency[256];
 static bool mock_recency_race;
 static bool uvm_gpu_vab_get_recency(uvm_parent_gpu_t *p,const uvm_vab_snapshot_t *s,
                                     NvU64 address,NvU64 size,NvU64 ready,NvU64 *last) {
@@ -118,6 +118,7 @@ static void chunk_start_eviction(uvm_pmm_gpu_t *p,uvm_gpu_chunk_t *c) {
     for(unsigned i=0;i<3;++i)remove_chunk(&p->root_chunks.alloc_list[i],c);
     for(unsigned i=0;i<2;++i)remove_chunk(&p->free_list[i],c);
 }
+static bool chunk_is_evictable(uvm_pmm_gpu_t *p,uvm_gpu_chunk_t *c) {assert(p->list_lock);return !c->claimed && c->state==UVM_PMM_GPU_CHUNK_STATE_ALLOCATED;}
 static NV_STATUS evict_root_chunk(uvm_pmm_gpu_t *p,uvm_gpu_root_chunk_t *r,int context) {
     assert(p->lock && !p->list_lock && r->chunk.claimed && context==PMM_CONTEXT_DEFAULT);++evictions;return fail_at && evictions==fail_at ? 1 : migration_status;
 }
@@ -127,8 +128,12 @@ static void free_root_chunk(uvm_pmm_gpu_t *p,uvm_gpu_root_chunk_t *r,int mode) {
 '''
 
 SCENARIOS = r'''
+static bool one(uvm_pmm_gpu_t *p,uvm_gpu_root_chunk_t **out) {
+ uvm_eviction_candidates_t candidates={.limit=1};
+ return eager_eviction_one(p,out,&candidates);
+}
 static uvm_pmm_gpu_t p;
-static uvm_gpu_root_chunk_t roots[6];
+static uvm_gpu_root_chunk_t roots[256];
 static void reset(void){
  memset(&p,0,sizeof(p));memset(roots,0,sizeof(roots));memset(&mock_snapshot,0,sizeof(mock_snapshot));
  mock_now=1000000000ULL;uvm_perf_vab_min_residency_ms=100;uvm_perf_prefetch_replacement_enable=false;
@@ -137,7 +142,7 @@ static void reset(void){
  mock_snapshot.valid=true;mock_snapshot.eviction_enabled=true;mock_snapshot.lru_enabled=true;
  mock_snapshot.sampled_ns=mock_now;mock_snapshot.linear_base=0;mock_snapshot.granularity=5;
  for(unsigned i=0;i<64;++i)mock_snapshot.enabled_mask[i]=~0ULL;
- for(unsigned i=0;i<6;++i){
+ for(unsigned i=0;i<256;++i){
   roots[i].chunk.address=(NvU64)i*UVM_CHUNK_SIZE_MAX;
   roots[i].chunk.state=UVM_PMM_GPU_CHUNK_STATE_ALLOCATED;roots[i].chunk.va_block=(void *)1;
   roots[i].vab_generation=roots[i].vab_ready_generation=1;roots[i].vab_ready_ns=mock_now-200*NSEC_PER_MSEC;
@@ -170,33 +175,33 @@ int main(void){
 
  // Background skips all-hot roots.
  reset();add(0,2);add(1,2);mock_snapshot.access_bits[0]=3;
- assert(!eager_eviction_one(&p,&out)&&!evictions);
+ assert(!one(&p,&out)&&!evictions);
  assert(p.vab_stats.background_hot_skips==2);
  // With one hot and one cold region, background selects the cold root.
  reset();add(0,2);add(1,2);mock_snapshot.access_bits[0]=(1ULL << 1);
- assert(eager_eviction_one(&p,&out)&&out==&roots[0]);
+ assert(one(&p,&out)&&out==&roots[0]);
  assert(p.vab_stats.selected_cold==1);
  // Cold-only behavior also applies in mode 2; observation-only never reclaims.
  reset();add(0,2);add(1,2);mock_snapshot.lru_enabled=false;mock_snapshot.access_bits[0]=2;
- assert(eager_eviction_one(&p,&out)&&out==&roots[0]);
- reset();add(0,2);mock_snapshot.eviction_enabled=false;assert(!eager_eviction_one(&p,&out));
- reset();add(0,2);mock_snapshot.valid=false;assert(!eager_eviction_one(&p,&out));
+ assert(one(&p,&out)&&out==&roots[0]);
+ reset();add(0,2);mock_snapshot.eviction_enabled=false;assert(!one(&p,&out));
+ reset();add(0,2);mock_snapshot.valid=false;assert(!one(&p,&out));
  // Fixed completion grace protects roots below the residency threshold.
  reset();add(0,2);roots[0].vab_ready_ns=mock_now-99*NSEC_PER_MSEC;
- assert(!eager_eviction_one(&p,&out)&&!evictions);
+ assert(!one(&p,&out)&&!evictions);
  // Unknown, stale, unmapped and racing data cannot admit proactive eviction.
- reset();add(0,2);vab_root_changed(&roots[0]);assert(!eager_eviction_one(&p,&out));
- reset();add(0,2);mock_snapshot.sampled_ns=mock_now-301;assert(!eager_eviction_one(&p,&out));
- reset();add(0,2);mock_snapshot.linear_base=~0ULL;assert(!eager_eviction_one(&p,&out));
- reset();add(0,2);mock_recency_race=true;assert(!eager_eviction_one(&p,&out));
+ reset();add(0,2);vab_root_changed(&roots[0]);assert(!one(&p,&out));
+ reset();add(0,2);mock_snapshot.sampled_ns=mock_now-301;assert(!one(&p,&out));
+ reset();add(0,2);mock_snapshot.linear_base=~0ULL;assert(!one(&p,&out));
+ reset();add(0,2);mock_recency_race=true;assert(!one(&p,&out));
  // A valid cold snapshot permits background selection.
- reset();add(0,2);assert(eager_eviction_one(&p,&out)&&out==&roots[0]);
+ reset();add(0,2);assert(one(&p,&out)&&out==&roots[0]);
  // Background VAB selection operates on allocated roots only.
  // Split/ownerless roots remain unknown and pressure uses the fallback.
  reset();add(0,2);roots[0].chunk.state=UVM_PMM_GPU_CHUNK_STATE_IS_SPLIT;
  assert(vab_root_state(&roots[0],&mock_snapshot)==UVM_VAB_REGION_UNKNOWN);
- assert(!eager_eviction_one(&p,&out));
- reset();add(0,2);roots[0].chunk.va_block=NULL;assert(!eager_eviction_one(&p,&out));
+ assert(!one(&p,&out));
+ reset();add(0,2);roots[0].chunk.va_block=NULL;assert(!one(&p,&out));
  // Mandatory PMA/allocation fallback still returns HOT and UNKNOWN roots.
  reset();add(0,2);mock_snapshot.access_bits[0]=1;
  uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[0]);uvm_mutex_unlock(&p.lock);
@@ -211,11 +216,81 @@ int main(void){
  // eviction still uses them; used HOT roots remain protected.
  reset();uvm_perf_prefetch_replacement_enable=true;
  add(0,2);p.free_list[0].first=&roots[3].chunk;
- assert(eager_eviction_one(&p,&out)&&out==&roots[0]);
+ assert(one(&p,&out)&&out==&roots[0]);
  assert(p.free_list[0].first==&roots[3].chunk);
  uvm_mutex_lock(&p.lock);assert(pick_root_chunk_to_evict(&p)==&roots[3]);uvm_mutex_unlock(&p.lock);
  reset();uvm_perf_prefetch_replacement_enable=true;add(0,2);mock_snapshot.access_bits[0]=1;
- assert(!eager_eviction_one(&p,&out));
+ assert(!one(&p,&out));
+ // A batch scans the used list once and preserves oldest-first ordering.
+ reset();for(unsigned i=0;i<6;++i){add(i,2);mock_recency[i]=mock_now-(i+1)*NSEC_PER_MSEC;}
+ assert(eager_eviction_batch(&p,4,0)==4);
+ assert(visits==6 && roots[5].chunk.claimed && roots[4].chunk.claimed &&
+        roots[3].chunk.claimed && roots[2].chunk.claimed && !roots[1].chunk.claimed);
+ // At realistic list sizes a full 16-victim batch still makes one scan.
+ reset();for(unsigned i=0;i<256;++i){add(i,2);mock_recency[i]=mock_now-((i*73)%257+1)*NSEC_PER_MSEC;}
+ uvm_eviction_candidates_t ranked={.limit=16};
+ uvm_spin_lock(&p.list_lock);eviction_candidates_collect(&p,&mock_snapshot,&ranked);uvm_spin_unlock(&p.list_lock);
+ assert(visits==256 && ranked.count==16);
+ for(unsigned i=0;i<16;++i){
+   unsigned best=256;
+   for(unsigned j=0;j<256;++j)
+     if(!roots[j].chunk.claimed && (best==256 || max(roots[j].vab_ready_ns,mock_recency[j])<max(roots[best].vab_ready_ns,mock_recency[best]) ||
+        (max(roots[j].vab_ready_ns,mock_recency[j])==max(roots[best].vab_ready_ns,mock_recency[best]) && j>best)))best=j;
+   assert(eager_eviction_one(&p,&out,&ranked)&&out==&roots[best]);
+ }
+ assert(visits==256);
+ reset();for(unsigned i=0;i<256;++i)add(i,2);
+ assert(eager_eviction_batch(&p,16,0)==16 && visits==256);
+ printf("Selection scan regression: 256 visits for 16 victims (previously 3976).\n");
+ // Larger configured batches collect another bounded group after draining.
+ reset();for(unsigned i=0;i<256;++i)add(i,2);
+ assert(eager_eviction_batch(&p,32,0)==32 && visits==256+240);
+ // Candidate generations and current VAB evidence are revalidated before use.
+ reset();for(unsigned i=0;i<4;++i)add(i,2);
+ uvm_eviction_candidates_t candidates={.limit=4};
+ uvm_spin_lock(&p.list_lock);eviction_candidates_collect(&p,&mock_snapshot,&candidates);uvm_spin_unlock(&p.list_lock);
+ vab_root_changed(&roots[3]);mock_snapshot.access_bits[0]=1ULL<<2;
+ assert(eager_eviction_one(&p,&out,&candidates)&&out==&roots[1]);
+ assert(eager_eviction_one(&p,&out,&candidates)&&out==&roots[0]);
+ assert(!eager_eviction_one(&p,&out,&candidates));
+ // Roots claimed by another caller are skipped, without rescanning.
+ reset();for(unsigned i=0;i<3;++i)add(i,2);
+ candidates=(uvm_eviction_candidates_t){.limit=3};
+ uvm_spin_lock(&p.list_lock);eviction_candidates_collect(&p,&mock_snapshot,&candidates);uvm_spin_unlock(&p.list_lock);
+ roots[2].chunk.claimed=true;
+ assert(eager_eviction_one(&p,&out,&candidates)&&out==&roots[1]);
+ mock_recency_race=true;
+ assert(!eager_eviction_one(&p,&out,&candidates));
+ assert(!roots[0].chunk.claimed && visits==5);
+ // A newer sample reranks candidates using current recency.
+ reset();for(unsigned i=0;i<3;++i){add(i,2);mock_recency[i]=mock_now-(i+1)*NSEC_PER_MSEC;}
+ candidates=(uvm_eviction_candidates_t){.limit=2};
+ assert(eager_eviction_one(&p,&out,&candidates)&&out==&roots[2]);
+ ++mock_snapshot.sampled_ns;++mock_now;mock_recency[1]=mock_now;
+ assert(eager_eviction_one(&p,&out,&candidates)&&out==&roots[0]);
+ // If the cached best root becomes hot, one refill finds an outside root.
+ reset();for(unsigned i=0;i<3;++i)add(i,2);
+ candidates=(uvm_eviction_candidates_t){.limit=1};
+ uvm_spin_lock(&p.list_lock);eviction_candidates_collect(&p,&mock_snapshot,&candidates);uvm_spin_unlock(&p.list_lock);
+ mock_snapshot.access_bits[0]=1ULL<<2;
+ assert(eager_eviction_one(&p,&out,&candidates)&&out==&roots[1]);
+ assert(candidates.refilled && p.vab_stats.background_hot_skips>0);
+ // An invalidation before a successful pick is remembered until exhaustion.
+ reset();for(unsigned i=0;i<3;++i)add(i,2);
+ candidates=(uvm_eviction_candidates_t){.limit=2};
+ uvm_spin_lock(&p.list_lock);eviction_candidates_collect(&p,&mock_snapshot,&candidates);uvm_spin_unlock(&p.list_lock);
+ mock_snapshot.access_bits[0]=1ULL<<2;
+ assert(eager_eviction_one(&p,&out,&candidates)&&out==&roots[1]);
+ assert(eager_eviction_one(&p,&out,&candidates)&&out==&roots[0]);
+ assert(candidates.refilled);
+ // Expired snapshots never authorize a cached eviction.
+ reset();add(0,2);candidates=(uvm_eviction_candidates_t){.limit=1};
+ uvm_spin_lock(&p.list_lock);eviction_candidates_collect(&p,&mock_snapshot,&candidates);uvm_spin_unlock(&p.list_lock);
+ mock_now+=301;
+ assert(!eager_eviction_one(&p,&out,&candidates)&&!evictions);
+ // Non-LRU selection stops scanning once the batch has enough cold roots.
+ reset();for(unsigned i=0;i<6;++i)add(i,2);mock_snapshot.lru_enabled=false;
+ assert(eager_eviction_batch(&p,2,0)==2&&visits==2);
  // Completed frees and failures are counted separately; batches stop at low.
  reset();for(unsigned i=0;i<5;++i)add(i,2);
  assert(eager_eviction_batch(&p,16,98)==2&&p.vab_stats.background_roots_freed==2);
@@ -263,7 +338,10 @@ def main():
     for name in ('prefetch_cached_free_bytes_locked', 'prefetch_free_bytes_locked',
                  'uvm_pmm_gpu_adaptive_admission_extra', 'adaptive_replacement_feedback'):
         code += function(source, name)
-    for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):
+    start = source.index('#define UVM_EVICTION_CANDIDATES_MAX')
+    end = source.index('// One used-list scan', start)
+    code += source[start:end]
+    for name in ('vab_root_changed','vab_root_state','vab_pick_allocated','get_first_allocated_chunk','vab_pick_root','pick_root_chunk_to_evict','eviction_candidate_newer','eviction_candidates_sift','eviction_candidates_collect','eviction_candidates_pick','eager_eviction_one','eager_eviction_batch','uvm_pmm_gpu_vab_stats'):
         code+=function(source,name)
     code+=SCENARIOS
     with tempfile.TemporaryDirectory(prefix='demand-first-eviction-') as directory:
