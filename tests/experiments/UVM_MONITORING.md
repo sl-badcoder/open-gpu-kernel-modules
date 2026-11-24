@@ -67,6 +67,9 @@ bash ../open-gpu-kernel-modules/tests/experiments/run_vllm_monitored.sh
 the helper defines the exact units. `RESERVATION_EXECUTABLE` defaults to `./reserv`.
 It must stay in the foreground until killed. To reserve another size, change
 `RESERVATION_GIB`. Leave it unset to preserve runs without a managed reservation.
+Helpers that print "Press Enter to release" are supported: the wrapper keeps
+their stdin open through a private FIFO without sending Enter, then terminates
+them during cleanup. No second terminal is needed.
 Stop your manually launched `reserv` before the first sweep; only processes
 started by this wrapper are stopped automatically.
 

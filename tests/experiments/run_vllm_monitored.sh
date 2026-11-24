@@ -45,6 +45,7 @@ fi
 # The optional wrapper must exec its foreground reservation process so $! owns
 # the GPU client itself. Never kill unrelated/manual reservation processes.
 reservation_pid=""
+reservation_input_dir=""
 reservation_command=()
 reservation_startup_seconds=${RESERVATION_STARTUP_SECONDS:-3}
 if [[ -n ${RESERVATION_GIB:-} ]]; then
@@ -93,11 +94,18 @@ stop_reservation() {
     wait "$reservation_pid" 2>/dev/null || true
     reservation_pid=""
   fi
+  if [[ -n $reservation_input_dir ]]; then
+    exec 9>&-
+    rm -f -- "$reservation_input_dir/stdin"
+    rmdir -- "$reservation_input_dir"
+    reservation_input_dir=""
+  fi
 }
 
 check_reservation() {
   if [[ ${#reservation_command[@]} -gt 0 ]] && ! kill -0 "$reservation_pid" 2>/dev/null; then
-    echo "GPU reservation exited unexpectedly; check its reservation log" >&2
+    echo "GPU reservation exited unexpectedly; log: $reservation_log" >&2
+    tail -n 20 "$reservation_log" >&2 || true
     exit 1
   fi
 }
@@ -113,14 +121,29 @@ for threshold in "${thresholds[@]}"; do
   threshold_tag=""
   if [[ $threshold != current ]]; then
     echo "Reloading module with access-counter threshold $threshold"
-    bash "$RELOAD_SCRIPT" "uvm_perf_access_counter_threshold=$threshold" \
-      2>&1 | tee "$result_root/reload-ac-${threshold}-${run_id}-$$.log"
+    reload_log="$result_root/reload-ac-${threshold}-${run_id}-$$.log"
+    if bash "$RELOAD_SCRIPT" "uvm_perf_access_counter_threshold=$threshold" \
+        2>&1 | tee "$reload_log"; then
+      echo "Reload script completed successfully"
+    else
+      reload_status=$?
+      echo "Reload pipeline failed (exit $reload_status); reservation and benchmark were not started." >&2
+      echo "Check $reload_log. A final diagnostic command in the reload script can fail even after insmod succeeds." >&2
+      exit "$reload_status"
+    fi
     threshold_tag="-ac-${threshold}"
   fi
   if [[ ${#reservation_command[@]} -gt 0 ]]; then
     reservation_log="$result_root/reservation-ac-${threshold}-${run_id}-$$.log"
     echo "Starting GPU reservation; log: $reservation_log"
-    "${reservation_command[@]}" > "$reservation_log" 2>&1 &
+    # Helpers which wait for Enter must not see the /dev/null stdin normally
+    # assigned to asynchronous commands. Keep a FIFO writer open without sending
+    # a newline; the helper waits until stop_reservation terminates it.
+    reservation_input_dir=$(mktemp -d "${TMPDIR:-/tmp}/uvm-reservation.XXXXXX")
+    mkfifo "$reservation_input_dir/stdin"
+    exec 9<> "$reservation_input_dir/stdin"
+    "${reservation_command[@]}" < "$reservation_input_dir/stdin" 9>&- \
+      > "$reservation_log" 2>&1 &
     reservation_pid=$!
     reservation_deadline=$((SECONDS + 10#$reservation_startup_seconds))
     while (( SECONDS < reservation_deadline )); do
@@ -128,10 +151,12 @@ for threshold in "${thresholds[@]}"; do
       check_reservation
     done
     check_reservation
+    echo "GPU reservation running (PID $reservation_pid)"
   fi
   for batch in ${BATCH_SIZES:-24}; do
     check_reservation
     run_dir="$result_root/kv-adp3-batch-${batch}${threshold_tag}-${run_id}-$$"
+    echo "Starting vLLM benchmark: batch=$batch threshold=$threshold results=$run_dir"
     python3 "$monitor" --gpu "$gpu" --interval "$interval" \
       --output-dir "$run_dir" -- \
       .venv/bin/python benchmarks/benchmark_uvm.py \
